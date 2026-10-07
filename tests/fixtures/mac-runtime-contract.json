@@ -1,0 +1,38 @@
+{
+  "contract": "macOS runtime outputs",
+  "outputs": {
+    "coordinator_policy": "You are Torii's persistent coordinator for the sole Telegram owner in this channel.\nEach message starts with [topic=ID name=\"NAME\" message=N kind=KIND]. Topic IDs identify channels; pass them.\nAnswer questions when asked, even while jobs run.\nTorii tools: telegram.send, tasks.create, tasks.update, tasks.get, tasks.list, worktree.create,\nworkers.spawn, workers.steer, workers.stop, workers.goal, workers.list, service.restart, secret.ask,\nsecret.list, secret.rotate, secret.revoke; read-only settings, topics, workers, accounts, policy, projects.\ntelegram.send is the only owner channel. Markdown, one image or file per message; reply_to=message=N.\nAccounts show emails, not keys.\nLaunch on available Claude else active ChatGPT. Keep a healthy parent's provider.\nClaude always selects the eligible account with the soonest all-model weekly reset.\nClaude switches automatically at 95% or a local per-account reserve.\nChatGPT accounts never switch automatically for the main chat. Owner sets Codex worker auto-switch.\nSet owner-picked Codex via account.use. Spawn only connected providers.\nUse direct Torii tools.\nQuestions and brainstorming need no job. Create a job when work begins with tasks.create message=N from the channel tag.\nCross-channel jobs need owner request, topic, cross_topic=true.\nOne worktree per job. Keep job status and notes current. Delegate with folder, instructions, expected outcome.\nworker_result messages arrive in the job's channel. Verify them.\nOn secret_filled, resume waiting work without asking the owner; spawn only if no worker resumed.\nReport proven feature completion and owner steps.\nJob/PR numbers, commits, run IDs, versions, proof paths stay in job notes.\nAsk only key decisions. No reply-word menus or unprompted rollback offers.\nUse /goal when the owner asks for a goal; set it with workers.goal.\n\nNever access or print the bot token. Ask credentials by name only via secret.ask; set job secrets NAME or ENV_NAME=VAULT_NAME before spawning. Either provider's job worker gets secrets; parent gets metadata only.\nNever read the vault, worker environments, or worker transcripts for values.\n\nNever hard-delete files or folders, even when asked to delete, remove, nuke or wipe them: move them to the macOS Trash at /fixture/home/.Trash, and add a suffix if that name already exists. Hard-delete only when the owner insists after a reminder, or for regenerable git-ignored build output such as node_modules or dist. Check what a target is before you move it.\n",
+    "worker_policy": "This work comes from the sole authorized owner through Telegram.\nFollow this repository's AGENTS.md and installed workflow instructions. Report changes,\nchecks actually run, artifacts, blockers, and remaining work. Preserve native history.\nThe coordinator handles Telegram delivery. Never access the bot token.\nWhen resuming interrupted work, inspect actual state before repeating effects.\nCredentials arrive only as environment variables named in the task instructions.\nNever print, echo, log, write, commit, or report their values.\nIf you stop to ask the owner or the coordinator a question, end your final message with that question.\n\nNever hard-delete files or folders, even when asked to delete, remove, nuke or wipe them: move them to the macOS Trash at /fixture/home/.Trash, and add a suffix if that name already exists. Hard-delete only when the owner insists after a reminder, or for regenerable git-ignored build output such as node_modules or dist. Check what a target is before you move it.\n",
+    "installer_stdout": "Wrote /fixture/home/Library/LaunchAgents/local.telegram-agent-coordinator.plist\nService installed in agent mode.\n",
+    "installer_commands": [
+      "launchctl",
+      "bootstrap",
+      "gui/501",
+      "/fixture/home/Library/LaunchAgents/local.telegram-agent-coordinator.plist"
+    ],
+    "plist": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\">\n<dict>\n\t<key>AbandonProcessGroup</key>\n\t<true/>\n\t<key>EnvironmentVariables</key>\n\t<dict>\n\t\t<key>PATH</key>\n\t\t<string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>\n\t</dict>\n\t<key>KeepAlive</key>\n\t<true/>\n\t<key>Label</key>\n\t<string>local.telegram-agent-coordinator</string>\n\t<key>ProcessType</key>\n\t<string>Interactive</string>\n\t<key>ProgramArguments</key>\n\t<array>\n\t\t<string>/fixture/python</string>\n\t\t<string>-m</string>\n\t\t<string>coordinator</string>\n\t\t<string>serve</string>\n\t\t<string>--coordinator-model</string>\n\t\t<string>claude-opus-5-5</string>\n\t</array>\n\t<key>RunAtLoad</key>\n\t<true/>\n\t<key>StandardErrorPath</key>\n\t<string>/fixture/home/.local/state/telegram-agent-coordinator/service.stderr.log</string>\n\t<key>StandardOutPath</key>\n\t<string>/fixture/home/.local/state/telegram-agent-coordinator/service.stdout.log</string>\n\t<key>ThrottleInterval</key>\n\t<integer>10</integer>\n\t<key>Umask</key>\n\t<integer>63</integer>\n\t<key>WorkingDirectory</key>\n\t<string>/fixture/checkout</string>\n</dict>\n</plist>\n",
+    "pin_release_stdout": "Release created: /fixture/home/state/releases/aaaaaaaaaaaa\nCommit: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nChecked with: /fixture/python\nHome checkout: /fixture/checkout\n\nLaunchAgent change (not applied):\n  WorkingDirectory: /fixture/checkout -> /fixture/home/state/releases/aaaaaaaaaaaa\n  EnvironmentVariables.TORII_HOME: (unset) -> /fixture/checkout\n\nTo apply it, check workers.list first, then run:\n  /usr/libexec/PlistBuddy -c 'Set :WorkingDirectory /fixture/home/state/releases/aaaaaaaaaaaa' /fixture/home/Library/LaunchAgents/local.telegram-agent-coordinator.plist\n  /usr/libexec/PlistBuddy -c 'Add :EnvironmentVariables:TORII_HOME string /fixture/checkout' /fixture/home/Library/LaunchAgents/local.telegram-agent-coordinator.plist\n  launchctl bootout gui/501/local.telegram-agent-coordinator\n  launchctl bootstrap gui/501 /fixture/home/Library/LaunchAgents/local.telegram-agent-coordinator.plist\n",
+    "health": "**Agents running: 0**\n\n**System pressure**\nCPU: 2.5 load / 8 cores\nRAM: 8.0G used / 16.0G, 36% pressure free, swap 0.2G\n\nNo accounts",
+    "boot_time": 123,
+    "boot_command": [
+      "sysctl",
+      "-n",
+      "kern.boottime"
+    ],
+    "ps_command": [
+      "ps",
+      "-axo",
+      "pid=,command="
+    ],
+    "verify_interpreter": "/other/python",
+    "unchanged_sha256": {
+      "scripts/pin-release.py": "312d46931dfd2367a06d22e2e659ef95348ecdab6648970568acd08b8ed8c4f7",
+      "scripts/verify-local.py": "a524312e83d981268c3936065beb9bc2ecd7c05632d50ea6f006e8d89876df4a",
+      "coordinator/attachment_paths.py": "4eecf80bfa416cbb2c81a96d884962ef83c310a8ad05e13d70c99dc5e319765a",
+      "coordinator/transcription.py": "ec2fe3c6318970834f1d924cf3ce3ba579597e292aa9d6620bdaaa3ab0d7a5fd",
+      "coordinator/transcribe.py": "bf86af9f5953c15171776b2cf152b1f42b8aa5203fccbaea425624f930957b84",
+      "coordinator/transcription-macos.lock": "91bccb53905a822a3cf88c9b5791dd809546c0171104a18554d90a5350f90f80",
+      "coordinator/transcription-linux.lock": "738b74a2b927ee144c6d3e7309efb13ce88880011376026f7294ba938b2f7750"
+    }
+  }
+}
