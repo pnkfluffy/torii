@@ -1,0 +1,16 @@
+[Unit]
+Description=Torii Telegram agent coordinator
+
+[Service]
+ExecStart="/fixture/python" "-m" "coordinator" "serve" "--coordinator-model" "claude-opus-5-5"
+WorkingDirectory=/fixture/checkout
+Restart=always
+RestartSec=10
+KillMode=process
+UMask=0077
+Environment="PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin"
+StandardOutput=append:/fixture/home/.local/state/telegram-agent-coordinator/service.stdout.log
+StandardError=append:/fixture/home/.local/state/telegram-agent-coordinator/service.stderr.log
+
+[Install]
+WantedBy=default.target
