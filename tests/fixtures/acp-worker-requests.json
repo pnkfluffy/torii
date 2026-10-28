@@ -1,0 +1,278 @@
+{
+  "opencode_fresh": {
+    "writes": [
+      {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+          "protocolVersion": 1,
+          "clientCapabilities": {
+            "fs": {
+              "readTextFile": false,
+              "writeTextFile": false
+            },
+            "terminal": false
+          },
+          "clientInfo": {
+            "name": "torii",
+            "version": "1"
+          }
+        }
+      },
+      {
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "session/new",
+        "params": {
+          "cwd": "/workspace",
+          "mcpServers": []
+        }
+      },
+      {
+        "jsonrpc": "2.0",
+        "id": 3,
+        "method": "session/prompt",
+        "params": {
+          "sessionId": "session-a",
+          "prompt": [
+            {
+              "type": "text",
+              "text": "worker instructions\n\nowner request"
+            }
+          ]
+        }
+      },
+      {
+        "jsonrpc": "2.0",
+        "id": 4,
+        "method": "session/prompt",
+        "params": {
+          "sessionId": "session-a",
+          "prompt": [
+            {
+              "type": "text",
+              "text": "next request"
+            }
+          ],
+          "_meta": {
+            "toriiSteers": [
+              "follow-up"
+            ]
+          }
+        }
+      }
+    ],
+    "receipt": "queued",
+    "outcome": "succeeded"
+  },
+  "opencode_resume": {
+    "writes": [
+      {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+          "protocolVersion": 1,
+          "clientCapabilities": {
+            "fs": {
+              "readTextFile": false,
+              "writeTextFile": false
+            },
+            "terminal": false
+          },
+          "clientInfo": {
+            "name": "torii",
+            "version": "1"
+          }
+        }
+      },
+      {
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "session/load",
+        "params": {
+          "sessionId": "session-a",
+          "cwd": "/workspace",
+          "mcpServers": []
+        }
+      },
+      {
+        "jsonrpc": "2.0",
+        "id": 3,
+        "method": "session/prompt",
+        "params": {
+          "sessionId": "session-a",
+          "prompt": [
+            {
+              "type": "text",
+              "text": "worker instructions\n\nowner request"
+            }
+          ]
+        }
+      },
+      {
+        "jsonrpc": "2.0",
+        "id": 4,
+        "method": "session/prompt",
+        "params": {
+          "sessionId": "session-a",
+          "prompt": [
+            {
+              "type": "text",
+              "text": "next request"
+            }
+          ],
+          "_meta": {
+            "toriiSteers": [
+              "follow-up"
+            ]
+          }
+        }
+      }
+    ],
+    "receipt": "queued",
+    "outcome": "succeeded"
+  },
+  "authenticated_fresh": {
+    "writes": [
+      {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+          "protocolVersion": 1,
+          "clientCapabilities": {
+            "fs": {
+              "readTextFile": false,
+              "writeTextFile": false
+            },
+            "terminal": false
+          },
+          "clientInfo": {
+            "name": "torii",
+            "version": "1"
+          }
+        }
+      },
+      {
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "authenticate",
+        "params": {
+          "methodId": "cached_token"
+        }
+      },
+      {
+        "jsonrpc": "2.0",
+        "id": 3,
+        "method": "session/new",
+        "params": {
+          "cwd": "/workspace",
+          "mcpServers": []
+        }
+      },
+      {
+        "jsonrpc": "2.0",
+        "id": 4,
+        "method": "session/prompt",
+        "params": {
+          "sessionId": "session-a",
+          "prompt": [
+            {
+              "type": "text",
+              "text": "worker instructions\n\nowner request"
+            }
+          ]
+        }
+      },
+      {
+        "jsonrpc": "2.0",
+        "id": 5,
+        "method": "session/prompt",
+        "params": {
+          "sessionId": "session-a",
+          "prompt": [
+            {
+              "type": "text",
+              "text": "next request"
+            }
+          ]
+        }
+      }
+    ],
+    "receipt": "uncertain",
+    "outcome": "succeeded"
+  },
+  "authenticated_resume": {
+    "writes": [
+      {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+          "protocolVersion": 1,
+          "clientCapabilities": {
+            "fs": {
+              "readTextFile": false,
+              "writeTextFile": false
+            },
+            "terminal": false
+          },
+          "clientInfo": {
+            "name": "torii",
+            "version": "1"
+          }
+        }
+      },
+      {
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "authenticate",
+        "params": {
+          "methodId": "cached_token"
+        }
+      },
+      {
+        "jsonrpc": "2.0",
+        "id": 3,
+        "method": "session/load",
+        "params": {
+          "sessionId": "session-a",
+          "cwd": "/workspace",
+          "mcpServers": []
+        }
+      },
+      {
+        "jsonrpc": "2.0",
+        "id": 4,
+        "method": "session/prompt",
+        "params": {
+          "sessionId": "session-a",
+          "prompt": [
+            {
+              "type": "text",
+              "text": "worker instructions\n\nowner request"
+            }
+          ]
+        }
+      },
+      {
+        "jsonrpc": "2.0",
+        "id": 5,
+        "method": "session/prompt",
+        "params": {
+          "sessionId": "session-a",
+          "prompt": [
+            {
+              "type": "text",
+              "text": "next request"
+            }
+          ]
+        }
+      }
+    ],
+    "receipt": "uncertain",
+    "outcome": "succeeded"
+  }
+}
