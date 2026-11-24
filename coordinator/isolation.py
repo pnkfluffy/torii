@@ -3,10 +3,10 @@
 import json
 import os
 from pathlib import Path
-import platform
 import re
 import shutil
-import sys
+
+from . import host_os
 
 
 def codex_install_problem(binary):
@@ -24,14 +24,10 @@ def codex_install_problem(binary):
             match = re.fullmatch(r'(\d+)\.(\d+)\.(\d+)(?:[-+].*)?', version) if isinstance(version, str) else None
             if match and tuple(map(int, match.groups())) < (0, 143, 0):
                 return None
-            architecture = {'arm64': 'aarch64', 'aarch64': 'aarch64',
-                            'x86_64': 'x86_64', 'amd64': 'x86_64'}.get(platform.machine().lower())
-            system = {'darwin': 'apple-darwin', 'linux': 'unknown-linux-musl'}.get(sys.platform)
-            if not architecture or not system:
+            npm_target = host_os.codex_npm_target()
+            if npm_target is None:
                 return None
-            target = architecture + '-' + system
-            package = 'codex-' + ('darwin' if sys.platform == 'darwin' else 'linux') + '-' + (
-                'arm64' if architecture == 'aarch64' else 'x64')
+            package, target = npm_target
             vendors = [parent / 'node_modules' / '@openai' / package / 'vendor'
                        for parent in (root, *root.parents)] + [root / 'vendor']
             candidates = [vendor / target / 'bin' / 'codex' for vendor in vendors]

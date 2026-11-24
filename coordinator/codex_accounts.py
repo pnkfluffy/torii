@@ -8,11 +8,12 @@ Codex process gets CODEX_SQLITE_HOME set to the first home, so all accounts shar
 A thread started under one account therefore resumes under another.
 
 By default Codex work runs on one active account that the owner or the coordinator picks, and Torii
-posts only hard-stop rejection notices to the home chat, once per account and window. With automatic
-switching on, Torii moves work between accounts at 95% or after a usage-limit rejection.
+posts hard-stop rejection notices to the home chat, once per account and window. Automatic selection
+prefers included allowance, then prepaid credits, and moves work after a usage-limit rejection.
 """
 
 import asyncio
+from decimal import Decimal, InvalidOperation
 import json
 import logging
 import math
@@ -23,7 +24,7 @@ import time
 import uuid
 
 from . import problems
-from .account_status import _stop, identity_label
+from .account_status import _terminate, identity_label
 from .accounts import LIMIT_CONTINUATION, _dict, _number, identity_email
 from .providers import RunResult, child_environment
 from .usage_notice import queue_limit_notice
@@ -45,11 +46,12 @@ CODEX_SKILLS_POINTER = (
 )
 
 
+PSTACK = 'pstack@pstack-claude'
 DEFAULT_ALIAS = 'codex'
-CODEX_SWITCH_THRESHOLD = 0.95
+CODEX_SWITCH_THRESHOLD = 0.99
 THREADS = ('sessions', 'archived_sessions', 'thread-writer-locks')
 SHARED = frozenset(THREADS + ('config.toml', '.config.toml.lock', '.personality_migration', '.sandbox_migration',
-                              'AGENTS.md', 'agents', 'attachments', 'history.jsonl', 'hooks.json', 'memories',
+                              'AGENTS.md', 'agents', 'attachments', 'history.jsonl', 'memories',
                               'mcp-oauth-locks', 'prompts', 'rules', 'skills'))
 SCRATCH = frozenset({'auth.json', 'installation_id', 'models_cache.json', 'version.json', 'cache', 'log', 'tmp',
                      '.tmp', 'shell_snapshots', 'plugins'})
@@ -132,10 +134,12 @@ def codex_home_for_environment(env):
     return env.get('CODEX_HOME')
 
 
-def codex_skills_pointer(env):
+def codex_skills_pointer(env, pstack=True):
     home = Path(env['HOME']).absolute()
     codex_home = Path(env.get('CODEX_HOME') or home / '.codex').absolute()
-    return (CODEX_SKILLS_POINTER
+    text = CODEX_SKILLS_POINTER if pstack else CODEX_SKILLS_POINTER.replace(
+        "For pstack, <source>/<plugin> is pstack-claude/pstack. ", "")
+    return (text
             .replace("If CODEX_HOME is unset, use ~/.codex for the paths below. ", "")
             .replace('$CODEX_HOME', str(codex_home)).replace('~/', str(home) + '/'))
 
@@ -184,6 +188,29 @@ def usage_line(usage):
                      if _number(window.get('utilization')))
 
 
+def credit_balance(snapshot):
+    try:
+        balance = Decimal(str(_dict(snapshot.get('credits')).get('balance')))
+        return balance if balance.is_finite() and balance >= 0 else None
+    except InvalidOperation:
+        return None
+
+
+def credit_line(snapshot):
+    if _dict(snapshot.get('credits')).get('unlimited') is True:
+        return 'unlimited credits'
+    balance = credit_balance(snapshot)
+    if balance is None:
+        return '? credits'
+    amount = math.floor(balance)
+    return str(amount // 1000) + 'k credits' if amount >= 1000 else str(amount) + ' credits'
+
+
+def credits_allowed(limits):
+    return (limits.get('spendControlReached') is not True
+            and limits.get('rateLimitReachedType') in (None, 'rate_limit_reached'))
+
+
 def limit_windows(usage, out=False):
     """Windows at the switch point or above, by name and reset time. An account that is out and shows no such window
     counts its weekly window, or an unnamed one."""
@@ -215,14 +242,17 @@ class AppServer:
         self.counter = 0
         self.notifications = []
 
-    async def start(self, settings=(), cwd=None):
+    async def start(self, settings=(), cwd=None, experimental=False):
         self.process = await asyncio.create_subprocess_exec(
             self.binary, *settings,
             'app-server', '--listen', 'stdio://', '--disable', 'plugins', env=self.env,
             cwd=cwd or str(Path.home()),
             stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
             limit=1024 * 1024, start_new_session=True)
-        await self.request('initialize', {'clientInfo': {'name': 'torii', 'version': '1'}})
+        params = {'clientInfo': {'name': 'torii', 'version': '1'}}
+        if experimental:
+            params['capabilities'] = {'experimentalApi': True}
+        await self.request('initialize', params)
         await self.send({'method': 'initialized', 'params': {}})
         return self
 
@@ -265,7 +295,7 @@ class AppServer:
 
     async def stop(self):
         if self.process is not None:
-            await _stop(self.process)
+            await _terminate(self.process)
 
 
 async def collect_codex_status(account, binary='codex', timeout=30):
@@ -307,6 +337,7 @@ def _status_from_limits(response):
     result = {'usage': usage_windows(limits),
               'credits': {'has_credits': credits.get('hasCredits') is True, 'unlimited': credits.get('unlimited') is True,
                           'balance': identity_label(credits.get('balance'))},
+              'credits_allowed': credits_allowed(limits),
               'resets_available': count if type(count) is int else 0,
               'reset_expires': None,
               'usage_allowed': (response.get('ordinaryUsageAllowed') is not False
@@ -345,7 +376,7 @@ async def redeem_codex_reset(account, binary='codex', guarded=False, limited=Fal
         if before['resets_available'] < 1:
             raise ValueError('This Codex account has no banked reset')
         if guarded and not (limited or before['usage_allowed'] is False or full_windows(before['usage'])):
-            raise ValueError('This Codex account is below 95% on its resettable meters')
+            raise ValueError('This Codex account is below 99% on its resettable meters')
         params = {'idempotencyKey': str(uuid.uuid4())}
         if RESET_CREDIT_SCHEMA['credit_id'] and before.get('reset_credits'):
             params['creditId'] = before['reset_credits'][0]['id']
@@ -417,6 +448,7 @@ async def refresh_codex_accounts(store, collect=None):
                 continue
             snapshots = _dict(store.get('codex_account_status', {}))
             previous = _dict(snapshots.get(alias))
+            saved = previous
             if snapshot.get('error') == 'login_required' and 'identity' not in snapshot:
                 snapshot['identity'] = {'logged_in': False}
             identity = _dict(snapshot.get('identity'))
@@ -428,10 +460,12 @@ async def refresh_codex_accounts(store, collect=None):
                 snapshot['identity']['logged_in'] = False
             if 'identity' in snapshot and snapshot['identity'] != previous.get('identity'):
                 previous = {}
-            if 'error' in snapshot and snapshot['error'] != previous.get('error'):
-                problems.record(store, 'accounts', 'codex-status-' + snapshot['error'].replace('_', '-'),
-                                'account=' + broker.label(alias))
+            pending = problems.account_status(store, 'codex-status-', alias, snapshot, previous, saved)
             snapshots[alias] = {**previous, **snapshot}
+            if pending:
+                snapshots[alias]['login_recovery_pending'] = True
+            else:
+                snapshots[alias].pop('login_recovery_pending', None)
             if 'error' not in snapshot:
                 snapshots[alias].pop('error', None)
             store.put('codex_account_status', snapshots)
@@ -465,6 +499,7 @@ class CodexBroker:
 
     FRESH_SECONDS = 600
     REJECTION_HOLD_SECONDS = 300
+    AUTO_REDEEM_GAP = 3600
 
     def __init__(self, store):
         self.store = store
@@ -518,15 +553,28 @@ class CodexBroker:
 
     def exhausted(self, alias, parent=False):
         """Whether Codex refuses work on the account now: a rejection holds it, or a window is used up."""
-        block = self.blocks().get(alias)
+        return self.account_state(alias, parent=parent)['state'] == 'limited'
+
+    def has_credits(self, alias):
         snapshot = self.snapshot(alias)
-        return (bool(block) and (block.get('reason') == 'quota' or not parent and self.automatic())
-                or snapshot.get('usage_allowed') is False
-                or any(window['utilization'] >= 100 for window in full_windows(_dict(snapshot.get('usage')))))
+        credits = _dict(snapshot.get('credits'))
+        balance = credit_balance(snapshot)
+        return (snapshot.get('credits_allowed') is not False and (credits.get('unlimited') is True
+                or credits.get('has_credits') is True and balance is not None and balance > 0))
+
+    def uses_credits(self, alias):
+        snapshot = self.snapshot(alias)
+        return self.has_credits(alias) and (snapshot.get('usage_allowed') is False
+                or any(self.automatic() or window['utilization'] >= 100
+                       for window in full_windows(_dict(snapshot.get('usage')))))
 
     def parent_account(self):
+        if not self.managed():
+            return None
+        if self.automatic():
+            return self.select()
         alias = self.active()
-        return alias if self.managed() and self.signed_in(alias) and not self.exhausted(alias, parent=True) else None
+        return alias if self.signed_in(alias) and not self.exhausted(alias, parent=True) else None
 
     def environment(self, alias):
         directory = _dict(self.accounts().get(alias)).get('config_dir')
@@ -544,14 +592,26 @@ class CodexBroker:
         now = time.time()
         saved = _dict(self.store.get('codex_account_blocks', {}))
         kept = {alias: block for alias, block in saved.items() if isinstance(block, dict) and
-                (block.get('until') is None or (_number(block['until']) and block['until'] > now))}
+                (block.get('credits') is True and block.get('reason') == 'quota' or block.get('until') is None
+                 or (_number(block['until']) and block['until'] > now))}
         for alias, block in list(kept.items()):
             snapshot = self.snapshot(alias)
+            if block.get('reason') == 'threshold' and self.has_credits(alias):
+                kept.pop(alias)
+                continue
+            credit_block = block.get('reason') == 'quota' and block.get('credits') is True
+            allowance_recovery = (snapshot.get('usage_allowed') is True
+                                  and not full_windows(_dict(snapshot.get('usage'))))
+            credit_recovery = (credit_block and (allowance_recovery or
+                               self.has_credits(alias) and snapshot.get('credits_allowed') is True))
             if (_number(snapshot.get('observed_at'))
-                    and (block.get('until') is None or block.get('reason') != 'quota' and _number(block.get('observed_at')))
+                    and (credit_recovery or block.get('until') is None
+                         or block.get('reason') != 'quota' and _number(block.get('observed_at')))
                     and snapshot['observed_at'] > (block.get('observed_at') or 0)
-                    and not snapshot.get('error') and snapshot.get('usage_allowed') is not False
-                    and not full_windows(_dict(snapshot.get('usage')))):
+                    and not snapshot.get('error')
+                    and (credit_recovery or snapshot.get('usage_allowed') is not False)
+                    and (credit_recovery or not full_windows(_dict(snapshot.get('usage'))))
+                    and (not credit_block or credit_recovery)):
                 kept.pop(alias)
         if kept != saved:
             outer = self.store.db.in_transaction
@@ -562,12 +622,12 @@ class CodexBroker:
 
     def account_state(self, alias, parent=False):
         block = self.blocks().get(alias)
-        if block and (block.get('reason') == 'quota' or not parent and self.automatic()):
+        if block and (block.get('reason') == 'quota' or self.automatic()):
             return {'state': 'limited', 'until': block.get('until')}
         snapshot = self.snapshot(alias)
         full = [window for window in full_windows(_dict(snapshot.get('usage')))
-                if not parent and self.automatic() or window['utilization'] >= 100]
-        if full or snapshot.get('usage_allowed') is False:
+                if self.automatic() or window['utilization'] >= 100]
+        if not self.has_credits(alias) and (full or snapshot.get('usage_allowed') is False):
             resets = [window['resets_at'] for window in full if _number(window.get('resets_at'))]
             return {'state': 'limited', 'until': max(resets) if resets else None}
         observed = snapshot.get('observed_at')
@@ -578,20 +638,61 @@ class CodexBroker:
     def select(self, attempted=()):
         """The account for the next launch, or None.
 
-        With automatic switching on, this is the signed-in account under 95% whose weekly limit resets
-        soonest. With it off, it is the active account while that account is signed in and not exhausted.
+        Automatic selection prefers included allowance by weekly reset, then credits by descending balance.
+        Manual selection stays on the active account while it is signed in and not exhausted.
         """
         if not self.automatic():
             alias = self.active()
             return (alias if alias and alias not in attempted and self.signed_in(alias) and not self.exhausted(alias)
                     else None)
+        return next(iter(self.selection_order(attempted)), None)
+
+    def default_model(self):
+        return self.store.get('codex_model') or 'gpt-6.2-sol'
+
+    def capacity(self, model):
+        return bool(self.store.get('codex_enabled', True) and self.managed() and self.select() is not None)
+
+    async def ready(self, worker):
+        return self.select() is not None
+
+    def reset(self, worker):
+        return self.earliest_reset()
+
+    def selection_order(self, attempted=()):
+        """Usable accounts in routing order: included allowance, then descending credits."""
         eligible = [alias for alias in self.accounts() if alias not in attempted and self.signed_in(alias)
                     and self.account_state(alias)['state'] != 'limited']
 
         def weekly_reset(alias):
             reset = _dict(_dict(self.snapshot(alias).get('usage')).get('seven_day')).get('resets_at')
             return reset if _number(reset) and reset > time.time() else math.inf
-        return min(eligible, key=lambda alias: (weekly_reset(alias), alias)) if eligible else None
+        def order(alias):
+            if not self.uses_credits(alias):
+                return (0, weekly_reset(alias), alias)
+            balance = (Decimal('Infinity') if _dict(self.snapshot(alias).get('credits')).get('unlimited') is True
+                       else credit_balance(self.snapshot(alias)))
+            return (1, -balance, alias)
+        return sorted(eligible, key=order)
+
+    def check_credit_recovery(self):
+        available = any(
+                self.signed_in(alias) and self.account_state(alias)['state'] != 'limited'
+                and not self.uses_credits(alias) for alias in self.accounts())
+        if available and self.store.get('codex_credits_since') is not None:
+            self.store.put('codex_credits_since', None)
+        return available
+
+    def notify_credit_use(self, alias):
+        with self.store.transaction():
+            if (self.check_credit_recovery() or not self.uses_credits(alias)
+                    or self.store.get('codex_credits_since') is not None):
+                return
+            home = self.store.get('coordinator_home_topic')
+            topic = self.store.topic(home) if home else None
+            if topic and topic['enabled']:
+                self.store.put('codex_credits_since', time.time())
+                self.store.enqueue_report(home, 'ChatGPT weekly limits are used; ChatGPT work now runs on credits.')
 
     def listed(self):
         """Signed-in accounts sorted by email, with the next choice first, and that choice."""
@@ -644,10 +745,11 @@ class CodexBroker:
         redeem = 'To use a banked reset, tap Reset in /accounts or ask the coordinator to call account.redeem.'
         parent_paused = bool(self.store.get('coordinator_account_retry_at') and alias == self.active())
         if parent_paused:
-            lines.append('The main chat waits until you pick another ChatGPT account or the limit resets. '
+            lines.append('The main chat waits until an account has allowance or credits.' if self.automatic() else
+                         'The main chat waits until you pick another ChatGPT account or the limit resets. '
                          'It never switches ChatGPT accounts on its own.')
         if self.automatic():
-            lines.append('Automatic switching is on for workers, and no Codex account can take over. ' + redeem)
+            lines.append('Automatic switching is on, and no Codex account can take over. ' + redeem)
         else:
             lines.append(('The main chat and Codex workers wait until you switch' if parent_paused else
                           'Codex workers wait until you switch') + ' the active account or the limit resets. '
@@ -656,32 +758,63 @@ class CodexBroker:
         return '\n'.join(lines)
 
     def record_rate_limit(self, alias, limits, rejected=False, parent=False):
-        """Save the meter a run reported. Hold the account at 95%, or after a rejection until its limit resets.
+        """Save the meter a run reported. Hold the account at 99%, or after a rejection until its limit resets.
 
         Worker hard stops are reported at home once per account and window. The service reports parent pauses.
         """
         if not alias or alias not in self.accounts():
             return
+        credit_account = self.has_credits(alias) or _dict(self.blocks().get(alias)).get('credits') is True
         windows = usage_windows(limits)
-        if windows:
+        ordinary = _dict(limits).get('limitId', _dict(limits).get('limit_id')) in (None, 'codex')
+        if windows or ordinary and any(key in _dict(limits) for key in (
+                'credits', 'spendControlReached', 'rateLimitReachedType')):
             snapshots = _dict(self.store.get('codex_account_status', {}))
             snapshot = dict(_dict(snapshots.get(alias)))
             snapshot['usage'] = {**_dict(snapshot.get('usage')), **windows}
+            if ordinary and isinstance(_dict(limits).get('credits'), dict):
+                snapshot['credits'] = _status_from_limits({'rateLimits': limits})['credits']
+            if ordinary and any(key in _dict(limits) for key in ('spendControlReached', 'rateLimitReachedType')):
+                snapshot['credits_allowed'] = credits_allowed(limits)
+                if not snapshot['credits_allowed']:
+                    snapshot['usage_allowed'] = False
             snapshots[alias] = snapshot
             self.store.put('codex_account_status', snapshots)
         full = full_windows(_windows(limits) if rejected else windows) if self.automatic() or rejected else []
-        if not (rejected or full):
+        if not rejected and (not full or self.has_credits(alias)):
             self.notify_limit(alias, limits, rejected and not parent)
+            return
+        blocks = self.blocks()
+        if not rejected and _dict(blocks.get(alias)).get('reason') == 'quota':
             return
         resets = [window['resets_at'] for window in full
                   if _number(window.get('resets_at')) and window['resets_at'] > time.time()]
         until = max(resets) if resets else (time.time() + self.REJECTION_HOLD_SECONDS if rejected else None)
-        blocks = self.blocks()
         blocks[alias] = {'until': until, 'reason': 'quota' if rejected else 'threshold', 'observed_at': time.time()}
+        if ordinary and (credit_account or self.has_credits(alias)):
+            blocks[alias]['credits'] = True
+            if rejected:
+                blocks[alias]['until'] = None
         self.store.put('codex_account_blocks', blocks)
         self.store.put('codex_account_status_refresh_requested', time.time())
         logger.info('codex account limited account=%s', self.label(alias))
+        self.auto_redeem(alias)
         self.notify_limit(alias, limits, rejected and not parent)
+
+    def auto_redeem(self, alias):
+        """Queue one banked reset for an account the owner listed in codex_auto_redeem, at most once an hour."""
+        names = self.store.get('codex_auto_redeem') or []
+        if not isinstance(names, list) or (alias not in names and self.label(alias) not in names):
+            return
+        if self.snapshot(alias).get('resets_available') == 0 or not self.store.get('coordinator_home_topic'):
+            return
+        marks = _dict(self.store.get('codex_auto_redeem_at', {}))
+        if _number(marks.get(alias)) and time.time() - marks[alias] < self.AUTO_REDEEM_GAP:
+            return
+        self.store.put('codex_auto_redeem_at', dict(marks, **{alias: time.time()}))
+        self.store.service_request('account.codex_reset', {'alias': alias,
+                                                           '_topic': self.store.get('coordinator_home_topic')})
+        logger.info('codex auto redeem queued account=%s', self.label(alias))
 
     async def run(self, run, provider, prompt, cwd, session_id, notice_topic=None, stopped=None, **options):
         """Run on the chosen account. With automatic switching on, a usage-limit rejection resumes the same
@@ -715,6 +848,7 @@ class CodexBroker:
                     options['on_problem']('accounts', 'codex-rotated', 'from=%s to=%s model=%s' % (
                         self.label(previous), self.label(alias), model))
             logger.info('codex account selected account=%s model=%s', self.label(alias), model)
+            self.notify_credit_use(alias)
             last = await run(provider, prompt, cwd, session_id, account_alias=alias, **options)
             with self.store.db:
                 self.record_rate_limit(alias, last.rate_limit_info, last.quota_limited and not last.success)
@@ -740,6 +874,7 @@ class CodexBroker:
         if on_account:
             on_account(alias)
         logger.info('codex account selected account=%s model=%s', label, options.get('model') or 'native-default')
+        self.notify_credit_use(alias)
         result = await run(provider, prompt, cwd, session_id, account_alias=alias, **options)
         with self.store.db:
             self.record_rate_limit(alias, result.rate_limit_info, result.quota_limited and not result.success)

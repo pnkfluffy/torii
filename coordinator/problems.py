@@ -8,6 +8,7 @@ selected token, email, and URL shapes but does not remove every secret.
 from datetime import datetime
 import json
 import logging
+import re
 import sqlite3
 import time
 
@@ -23,39 +24,67 @@ SUMMARY_HOURS = 24
 REFS = ('topic', 'task', 'worker', 'message', 'attachment')
 
 _quiet = {}
+_lock_quiet = {}
+
+
+def lock_wait(store, operation):
+    key = (str(store.directory), operation)
+    now = time.monotonic()
+    if now - _lock_quiet.get(key, float('-inf')) >= 60:
+        _lock_quiet[key] = now
+        logger.warning('problem area=storage code=db-locked detail=operation=%s', operation)
+
+
+def account_status(store, prefix, alias, snapshot, previous, saved):
+    label = alias if isinstance(alias, str) and re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_-]{0,63}', alias) else '[invalid]'
+    detail = 'account=' + label
+    error = snapshot.get('error')
+    pending = saved.get('login_recovery_pending') or saved.get('error') == 'login_required'
+    if error and error != previous.get('error'):
+        record(store, 'accounts', prefix + error.replace('_', '-'), detail)
+    if error == 'login_required':
+        pending = True
+    elif not error and pending:
+        record(store, 'accounts', prefix + 'login-restored', detail, level=logging.INFO)
+        pending = False
+    return bool(pending)
 
 
 def record(store, area, code, detail=None, level=logging.WARNING, every=None,
-           topic=None, task=None, worker=None, message=None, attachment=None):
+           topic=None, task=None, worker=None, message=None, attachment=None, scope=None, limit=DETAIL_LIMIT):
     """Log and save one problem. With `every`, repeats of one area and code inside
     that many seconds are only counted, and the next saved row reports the count.
     A failed save is logged and never raised, so a failure path stays a failure path."""
     now = time.time()
     if every:
-        key = (str(store.directory), area, code, worker)
-        last, repeated = _quiet.get(key, (0, 0))
+        key = (str(store.directory), area, code, worker, scope)
+        last, repeated = _quiet.get(key, (float('-inf'), 0))
         if now - last < every:
             _quiet[key] = (last, repeated + 1)
             return None
         _quiet[key] = (now, 0)
         if repeated:
             detail = 'repeated=%d %s' % (repeated, detail or '')
-    detail = sanitize(detail)
+    detail = sanitize(detail, limit)
     refs = {name: sanitize(value, 80) if isinstance(value, str) else value
             for name, value in zip(REFS, (topic, task, worker, message, attachment)) if value is not None}
-    logger.log(level, 'problem area=%s code=%s%s%s', area, code,
-               ''.join(' %s=%s' % item for item in refs.items()),
-               ' detail=' + json.dumps(detail, ensure_ascii=False) if detail else '')
     values = (now, area, code, detail) + tuple(refs.get(name) for name in REFS)
     statement = ('INSERT INTO problems(created,area,code,detail,' + ','.join(REFS) +
                  ') VALUES (?,?,?,?,?,?,?,?,?)')
     try:
         if store.db.in_transaction:
-            return store.db.execute(statement, values).lastrowid
-        with store.db:
-            return store.db.execute(statement, values).lastrowid
+            row_id = store.db.execute(statement, values).lastrowid
+        else:
+            with store.db:
+                row_id = store.db.execute(statement, values).lastrowid
+        logger.log(level, 'problem area=%s code=%s%s%s', area, code,
+                   ''.join(' %s=%s' % item for item in refs.items()),
+                   ' detail=' + json.dumps(detail, ensure_ascii=False) if detail else '')
+        return row_id
     except sqlite3.Error as error:
-        logger.error('problem not saved area=%s code=%s type=%s', area, code, type(error).__name__)
+        if every:
+            _quiet.pop(key, None)
+        logger.warning('problem not saved area=%s code=%s type=%s', area, code, type(error).__name__)
         return None
 
 
@@ -63,6 +92,7 @@ def prune(store, days=RETENTION_DAYS):
     with store.db:
         removed = store.db.execute('DELETE FROM problems WHERE created<?',
                                    (time.time() - days * 86400,)).rowcount
+        store.db.execute('DELETE FROM sweep_failures WHERE failed<?', (time.time() - days * 86400,))
     logger.info('problems pruned removed=%d days=%d', removed, days)
     return removed
 

@@ -15,7 +15,7 @@ from coordinator.service import Service
 from coordinator.store import Store
 from coordinator.telegram import TelegramError
 from coordinator.vault import FileVault, vault_from_environment
-from tests.support import FakeVault, isolate_shared_mcp_home, stop_test_hosts
+from tests.support import FakeVault, finish_background_tasks, isolate_shared_mcp_home, stop_test_hosts
 
 
 TOPIC = '-10042:4'
@@ -74,7 +74,8 @@ class EnvelopeFixture(unittest.TestCase):
             return control_api.call(self.store, op, params, topic=TOPIC, source='mcp')
 
     def ask(self, name='GITHUB_TOKEN', **extra):
-        params = dict(name=name, reason='Push the release branch', consumer='release worker', **extra)
+        params = dict(name=name, reason='Push the release branch', consumer='release worker')
+        params.update(extra)
         return self.call('secret.ask', **params)
 
     def envelope(self, name='GITHUB_TOKEN'):
@@ -112,11 +113,13 @@ class AskTests(EnvelopeFixture):
             [{'text': 'Cancel', 'callback_data': 'envelope:%d:cancel' % envelope['id']}]])
         self.assertIsNone(envelope['token_hash'])
         self.assertEqual((envelope['state'], envelope['chat']), ('armed', OWNER))
-        self.assertAlmostEqual(envelope['expires'] - envelope['armed_at'], 600)
+        self.assertAlmostEqual(envelope['expires'] - envelope['armed_at'], 86400)
         self.assertEqual(self.events(), [('ask', None, 'mcp'), ('arm', None, 'direct_prompt')])
         self.assertEqual(card['text'], 'Envelope: GITHUB_TOKEN\nWhy: Push the release branch\n'
+                         'Torii has never stored a value under this name.\n'
                          'Used by: release worker\nJob: any job\n'
-                         'Waiting for the value in the private chat. Tap Fill privately to open it.\n'
+                         'The prompt is in your private chat with me. Reply to it there with the value within 24 hours, '
+                         'or tap Fill privately to open the chat.\n'
                          'Never paste it in this channel.')
         self.assertEqual(self.vault.calls, [])
 
@@ -160,6 +163,7 @@ class AskTests(EnvelopeFixture):
     def test_mcp_schema_constrains_secret_names(self):
         tool = next(tool for tool in mcp.tools_list() if tool['name'] == 'secret_ask')
         self.assertEqual(tool['inputSchema']['properties']['name']['pattern'], '^[A-Z][A-Z0-9_]{1,63}$')
+        self.assertEqual(tool['inputSchema']['properties']['confirm']['type'], 'boolean')
         self.assertEqual(set(tool['inputSchema']['required']), {'topic', 'name', 'reason', 'consumer'})
 
 
@@ -200,8 +204,8 @@ class CancelAndExpiryTests(EnvelopeFixture):
         self.ask()
         envelope = self.envelope()
         with self.store.db:
-            self.assertEqual(envelopes.sweep(self.store, envelope['created'] + 599), 0)
-            self.assertEqual(envelopes.sweep(self.store, envelope['created'] + 601), 1)
+            self.assertEqual(envelopes.sweep(self.store, envelope['expires'] - 1), 0)
+            self.assertEqual(envelopes.sweep(self.store, envelope['expires'] + 1), 1)
         expired = self.envelope()
         self.assertEqual(expired['state'], 'expired')
         self.assertIsNone(self.outbox(envelope['card_outbox'])['reply_markup'])
@@ -327,18 +331,15 @@ class CancelAndExpiryTests(EnvelopeFixture):
             with self.subTest(sender=sender):
                 self.assert_inert_again(number, old, **sender)
 
-    def test_F4_again_clears_pause_and_prompts_the_oldest_waiter(self):
+    def test_F4_again_prompts_the_fresh_ask_beside_the_others(self):
         self.ask()
         self.ask('NPM_TOKEN')
         old = self.expire_card()
-        self.assertFalse(self.store.get('envelope_prompt_exit')['acknowledged'])
         self.assertEqual(self.click_again(1, old), 'envelope_again')
-        self.assertEqual(self.envelope('NPM_TOKEN')['state'], 'armed')
-        self.assertEqual(self.envelope()['state'], 'open')
+        self.assertEqual((self.envelope()['state'], self.envelope('NPM_TOKEN')['state']), ('armed', 'armed'))
         replies = [r[0] for r in self.store.db.execute("SELECT text FROM envelope_effects WHERE kind='reply' ORDER BY id")]
-        self.assertEqual(replies[-1], 'Send the value for NPM_TOKEN now in one message. '
-                         'I will delete it after I store it. Send /cancel to stop.')
-        self.assertIsNone(self.store.get('envelope_prompt_exit'))
+        self.assertTrue(replies[-1].startswith('Envelope: GITHUB_TOKEN\n'), replies[-1])
+        self.assertEqual(sum(text.startswith('Envelope: NPM_TOKEN\n') for text in replies), 1)
 
     def test_review_B1_again_with_a_waiter_posts_only_the_tracked_card(self):
         self.ask()
@@ -356,10 +357,13 @@ class CancelAndExpiryTests(EnvelopeFixture):
         self.assertEqual([row['id'] for row in posts], [fresh['card_outbox']])
         card = self.outbox(fresh['card_outbox'])
         self.assertEqual(card['text'], 'Envelope: GITHUB_TOKEN\nWhy: Push the release branch\n'
+                         'An earlier request for this name expired without a value.\n'
                          'Used by: release worker\nJob: any job\n'
-                         'Waiting behind another credential ask in the private chat.\nNever paste it in this channel.')
+                         'The prompt is in your private chat with me. Reply to it there with the value within 24 hours, '
+                         'or tap Fill privately to open the chat.\n'
+                         'Never paste it in this channel.')
         self.assertEqual(card['markup'], {'inline_keyboard': [
-            [{'text': 'Fill privately', 'callback_data': 'envelope:%d:fill' % fresh['id']}],
+            [{'text': 'Fill privately', 'url': 'https://t.me/' + BOT}],
             [{'text': 'Cancel', 'callback_data': 'envelope:%d:cancel' % fresh['id']}]]})
 
     def test_review_F1_refused_again_is_answered_recorded_and_does_not_stop_polling(self):
@@ -398,17 +402,6 @@ class CancelAndExpiryTests(EnvelopeFixture):
         for snapshot in (before, after):
             snapshot['settings'] = [r for r in snapshot['settings'] if r[0] != 'offset']
         self.assertEqual(after, before)
-
-    def test_F4_again_while_busy_keeps_the_current_prompt(self):
-        self.ask()
-        old = self.expire_card()
-        self.store.accept(private(1, '/start'))
-        self.ask('NPM_TOKEN')
-        before = self.count('envelope_effects')
-        self.assertEqual(self.click_again(2, old), 'envelope_again')
-        self.assertEqual(self.envelope('NPM_TOKEN')['state'], 'armed')
-        self.assertEqual(self.envelope()['state'], 'open')
-        self.assertEqual(self.count('envelope_effects'), before)
 
 
 class ServiceWiringTests(unittest.IsolatedAsyncioTestCase):
@@ -573,6 +566,9 @@ class IntakeTests(IntakeFixture):
     def test_one_character_credential_is_stored(self):
         self.assert_short_value_stored('SHORT_ONE', 'x')
 
+    def test_digit_only_credential_is_stored(self):
+        self.assert_short_value_stored('NUMERIC_PASSWORD', '48213907')
+
     def test_filled_notification_survives_store_restart(self):
         self.armed()
         self.store.accept(self.dated_private(2, VALUE))
@@ -632,14 +628,13 @@ class IntakeTests(IntakeFixture):
 
     def test_rejected_values_are_deleted_and_keep_the_envelope_armed(self):
         self.armed()
-        cases = ['x' * 4097, 'two\nlines-of-value', '/not-a-value-at-all',
-                 '12345678901234567890', 'tab\there-is-a-value']
+        cases = ['x' * 4097, 'two\nlines-of-value', '/not-a-value-at-all', 'tab\there-is-a-value']
         for number, text in enumerate(cases, 2):
             self.assertEqual(self.store.accept(self.dated_private(number, text)), 'envelope_reject')
         self.store.accept(self.dated_private(20, photo=[{'file_id': 'x', 'width': 1, 'height': 1}]))
         reasons = [reason for event, reason, _ in self.events() if event == 'reject']
-        self.assertEqual(reasons, ['too_long', 'multi_line', 'command', 'numeric', 'not_printable', 'not_text'])
-        self.assertEqual(self.deletes(), [102, 103, 104, 105, 106, 120])
+        self.assertEqual(reasons, ['too_long', 'multi_line', 'command', 'not_printable', 'not_text'])
+        self.assertEqual(self.deletes(), [102, 103, 104, 105, 120])
         self.assertEqual(self.envelope()['state'], 'armed')
         self.assertEqual(self.vault.values, {})
 
@@ -647,7 +642,7 @@ class IntakeTests(IntakeFixture):
         self.assertEqual(self.store.accept(self.dated_private(1, VALUE)), 'envelope_reject')
         self.assertEqual(self.deletes(), [101])
         self.assertEqual(self.vault.calls, [])
-        self.assertIn('No envelope is waiting', self.replies()[-1])
+        self.assertIn('No credential ask is waiting', self.replies()[-1])
 
     def test_vault_failure_keeps_the_envelope_armed_until_a_retry_succeeds(self):
         self.armed()
@@ -702,7 +697,7 @@ class IntakeTests(IntakeFixture):
         self.armed()
         self.store.accept(self.dated_private(2, VALUE))
         first = self.envelope()['id']
-        self.ask()
+        self.call('secret.rotate', name='GITHUB_TOKEN')
         self.run_effects()
         self.assertEqual(self.store.accept(self.dated_private(4, VALUE + '-rotated')), 'envelope_fill')
         states = dict(self.store.db.execute('SELECT id,state FROM envelopes').fetchall())
@@ -724,7 +719,9 @@ class ArmedCardTests(IntakeFixture):
     def test_armed_card_says_the_value_goes_to_the_private_chat(self):
         self.armed()
         card = self.outbox(self.envelope()['card_outbox'])
-        self.assertTrue(card['text'].endswith('\nWaiting for the value in the private chat. Tap Fill privately to open it.\nNever paste it in this channel.'), card['text'])
+        self.assertTrue(card['text'].endswith('\nThe prompt is in your private chat with me. Reply to it there with the '
+                                              'value within 24 hours, or tap Fill privately to open the chat.\n'
+                                              'Never paste it in this channel.'), card['text'])
 
 
 class EffectTests(IntakeFixture):
@@ -809,7 +806,8 @@ class TopicReplyTests(IntakeFixture):
         self.assertEqual([row[:3] for row in self.effects() if row[0] == 'delete'],
                          [('delete', GROUP, 201), ('delete', GROUP, 202)])
         notices = [row[0] for row in self.store.db.execute("SELECT text FROM outbox WHERE kind='report'")]
-        self.assertEqual(notices, ['I removed your reply. Use Fill privately to send values.'] * 2)
+        self.assertEqual(notices, ['I removed your reply. Reply to its prompt in your private chat with me, '
+                                   'or tap Fill privately.'] * 2)
         self.assertEqual(self.events()[-1], ('reject', 'topic_reply', 'intake'))
         self.assertEqual(self.envelope()['state'], 'armed')
         self.assert_value_absent()
@@ -890,7 +888,7 @@ class OperationTests(IntakeFixture):
 
     def test_service_revokes_idempotently_and_reports(self):
         self.fill()
-        self.ask('GITHUB_TOKEN')
+        self.call('secret.rotate', name='GITHUB_TOKEN')
         live = self.envelope()
         service = self.service()
         self.call('secret.revoke', name='GITHUB_TOKEN')
@@ -912,6 +910,10 @@ class OperationTests(IntakeFixture):
         self.assertEqual(self.requests()[-1][1], 'done')
         self.assertEqual(self.events()[-1], ('revoke', 'nothing_stored', 'service:revoke'))
         self.assertFalse(self.store.db.in_transaction)
+        self.assertTrue(self.ask('GITHUB_DEPLOY_TOKEN').ok)
+        self.assertTrue(self.ask().ok)
+        self.assertIn('Torii stored a value under this name earlier.',
+                      self.outbox(self.envelope()['card_outbox'])['text'])
 
     def test_vault_failure_during_revoke_changes_nothing(self):
         self.fill()
@@ -925,6 +927,122 @@ class OperationTests(IntakeFixture):
         self.assertEqual(self.count('envelope_events'), events)
         self.assertEqual(self.vault.values, {'GITHUB_TOKEN': VALUE})
 
+    def worker_ask(self, worker, name='GITHUB_TOKEN'):
+        with self.store.db:
+            return control_api.call(self.store, 'secret.ask', {
+                'topic': TOPIC, 'name': name, 'reason': 'Push', 'consumer': 'worker'}, source='cli', source_worker=worker)
+
+    def test_ask_for_a_stored_name_is_refused_without_a_card(self):
+        self.fill()
+        before = [self.count(table) for table in ('envelopes', 'envelope_events', 'outbox', 'messages')]
+        result = self.ask()
+        self.assertEqual(result.state, 'refused')
+        self.assertTrue(result.text.startswith('GITHUB_TOKEN is stored. Do not ask the owner again.'), result.text)
+        self.assertIn('tasks.update task=N secrets=GITHUB_TOKEN', result.text)
+        self.assertIn('secret.rotate', result.text)
+        self.assertNotIn(VALUE, json.dumps(result.data))
+        self.assertEqual(self.ask(confirm=True).state, 'refused')
+        self.assertEqual([self.count(table) for table in ('envelopes', 'envelope_events', 'outbox', 'messages')], before)
+        self.assertEqual(self.vault.calls, [('put', 'GITHUB_TOKEN')])
+        self.assertTrue(self.call('secret.rotate', name='GITHUB_TOKEN').ok)
+
+    def test_near_matches_use_provider_words_and_client_id(self):
+        self.fill('BILLING_PLAID_PRODUCTION_SECRET')
+        self.fill('PAYMENT_CLIENT_ID', number=2)
+        self.assertTrue(self.ask('PLAID_STAGING_KEY', confirm=True).ok)
+        tables = ('envelopes', 'envelope_events', 'outbox', 'messages', 'envelope_effects')
+        before = [self.count(table) for table in tables]
+        for name, matches in (
+                ('PLAID_CLIENT_ID', ['BILLING_PLAID_PRODUCTION_SECRET', 'PAYMENT_CLIENT_ID']),
+                ('PLAID_SANDBOX_SECRET', ['BILLING_PLAID_PRODUCTION_SECRET'])):
+            with self.subTest(name=name):
+                result = self.ask(name)
+                self.assertEqual(result.state, 'refused')
+                self.assertEqual(result.data, {'name': name, 'matches': matches})
+                self.assertIn(', '.join(matches), result.text)
+                self.assertIn('tasks.update secrets=ENV_NAME=VAULT_NAME', result.text)
+                self.assertIn('ask again with confirm=true', result.text)
+        self.assertEqual([self.count(table) for table in tables], before)
+        self.assertEqual(self.vault.calls, [('put', 'BILLING_PLAID_PRODUCTION_SECRET'),
+                                            ('put', 'PAYMENT_CLIENT_ID')])
+
+    def test_generic_words_do_not_block_an_ask(self):
+        self.fill('GITHUB_PRODUCTION_API_TOKEN')
+        self.fill('PAYMENT_CLIENT_ID', number=2)
+        result = self.ask('NPM_PRODUCTION_CLIENT_API_KEY')
+        self.assertTrue(result.ok, result.text)
+
+    def test_confirm_allows_a_near_match_after_an_unfilled_ask_expires(self):
+        self.fill('BILLING_PLAID_PRODUCTION_SECRET')
+        name = 'PLAID_CLIENT_ID'
+        reason = 'The saved copy expired.'
+        result = self.ask(name, reason=reason, confirm=True)
+        self.assertTrue(result.ok, result.text)
+        first = self.envelope(name)
+        card = self.outbox(first['card_outbox'])['text']
+        self.assertIn('Torii has never stored a value under this name.', card)
+        self.assertIn('Why: ' + reason, card)
+        self.assertLess(card.index('Why: ' + reason), card.index('Torii has never stored a value under this name.'))
+        self.assertEqual(first['reason'], reason)
+        with self.store.transaction():
+            self.store.db.execute('UPDATE envelopes SET expires=created-1 WHERE id=?', (first['id'],))
+            envelopes.sweep(self.store)
+        self.assertEqual(self.ask(name, reason=reason).state, 'refused')
+        result = self.ask(name, reason='The old saved credential is no longer valid.', confirm=True)
+        self.assertTrue(result.ok, result.text)
+        self.assertNotEqual(result.data['envelope'], first['id'])
+        card = self.outbox(self.envelope(name)['card_outbox'])['text']
+        self.assertIn('Why: The old saved credential is no longer valid.\n'
+                      'An earlier request for this name expired without a value.', card)
+        self.assertEqual(self.vault.calls, [('put', 'BILLING_PLAID_PRODUCTION_SECRET')])
+
+    def test_worker_ask_for_a_stored_name_notifies_its_coordinator_only(self):
+        self.fill()
+        job = self.store.task_create(TOPIC, 'Deploy', secrets=['OTHER_KEY'])
+        worker = self.store.db.execute('''INSERT INTO workers(task,topic,provider,prompt,created,updated)
+            VALUES (?,?,?,?,?,?)''', (job['id'], TOPIC, 'codex', 'Work', 1, 1)).lastrowid
+        self.store.db.commit()
+        outbox = self.count('outbox')
+        envelopes_before = self.count('envelopes')
+        result = self.worker_ask(worker)
+        self.assertEqual(result.state, 'refused')
+        self.assertIn("I told this job's coordinator.", result.text)
+        self.assertEqual((self.count('outbox'), self.count('envelopes')), (outbox, envelopes_before))
+        notice = dict(self.store.db.execute("SELECT * FROM messages WHERE kind='event' ORDER BY id DESC").fetchone())
+        self.assertEqual((notice['topic'], notice['source_worker'], notice['from_name']), (TOPIC, worker, None))
+        self.assertEqual(notice['text'], 'Job %d: worker %d asked the owner for GITHUB_TOKEN, which is already '
+                         'stored. I refused the ask and posted no card. Declare it: tasks.update task=%d '
+                         'secrets=GITHUB_TOKEN,OTHER_KEY' % (job['number'], worker, job['id']))
+        repeat = self.worker_ask(worker)
+        self.assertEqual(repeat.state, 'refused')
+        self.assertIn("This job's coordinator was already told.", repeat.text)
+        self.assertEqual(self.store.db.execute("SELECT count(*) FROM messages WHERE kind='event'").fetchone()[0], 1)
+        with self.store.db:
+            self.store.db.execute("UPDATE messages SET created=created-601 WHERE kind='event'")
+        self.assertEqual(self.store.task_get(job['id'])['secrets'], ['OTHER_KEY'])
+        self.assertNotIn(VALUE, json.dumps([result.text, result.data, notice['text']]))
+        with self.store.db:
+            self.store.task_update(job['id'], secrets=['GITHUB_TOKEN'])
+        self.assertEqual(self.worker_ask(worker).state, 'refused')
+        latest = self.store.db.execute("SELECT text FROM messages WHERE kind='event' ORDER BY id DESC").fetchone()[0]
+        self.assertIn('already declared on the job. Worker %d started before that' % worker, latest)
+        self.assertTrue(self.worker_ask(worker, 'NEW_KEY').ok)
+
+    def test_worker_ask_with_an_environment_name_conflict_tells_the_coordinator(self):
+        self.fill()
+        self.fill('OTHER_TOKEN', number=2)
+        job = self.store.task_create(TOPIC, 'Deploy', secrets=['GITHUB_TOKEN=OTHER_TOKEN'])
+        worker = self.store.db.execute('''INSERT INTO workers(task,topic,provider,prompt,created,updated)
+            VALUES (?,?,?,?,?,?)''', (job['id'], TOPIC, 'codex', 'Work', 1, 1)).lastrowid
+        self.store.db.commit()
+        result = self.worker_ask(worker)
+        self.assertEqual(result.state, 'refused', result.text)
+        notice = self.store.db.execute("SELECT text FROM messages WHERE kind='event'").fetchall()
+        self.assertEqual(len(notice), 1)
+        self.assertIn('maps environment name GITHUB_TOKEN to another vault name (secrets=GITHUB_TOKEN=OTHER_TOKEN)',
+                      notice[0][0])
+        self.assertEqual(self.store.task_get(job['id'])['secrets'], ['GITHUB_TOKEN=OTHER_TOKEN'])
+
     def test_rotate_asks_again_and_keeps_the_old_value_until_the_new_fill(self):
         self.fill()
         rotated = self.call('secret.rotate', name='GITHUB_TOKEN')
@@ -932,6 +1050,7 @@ class OperationTests(IntakeFixture):
         fresh = self.envelope()
         self.assertEqual((fresh['state'], fresh['reason'], fresh['consumer']),
                          ('armed', 'Push the release branch', 'release worker'))
+        self.assertIn('Torii stored a value under this name earlier.', self.outbox(fresh['card_outbox'])['text'])
         self.assertEqual(self.vault.values, {'GITHUB_TOKEN': VALUE})
         self.assertEqual(self.vault.calls, [('put', 'GITHUB_TOKEN')])
         self.assertEqual(self.call('secret.rotate', name='GITHUB_TOKEN').state, 'refused')
@@ -1045,6 +1164,7 @@ class EndToEndTests(unittest.IsolatedAsyncioTestCase):
 
     async def asyncTearDown(self):
         from coordinator import log
+        await finish_background_tasks()
         self.store.close()
         log.reset()
 
@@ -1081,13 +1201,13 @@ class EndToEndTests(unittest.IsolatedAsyncioTestCase):
         task = self.call('tasks.create', message=asked, title='Release', secrets='GITHUB_TOKEN').data
         with self.store.db:
             self.store.task_update(task['id'], worktree=str(self.work))
-        worker = self.call('workers.spawn', task=task['id'], provider='claude', prompt='release').data['worker']
+        worker = self.call('workers.spawn', task=task['id'], kind='design', prompt='release').data['worker']
         row = dict(self.store.db.execute('SELECT * FROM workers WHERE id=?', (worker,)).fetchone())
         await asyncio.wait_for(self.service.workers.run(row, self.store.topic(TOPIC)), 30)
         self.assertEqual((self.work / 'worker-saw').read_text(), str(len(value)))
         environment = json.loads((self.work / 'worker-environment').read_text())
         self.assertEqual([key for key in environment if key.startswith(('TORII_', 'CLAUDE_', 'CODEX_'))],
-                         ['CLAUDE_CONFIG_DIR'])
+                         ['CLAUDE_CONFIG_DIR', 'TORII_TASK_ID', 'TORII_WORKER_ID'])
         return worker
 
     async def test_no_file_holds_a_value_or_loose_key(self):
@@ -1127,7 +1247,7 @@ class EndToEndTests(unittest.IsolatedAsyncioTestCase):
         self.call('secret.ask', name='GITHUB_TOKEN', reason='Release', consumer='release worker', task=other['id'])
         await self.service.envelopes_once()
         self.assertEqual(self.store.accept(private(2, VALUE, date=self.telegram.date + 1)), 'envelope_fill')
-        worker = self.call('workers.spawn', task=job['id'], provider='claude', prompt='release').data['worker']
+        worker = self.call('workers.spawn', task=job['id'], kind='design', prompt='release').data['worker']
         await self.service.workers_once()
         await asyncio.gather(*self.service.worker_tasks.values())
         finished = self.service.workers.get(worker)
@@ -1157,7 +1277,7 @@ class EndToEndTests(unittest.IsolatedAsyncioTestCase):
             await self.service.envelopes_once()
             self.assertEqual(self.store.accept(private(index * 2 + 2, value, date=self.telegram.date + 1)), 'envelope_fill')
         await self.update(task=job['id'], secrets='GITHUB_TOKEN,GH_TOKEN=DEPLOY_KEY,NPM_TOKEN')
-        worker = self.call('workers.spawn', task=job['id'], provider='claude', prompt='release').data['worker']
+        worker = self.call('workers.spawn', task=job['id'], kind='design', prompt='release').data['worker']
         await self.service.workers_once()
         await asyncio.gather(*self.service.worker_tasks.values())
         finished = self.service.workers.get(worker)
@@ -1174,7 +1294,7 @@ class EndToEndTests(unittest.IsolatedAsyncioTestCase):
         other = self.store.task_create(TOPIC, 'Ask')
         job = self.store.task_create(TOPIC, 'Use', worktree=str(self.work), secrets=['GITHUB_TOKEN'])
         self.call('secret.ask', name='GITHUB_TOKEN', reason='Release', consumer='release worker', task=other['id'])
-        worker = self.call('workers.spawn', task=job['id'], provider='claude', prompt='release').data['worker']
+        worker = self.call('workers.spawn', task=job['id'], kind='design', prompt='release').data['worker']
         await self.service.workers_once()
         await asyncio.gather(*self.service.worker_tasks.values())
         self.assertEqual(self.service.workers.get(worker)['status'], 'waiting_for_secret')
@@ -1218,24 +1338,20 @@ class EndToEndTests(unittest.IsolatedAsyncioTestCase):
 
 
 class ReplyCompatibilityTests(EnvelopeFixture):
-    def test_F6_private_replies_match_origin_main_except_expired(self):
-        expected = {'bare_start': 'Open an Envelope card in your Torii channel and tap Fill privately.',
+    def test_F6_private_reply_texts(self):
+        expected = {'bare_start': 'No credential asks are waiting. When a job asks for one, I post its prompt here.',
+         'closed_prompt': 'That ask is no longer waiting for a value, so I deleted your message and stored nothing.',
          'command': 'The value cannot start with /. I deleted your message. Send the value '
                     'again.',
-         'handoff_closed': 'That sign-in is no longer waiting for a code, so I deleted your '
-                           'message.',
          'internal': 'Something failed while I handled your message. I deleted it. Send the '
                      'value again.',
          'multi_line': 'Send the value as one line. I deleted your message. Send the value '
                        'again.',
-         'no_armed': 'No envelope is waiting for a value, so I deleted your message. Tap Fill '
-                     'privately on an Envelope card first.',
+         'no_armed': 'No credential ask is waiting for a value, so I deleted your message.',
          'not_printable': 'The value has characters that cannot be printed. I deleted your '
                           'message. Send the value again.',
          'not_text': 'Send the value as one text message. I deleted your message.',
-         'nothing_to_cancel': 'No envelope is waiting for a value.',
-         'numeric': 'A value made only of digits is refused. I deleted your message. Send the '
-                    'value again.',
+         'nothing_to_cancel': 'No credential ask is waiting for a value.',
          'too_long': 'The value must have at most 4096 characters. I deleted your message. '
                      'Send the value again.',
          'vault_failed': 'The vault write failed. Your message was deleted. Send the value '
@@ -1249,15 +1365,17 @@ class ReplyCompatibilityTests(EnvelopeFixture):
         self.assertEqual(envelopes.REPLIES, expected)
         self.assertEqual(envelopes.SIGNIN_REPLIES, signin)
 
-    def test_F6_cards_match_origin_main_for_unchanged_states(self):
+    def test_card_text_and_markup_by_state(self):
         expected = {'armed': {'markup': {'inline_keyboard': [[{'text': 'Fill privately', 'url': 'https://t.me/torii_test_bot'}],
                                                   [{'callback_data': 'envelope:1:cancel', 'text': 'Cancel'}]]},
                    'state': 'armed',
                    'text': 'Envelope: GITHUB_TOKEN\n'
                            'Why: Push the release branch\n'
+                           'Torii has never stored a value under this name.\n'
                            'Used by: release worker\n'
                            'Job: any job\n'
-                           'Waiting for the value in the private chat. Tap Fill privately to open it.\n'
+                           'The prompt is in your private chat with me. Reply to it there with the value within '
+                           '24 hours, or tap Fill privately to open the chat.\n'
                            'Never paste it in this channel.'},
          'cancelled': {'markup': None, 'state': 'cancelled', 'text': 'Envelope: GITHUB_TOKEN\nCancelled.'},
          'handoff': {'markup': {'inline_keyboard': [[{'callback_data': 'envelope:1:cancel', 'text': 'Cancel'}]]},
@@ -1273,10 +1391,11 @@ class ReplyCompatibilityTests(EnvelopeFixture):
          'open': {'state': 'open',
                   'text': 'Envelope: GITHUB_TOKEN\n'
                           'Why: Push the release branch\n'
+                          'Torii has never stored a value under this name.\n'
                           'Used by: release worker\n'
                           'Job: any job\n'
-                          'Tap Fill privately within 10 minutes and send the value there in one message. Never paste '
-                          'it in this channel.',
+                          'Tap Fill privately within 24 hours and send the value there in one message.\n'
+                          'Never paste it in this channel.',
                   'markup': {'inline_keyboard': [[{'text': 'Fill privately', 'callback_data': 'envelope:1:fill'}],
                                                  [{'text': 'Cancel', 'callback_data': 'envelope:1:cancel'}]]}}}
         for action, card in expected.items():
@@ -1292,7 +1411,7 @@ class ReplyCompatibilityTests(EnvelopeFixture):
                                 envelopes.close(fixture.store, envelope, 'expired', 'expire', source='sweep')
                         else:
                             if action == 'open':
-                                fixture.store.put('envelope_prompt_exit', {'envelope': None, 'acknowledged': False})
+                                fixture.store.db.execute("DELETE FROM settings WHERE key='owner'")
                             fixture.ask()
                             envelope = fixture.envelope()
                             if action in ('cancelled', 'revoked'):

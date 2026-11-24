@@ -3,6 +3,7 @@ import hashlib
 from dataclasses import asdict
 import json
 import os
+import shlex
 from pathlib import Path
 import sys
 from types import SimpleNamespace
@@ -11,24 +12,256 @@ import time
 import unittest
 from unittest.mock import AsyncMock, Mock, patch
 
-from coordinator import host_os, parent_state
+from coordinator import host_os, parent_state, workers as worker_module
 from coordinator.host import HostClient, _reap_launchers, alive
 from coordinator.accounts import LIMIT_CONTINUATION, AccountBroker
 from coordinator.codex_accounts import CODEX_SKILLS_POINTER, codex_skills_pointer
 from coordinator.native_protocol import RunControl
 from coordinator.providers import ProviderRunner, RunResult
-from coordinator.policy import usage_policy
 from coordinator.store import Store
 from tests.support import FakeVault
-from coordinator.workers import WORKER_POLICY, WorkerPool, can_resume_finished
+from coordinator.workers import WorkerPool, can_resume_finished
 
 
 TOPIC = '-10042:4'
 
-from tests.support import expected_codex_skills_pointer, isolate_shared_mcp_home, read_jsonl, settle, stop_test_hosts, until, until_exists, until_text
+from tests.support import expected_codex_skills_pointer, finish_background_tasks, isolate_shared_mcp_home, read_jsonl, settle, stop_test_hosts, until, until_exists, until_text
 from tests.test_codex_secrets_goals import SERVER as CODEX_GOAL_SERVER
 
 class WorkerTests(unittest.IsolatedAsyncioTestCase):
+    async def test_finished_steers_send_only_new_text_to_provider(self):
+        from coordinator import control_api
+        from coordinator.service import Service
+        transcript = self.root / 'primary' / 'projects' / 'test' / 'saved.jsonl'
+        transcript.parent.mkdir(parents=True, exist_ok=True)
+        transcript.write_text('{}\n')
+        worker = self.worker()
+        self.store.worker_complete(worker['id'], {'success': True, 'session_id': 'saved'})
+        received = []
+        class Runner:
+            async def run(self, provider, prompt, cwd, session, **options):
+                received.append(prompt)
+                return RunResult(session, text='done', success=True)
+        service = Service(self.store, None, Runner(), self.root)
+        for prompt in ('Fix review', 'Finish'):
+            request = control_api.call(self.store, 'workers.steer',
+                                       {'worker': worker['id'], 'prompt': prompt}, topic=TOPIC)
+            self.assertTrue(request.ok, request.text)
+            await service.controls_once()
+            finished = await service.workers.run(service.workers.get(worker['id']), self.store.topic(TOPIC))
+            self.assertEqual(finished['status'], 'done')
+        self.assertEqual(received, ['Fix review', 'Finish'])
+
+    async def test_long_brief_accepts_finished_steer(self):
+        from coordinator import control_api
+        from coordinator.service import Service
+        transcript = self.root / 'primary' / 'projects' / 'test' / 'saved.jsonl'
+        transcript.parent.mkdir(parents=True, exist_ok=True)
+        transcript.write_text('{}\n')
+        worker = self.worker()
+        self.store.db.execute('UPDATE workers SET prompt=? WHERE id=?', ('x' * 49999, worker['id']))
+        self.store.worker_complete(worker['id'], {'success': True, 'session_id': 'saved'})
+        received = []
+        class Runner:
+            async def run(self, provider, prompt, cwd, session, **options):
+                received.append(prompt)
+                return RunResult(session, text='done', success=True)
+        service = Service(self.store, None, Runner(), self.root)
+        request = control_api.call(self.store, 'workers.steer', {'worker': worker['id'], 'prompt': 'Continue'}, topic=TOPIC)
+        self.assertTrue(request.ok, request.text)
+        await service.controls_once()
+        queued = service.workers.get(worker['id'])
+        self.assertEqual(queued['status'], 'queued')
+        await service.workers.run(queued, self.store.topic(TOPIC))
+        self.assertEqual(received, ['Continue'])
+
+    async def test_restart_continuation_keeps_brief_and_steers(self):
+        from coordinator import control_api
+        from coordinator.service import Service
+        from coordinator.workers import RESTART_CONTINUATION
+        transcript = self.root / 'primary' / 'projects' / 'test' / 'saved.jsonl'
+        transcript.parent.mkdir(parents=True, exist_ok=True)
+        transcript.write_text('{}\n')
+        worker = self.worker()
+        self.store.worker_complete(worker['id'], {'success': True, 'session_id': 'saved'})
+        received = []
+        class Runner:
+            async def run(self, provider, prompt, cwd, session, **options):
+                received.append(prompt)
+                return RunResult(session, text='done', success=True)
+        service = Service(self.store, None, Runner(), self.root)
+        for prompt in ('Fix review', 'Finish'):
+            request = control_api.call(self.store, 'workers.steer', {'worker': worker['id'], 'prompt': prompt}, topic=TOPIC)
+            self.assertTrue(request.ok, request.text)
+            await service.controls_once()
+            await service.workers.run(service.workers.get(worker['id']), self.store.topic(TOPIC))
+        self.store.db.execute("UPDATE workers SET status='queued',result=? WHERE id=?",
+                              (json.dumps({'restart_resume': True}), worker['id']))
+        await service.workers.run(service.workers.get(worker['id']), self.store.topic(TOPIC))
+        history = 'build this\n\nFollow-up:\nFix review\n\nFollow-up:\nFinish'
+        self.assertEqual(received, ['Fix review', 'Finish', RESTART_CONTINUATION + history])
+
+    async def test_live_steers_keep_restart_brief_without_resending_it(self):
+        from coordinator import control_api
+        from coordinator.service import Service
+        from coordinator.workers import RESTART_CONTINUATION
+        transcript = self.root / 'primary' / 'projects' / 'test' / 'saved.jsonl'
+        transcript.parent.mkdir(parents=True, exist_ok=True)
+        transcript.write_text('{}\n')
+        worker = self.worker()
+        self.store.db.execute("UPDATE workers SET status='running',session='saved' WHERE id=?", (worker['id'],))
+        delivered = []
+        async def steer(message_id, prompt):
+            delivered.append(prompt)
+            return 'received'
+        service = Service(self.store, None, Mock(), self.root)
+        service.workers.controls[worker['id']] = SimpleNamespace(steer=steer)
+        for prompt in ('Fix review', 'Finish'):
+            request = control_api.call(self.store, 'workers.steer', {'worker': worker['id'], 'prompt': prompt}, topic=TOPIC)
+            self.assertTrue(request.ok, request.text)
+            await service.controls_once()
+        received = []
+        class Runner:
+            async def run(self, provider, prompt, cwd, session, **options):
+                received.append(prompt)
+                return RunResult(session, text='done', success=True)
+        service.workers.runner = Runner()
+        self.store.db.execute("UPDATE workers SET status='queued',fresh=0,result=? WHERE id=?",
+                              (json.dumps({'restart_resume': True}), worker['id']))
+        await service.workers.run(service.workers.get(worker['id']), self.store.topic(TOPIC))
+        self.assertEqual(delivered, ['Fix review', 'Finish'])
+        self.assertEqual(received, [RESTART_CONTINUATION + 'build this\n\nFollow-up:\nFix review\n\nFollow-up:\nFinish'])
+
+    async def test_continuation_elides_old_steers_and_preserves_original_brief(self):
+        from coordinator import control_api
+        from coordinator.service import Service
+        from coordinator.workers import RESTART_CONTINUATION
+        transcript = self.root / 'primary' / 'projects' / 'test' / 'saved.jsonl'
+        transcript.parent.mkdir(parents=True, exist_ok=True)
+        transcript.write_text('{}\n')
+        worker = self.worker()
+        brief = 'original:' + 'x' * 49990
+        self.store.db.execute('UPDATE workers SET prompt=? WHERE id=?', (brief, worker['id']))
+        self.store.worker_complete(worker['id'], {'success': True, 'session_id': 'saved'})
+        received = []
+        class Runner:
+            async def run(self, provider, prompt, cwd, session, **options):
+                received.append(prompt)
+                return RunResult(session, text='done', success=True)
+        service = Service(self.store, None, Runner(), self.root)
+        for prompt in ('older:' + 'a' * 29990, 'newest:' + 'b' * 29990):
+            request = control_api.call(self.store, 'workers.steer', {'worker': worker['id'], 'prompt': prompt}, topic=TOPIC)
+            self.assertTrue(request.ok, request.text)
+            await service.controls_once()
+            self.assertEqual(service.workers.get(worker['id'])['status'], 'queued')
+            await service.workers.run(service.workers.get(worker['id']), self.store.topic(TOPIC))
+        self.store.db.execute("UPDATE workers SET status='queued',result=? WHERE id=?",
+                              (json.dumps({'restart_resume': True}), worker['id']))
+        await service.workers.run(service.workers.get(worker['id']), self.store.topic(TOPIC))
+        self.assertEqual(received[:2], ['older:' + 'a' * 29990, 'newest:' + 'b' * 29990])
+        self.assertEqual(received[2], RESTART_CONTINUATION + brief + '\n\n[Earlier steers omitted.]\n\nFollow-up:\n' + 'newest:' + 'b' * 29990)
+
+
+    async def test_queued_long_brief_accepts_steer_without_truncating_original(self):
+        from coordinator import control_api
+        from coordinator.service import Service
+        worker = self.worker()
+        brief = 'x' * 49999
+        self.store.db.execute('UPDATE workers SET prompt=? WHERE id=?', (brief, worker['id']))
+        received = []
+        class Runner:
+            async def run(self, provider, prompt, cwd, session, **options):
+                received.append(prompt)
+                return RunResult(session, text='done', success=True)
+        service = Service(self.store, None, Runner(), self.root)
+        request = control_api.call(self.store, 'workers.steer', {'worker': worker['id'], 'prompt': 'Continue'}, topic=TOPIC)
+        self.assertTrue(request.ok, request.text)
+        await service.controls_once()
+        state = self.store.db.execute('SELECT state FROM service_requests WHERE id=?', (request.data['request'],)).fetchone()[0]
+        self.assertEqual(state, 'done')
+        await service.workers.run(service.workers.get(worker['id']), self.store.topic(TOPIC))
+        self.assertEqual(received, [brief + '\n\nFollow-up:\nContinue'])
+
+    async def test_opencode_restart_after_quota_keeps_saved_brief(self):
+        from coordinator import control_api
+        from coordinator.service import Service
+        from coordinator.workers import RESTART_CONTINUATION
+        self.store.put('opencode_enabled', True)
+        worker = self.worker('opencode')
+        self.store.worker_complete(worker['id'], {'success': True, 'session_id': 'saved'})
+        received = []
+        class Runner:
+            async def run(self, provider, prompt, cwd, session, **options):
+                received.append(prompt)
+                return RunResult(session, text='done', success=True)
+        service = Service(self.store, None, Runner(), self.root)
+        async def run_provider(run, provider, prompt, cwd, session, **options):
+            return await run(provider, prompt, cwd, session, **options)
+        service.workers.brokers['opencode'] = SimpleNamespace(run=run_provider, select=lambda alias=None: 'saved',
+                                                     capacity=lambda model: True, default_model=lambda: None)
+        request = control_api.call(self.store, 'workers.steer', {'worker': worker['id'], 'prompt': 'Fix review'}, topic=TOPIC)
+        self.assertTrue(request.ok, request.text)
+        await service.controls_once()
+        await service.workers.run(service.workers.get(worker['id']), self.store.topic(TOPIC))
+        self.store.db.execute("UPDATE workers SET status='queued',result=? WHERE id=?", (json.dumps({
+            'restart_resume': True, 'status': 'waiting_for_quota'}), worker['id']))
+        await service.workers.run(service.workers.get(worker['id']), self.store.topic(TOPIC))
+        self.assertEqual(received, ['Fix review', RESTART_CONTINUATION + 'build this\n\nFollow-up:\nFix review'])
+
+    async def test_worker_prompt_assigns_review_to_coordinator(self):
+        captured = []
+        class Runner:
+            async def run(self, provider, prompt, cwd, session, **options):
+                captured.append(options['instructions'])
+                return RunResult(session or '00000000-0000-4000-8000-000000000001', text='done', success=True)
+        await WorkerPool(self.store, Runner(), AccountBroker(self.store)).run(self.worker('claude'), self.store.topic(TOPIC))
+        for prompt in captured:
+            self.assertIn('The coordinator owns review.', prompt)
+            self.assertIn('Do not stop at a review gate', prompt)
+
+    async def test_worker_result_hides_limits_but_rotation_and_storage_keep_them(self):
+        worker = self.worker('codex')
+        worker['account_alias'] = 'primary'
+        limits = {'primary': {'usedPercent': 99, 'resetsAt': 2000000000},
+                  'credits': {'balance': '12'}}
+        result = RunResult('session', quota_limited=True, failure_code='quota_limited',
+                           failure_detail='limit reached', rate_limit_info=limits)
+        broker = Mock()
+        broker.automatic.return_value = False
+        pool = WorkerPool(self.store, Mock(), AccountBroker(self.store), codex_accounts=broker)
+        attached = await pool.codex_attached(worker, self.store.topic(TOPIC), result, {}, lambda alias: None)
+        broker.record_rate_limit.assert_called_once_with('primary', limits, True)
+        self.store.worker_complete(worker['id'], asdict(attached))
+        saved = json.loads(pool.get(worker['id'])['result'])
+        message = self.store.db.execute(
+            "SELECT text FROM messages WHERE source_worker=? AND kind='worker_result'", (worker['id'],)).fetchone()[0]
+        payload = json.loads(message)
+        self.assertEqual(saved['rate_limit_info'], limits)
+        self.assertNotIn('rate_limit_info', payload)
+        self.assertNotIn('credits', message)
+        self.assertNotIn('usedPercent', message)
+        self.assertEqual((payload['quota_limited'], payload['failure_code'], payload['failure_detail']),
+                         (True, 'quota_limited', 'limit reached'))
+
+    async def test_worker_plugins_follow_plugin_chats_for_its_chat(self):
+        captured = []
+        class Runner:
+            async def run(self, provider, prompt, cwd, session, **options):
+                captured.append(options.get('plugins'))
+                return RunResult(session or '00000000-0000-4000-8000-000000000001', text='done', success=True)
+        pool = WorkerPool(self.store, Runner(), AccountBroker(self.store))
+        cases = ((None, None),
+                 ({'pstack@pstack-claude': [TOPIC]}, {'pstack@pstack-claude': True}),
+                 ({'pstack@pstack-claude': ['-10042:9'], 'other@market': [TOPIC]},
+                  {'pstack@pstack-claude': False, 'other@market': True}))
+        for provider in ('claude', 'codex'):
+            for setting, expected in cases:
+                with self.subTest(provider=provider, setting=setting):
+                    self.store.put('plugin_chats', setting)
+                    captured.clear()
+                    await pool.run(self.worker(provider), self.store.topic(TOPIC))
+                    self.assertEqual(captured, [expected])
+
     async def test_on_demand_tools_follow_goals_changed_while_queued_or_waiting(self):
         from coordinator import control_api
         import uuid
@@ -54,42 +287,102 @@ class WorkerTests(unittest.IsolatedAsyncioTestCase):
                     result = json.loads(done['result'])
                     self.assertTrue(result['success'], result.get('error'))
                     spec = json.loads(Path(result['log_path']).with_name('spec.json').read_text())
+                    self.assertEqual(spec['env']['TORII_WORKER_ID'], str(worker['id']))
+                    self.assertEqual(spec['env']['TORII_TASK_ID'], str(self.task['id']))
                     self.assertEqual(spec['initial_goal'], None if condition == 'clear' else condition)
                     self.assertEqual('features.goals=true' in spec['argv'], condition != 'clear')
 
-    async def test_d12_chat_delegation_does_not_reach_workers(self):
-        from coordinator.policy import worker_usage_policy
+    async def test_rule_file_layers_reach_new_worker(self):
+        from coordinator.policy import personal_path, chat_path
         self.store.put('coordinator_home_topic', TOPIC)
-        self.store.put('coordinator_delegation', {'text': 'Chat-only instructions.', 'revision': 1})
-        self.store.put('coordinator:' + TOPIC + '_delegation', {'text': 'Other chat-only instructions.', 'revision': 1})
+        personal_path(self.store).write_text('# Personal\n- personal worker rule\n## Coordinators\n- private coordinator rule\n')
+        path = chat_path(self.store, TOPIC)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text('# Chat\n- chat worker rule\n## Coordinators\n- chat coordinator rule\n')
         captured = {}
         class Runner:
             async def run(self, provider, prompt, cwd, session, **options):
                 captured.update(options)
                 return RunResult(session or '00000000-0000-4000-8000-000000000001', text='done', success=True)
-        for provider in ('claude', 'codex'):
-            worker = self.worker(provider)
-            await WorkerPool(self.store, Runner(), AccountBroker(self.store)).run(worker, self.store.topic(TOPIC))
-            expected = (WORKER_POLICY + '\nCurrent usage policy:\n' + worker_usage_policy(self.store.directory) +
-                        '\nJob: ' + json.dumps({'id': self.task['id'], 'number': self.task['number'],
-                                                 'topic': 'Torii', 'worktree': self.task['worktree'],
-                                                 'results': str(self.store.directory / 'results' / ('task-' + str(self.task['id'])))}))
-            expected += ("\n$TMPDIR is this worker's own temp folder; Torii deletes it when the worker finishes. "
-                         "Files there may be deleted outright."
-                         "\nKeep reports, logs and proofs in the job's results folder.")
-            if provider == 'codex':
-                expected += '\n' + CODEX_SKILLS_POINTER
-            self.assertEqual(captured['instructions'], expected)
+        await WorkerPool(self.store, Runner(), AccountBroker(self.store)).run(self.worker('claude'), self.store.topic(TOPIC))
+        prompt = captured['instructions']
+        self.assertIn('personal worker rule', prompt)
+        self.assertIn('chat worker rule', prompt)
+        self.assertNotIn('private coordinator rule', prompt)
+        self.assertNotIn('chat coordinator rule', prompt)
+        self.assertIn('Job: ', prompt)
+        self.assertEqual(prompt.count('`$TMPDIR`: cleared at worker end'), 1)
 
-    def test_worker_policy_does_not_require_a_final_question(self):
-        self.assertNotIn('If you stop to ask the owner or the coordinator a question, '
-                         'end your final message with that question.', WORKER_POLICY)
+    async def test_temp_folder_cleanup_is_stated_once(self):
+        captured = []
+        class Runner:
+            async def run(self, provider, prompt, cwd, session, **options):
+                captured.append(options['instructions'])
+                return RunResult(session or '00000000-0000-4000-8000-000000000001', text='done', success=True)
+        pool = WorkerPool(self.store, Runner(), AccountBroker(self.store))
+        await pool.run(self.worker('claude'), self.store.topic(TOPIC))
+        for instructions in captured:
+            self.assertEqual(instructions.count('`$TMPDIR`: cleared at worker end'), 1)
+            self.assertNotIn('Torii deletes it when the worker finishes', instructions)
+            self.assertNotIn('Your temp folder is deleted when you finish', instructions)
+
+    async def test_native_log_warning_once_per_step_and_only_while_running(self):
+        from coordinator.workers import log_sizes, warn_log_sizes
+        worker = self.worker('codex')
+        session = '00000000-0000-4000-8000-000000000001'
+        host = self.root / 'state' / 'hosts' / ('worker-' + str(worker['id']))
+        host.mkdir(parents=True)
+        home = self.root / 'codex'
+        native = home / 'sessions' / '2026' / '10' / '28' / ('rollout-example-' + session + '.jsonl')
+        native.parent.mkdir(parents=True)
+        native.write_bytes(b'')
+        with native.open('r+b') as output:
+            output.truncate(200 * 1024 * 1024)
+        (host / 'spec.json').write_text(json.dumps({'env': {'CODEX_HOME': str(home)}}))
+        self.store.db.execute("UPDATE workers SET status='running',session=? WHERE id=?", (session, worker['id']))
+        worker.update(status='running', session=session)
+        sizes = log_sizes(self.store, [worker])
+        warn_log_sizes(self.store, sizes)
+        warn_log_sizes(self.store, sizes)
+        self.assertEqual([row['text'] for row in self.store.db.execute('SELECT text FROM outbox')],
+                         ["worker %d's log is 200 MB, likely printing huge output" % worker['id']])
+        with native.open('r+b') as output:
+            output.truncate(400 * 1024 * 1024)
+        warn_log_sizes(self.store, log_sizes(self.store, [worker]))
+        self.assertEqual(self.store.db.execute('SELECT count(*) FROM outbox').fetchone()[0], 2)
+        self.store.db.execute("UPDATE workers SET status='done' WHERE id=?", (worker['id'],))
+        warn_log_sizes(self.store, [(worker['id'], TOPIC, 600 * 1024 * 1024)])
+        self.assertEqual(self.store.db.execute('SELECT count(*) FROM outbox').fetchone()[0], 2)
+
+    @patch.object(worker_module, 'LOG_WARNING_BYTES', 1024 * 1024)
+    async def test_claude_native_log_warning(self):
+        from coordinator.workers import log_sizes, warn_log_sizes
+        worker = self.worker('claude')
+        session = '00000000-0000-4000-8000-000000000002'
+        home = self.root / 'claude'
+        native = home / 'projects' / 'example' / (session + '.jsonl')
+        native.parent.mkdir(parents=True)
+        native.write_bytes(b'x' * 10)
+        host = self.root / 'state' / 'hosts' / ('worker-' + str(worker['id']))
+        host.mkdir(parents=True)
+        (host / 'spec.json').write_text(json.dumps({'env': {'CLAUDE_CONFIG_DIR': str(home)}}))
+        self.store.db.execute("UPDATE workers SET status='running',session=? WHERE id=?", (session, worker['id']))
+        worker.update(status='running', session=session)
+        self.assertEqual(log_sizes(self.store, [worker]), [(worker['id'], TOPIC, 10)])
+        warn_log_sizes(self.store, log_sizes(self.store, [worker]))
+        self.assertEqual(self.store.db.execute('SELECT count(*) FROM outbox').fetchone()[0], 0)
+        with native.open('r+b') as output:
+            output.truncate(1024 * 1024)
+        warn_log_sizes(self.store, log_sizes(self.store, [worker]))
+        self.assertEqual(self.store.db.execute('SELECT count(*) FROM outbox').fetchone()[0], 1)
 
     async def asyncSetUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
         self.addCleanup(self.temp.cleanup)
         isolate_shared_mcp_home(self, self.root)
+        from tests.support import fake_codex_hook_trust
+        fake_codex_hook_trust(self)
         self.addCleanup(stop_test_hosts, self.root)
         self.store = Store(self.root / 'state')
         with self.store.db:
@@ -104,6 +397,7 @@ class WorkerTests(unittest.IsolatedAsyncioTestCase):
         self.task = self.store.task_create(TOPIC, 'Build', worktree=str(self.root))
 
     async def asyncTearDown(self):
+        await finish_background_tasks()
         self.store.close()
 
     async def check_absolute_skills_launches(self, attached):
@@ -200,8 +494,10 @@ class WorkerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(observed, ['👨\u200d💻', '👨\u200d💻'])
 
     async def test_worker_gets_current_policy_and_effort(self):
-        (self.store.directory / 'USAGE.md').write_text('Use one worker.\n\nKeep spaces.  \nUnicode 日本語\n')
-        self.worker('codex')
+        from coordinator.policy import personal_path
+        personal_path(self.store).write_text('- Use one worker.\n- Unicode 日本語\n')
+        worker = self.worker('codex')
+        self.store.db.execute('UPDATE workers SET effort=? WHERE id=?', ('xhigh', worker['id']))
         captured = {}
 
         class Runner:
@@ -211,64 +507,11 @@ class WorkerTests(unittest.IsolatedAsyncioTestCase):
 
         row = dict(self.store.db.execute('SELECT * FROM workers ORDER BY id DESC LIMIT 1').fetchone())
         await WorkerPool(self.store, Runner(), AccountBroker(self.store)).run(row, self.store.topic(TOPIC))
-        self.assertEqual(captured['effort'], 'medium')
-        self.assertEqual(captured['instructions'].split('Current usage policy:\n', 1)[1].split('\nJob: ', 1)[0],
-                         usage_policy(self.store.directory))
+        self.assertEqual(captured['effort'], 'xhigh')
+        self.assertIn('- Use one worker.\n- Unicode 日本語', captured['instructions'].split('Current usage policy:\n', 1)[1].split('\nJob: ', 1)[0])
         self.assertNotIn('Owner delegation ' + 'settings', captured['instructions'])
         self.assertIn('Job: ', captured['instructions'])
-        self.assertEqual(captured['model'], 'gpt-6.1-sol')
-
-    async def test_a5_instruction_baselines_for_other_providers(self):
-        """Switch-on instruction baselines after shared job storage rules."""
-        expected = {
-            'codex': ['be91201e877d04b89421b7a5fd85cc35a360c3591bbccfe16d6611e3310377a5', '0d5478e2324b50efebaeda101d8a01aa87f281031986c26f83a89db85a54f51c'],
-            'claude': ['f6db27bd6d73df055b5f0e99f062633d41115010fe1b67524725e22d264dd623', '6818991975483c876e717e9393227a78226e2a0d9464abe06f0df857c6ab4f40'],
-        }
-        from coordinator import extension
-        if not extension.active().worker_policy:
-            expected = {
-                'codex': ['58142726bdc5752189955282fdc295a678e219ce8bd6be4256dcdb660b367e78', '834e8907337f42a5c2f4ad7a1c75712e13fed5197a16feb68e2ffcfbfb4b49c4'],
-                'claude': ['9e9c8a09692914804f433d00f75001fb7320aa4fe0ab1532ba39672c06428d9b', 'cdaa7649aa404fed388904835debb954924be8c5df032d750be0fbf08d017bbb'],
-            }
-        (self.store.directory / 'USAGE.md').write_text('Fixture usage.\n')
-
-        async def run(*args, **options):
-            return await args[0](*args[1:], **options)
-
-        for provider in ('codex', 'claude', 'opencode'):
-            for secret in (False, True):
-                for fresh in (True, False):
-                    with self.subTest(provider=provider, secret=secret, fresh=fresh):
-                        worker = self.worker(provider)
-                        worker['fresh'] = int(fresh)
-                        runner = SimpleNamespace(run=AsyncMock(return_value=RunResult(None, text='done', success=True)))
-                        pool = WorkerPool(self.store, runner, AccountBroker(self.store))
-                        broker = SimpleNamespace(run=run, run_active=run)
-                        with patch.object(pool, 'broker', return_value=broker), \
-                                patch('coordinator.workers.spawn_refusal', return_value=None), \
-                                patch('coordinator.workers.load_for_worker', return_value=({'TEST_KEY': 'fixture'} if secret else {}, [])):
-                            await pool.run(worker, self.store.topic(TOPIC))
-                        instructions = runner.run.await_args.kwargs['instructions']
-                        temp_note = ("\n$TMPDIR is this worker's own temp folder; Torii deletes it when the worker finishes. "
-                                     "Files there may be deleted outright.")
-                        if provider != 'opencode':
-                            temp_note += "\nKeep reports, logs and proofs in the job's results folder."
-                        self.assertEqual(instructions.count(temp_note), 1)
-                        baseline = instructions.replace(temp_note, '', 1)
-                        job_line = instructions.split('\nJob: ', 1)[1].split('\n', 1)[0]
-                        job = json.loads(job_line)
-                        if provider == 'opencode':
-                            self.assertNotIn('results', job)
-                        else:
-                            self.assertEqual(job.pop('results'),
-                                             str(self.store.directory / 'results' / ('task-' + str(self.task['id']))))
-                        normalized = baseline.replace(job_line, json.dumps(job)).replace(str(self.root), '<worktree>').replace(str(host_os.trash_directory()), '<trash>')
-                        normalized = normalized.replace('macOS Trash', 'host Trash').replace('Linux Trash', 'host Trash')
-                        self.assertEqual(hashlib.sha256(json.dumps(normalized).encode()).hexdigest(),
-                                         expected['codex' if provider == 'codex' else 'claude'][secret])
-                        self.assertEqual(instructions.count(CODEX_SKILLS_POINTER), int(provider == 'codex'))
-                        if provider == 'codex':
-                            self.assertTrue(instructions.endswith('\n' + CODEX_SKILLS_POINTER))
+        self.assertEqual(captured['model'], 'gpt-6.2-sol')
 
     async def test_codex_skills_pointer_ends_account_transfer_instructions(self):
         """Switch-on baselines captured from origin/main at d5d0a00eb9dd42547135705bb88dca995b8e5c0b."""
@@ -287,34 +530,6 @@ class WorkerTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(hashlib.sha256(json.dumps(instructions).encode()).hexdigest(), expected[secret])
                 self.assertEqual(instructions.count(CODEX_SKILLS_POINTER), 1)
                 self.assertTrue(instructions.endswith(CODEX_SKILLS_POINTER))
-
-    async def test_worker_omits_only_coordinators_sections(self):
-        cases = (
-            ('middle', 'Before.  \n\n## Coordinators\nOwner only.\n### Replies\nReply now.\n\n'
-             '## Effort\nKeep this.  \n日本語\n', 'Before.  \n\n## Effort\nKeep this.  \n日本語\n'),
-            ('end', 'Before.\n\n## Coordinators\nOwner only.', 'Before.\n\n'),
-            ('trailing whitespace', 'Before.\n## Coordinators \t\nOwner only.\n## Review\nKeep.',
-             'Before.\n## Review\nKeep.'),
-            ('repeated', '## Coordinators\nFirst.\n## Work\nKeep.\n## Coordinators\nLast.\n',
-             '## Work\nKeep.\n'),
-            ('near matches', ' ## Coordinators\nKeep.\n## Coordinators extra\nKeep too.\n### Coordinators\nEnd.',
-             ' ## Coordinators\nKeep.\n## Coordinators extra\nKeep too.\n### Coordinators\nEnd.'),
-        )
-        captured = {}
-
-        class Runner:
-            async def run(self, provider, prompt, cwd, session, **options):
-                captured.update(options)
-                return RunResult(session or '00000000-0000-4000-8000-000000000001', text='done', success=True)
-
-        for provider in ('claude', 'codex'):
-            for name, policy, expected in cases:
-                with self.subTest(provider=provider, section=name):
-                    (self.store.directory / 'USAGE.md').write_text(policy)
-                    row = self.worker(provider)
-                    await WorkerPool(self.store, Runner(), AccountBroker(self.store)).run(row, self.store.topic(TOPIC))
-                    self.assertEqual(captured['instructions'].split('Current usage policy:\n', 1)[1].split('\nJob: ', 1)[0],
-                                     expected)
 
     def worker(self, provider='claude', goal=None, model=None):
         with self.store.db:
@@ -335,11 +550,37 @@ class WorkerTests(unittest.IsolatedAsyncioTestCase):
                 worker['provider'] = provider
                 self.assertEqual(can_resume_finished(self.store, worker), provider in ('claude', 'codex', 'opencode'))
 
+    async def test_older_finished_goal_worker_resumes_after_review(self):
+        from coordinator import control_api
+        from coordinator.service import Service
+        author = self.worker('codex', goal='Complete the work')
+        session = '00000000-0000-4000-8000-000000000001'
+        self.store.worker_complete(author['id'], {'success': True, 'session_id': session})
+        reviewer = self.worker('claude')
+        self.store.worker_complete(reviewer['id'], {'success': True, 'session_id': 'review-session'})
+        with self.store.db:
+            request = control_api.call(self.store, 'workers.steer', {'worker': author['id'], 'prompt': 'Fix review'},
+                                       topic=TOPIC, source='cli')
+        self.assertTrue(request.ok, request.text)
+        service = Service(self.store, None, Mock(), self.root)
+        await service.controls_once()
+        queued = service.workers.get(author['id'])
+        self.assertEqual((queued['status'], queued['session'], queued['goal']),
+                         ('queued', session, 'Complete the work'))
+
+    def test_older_finished_worker_cannot_resume_an_active_session(self):
+        author = self.worker('codex')
+        self.store.worker_complete(author['id'], {'success': True, 'session_id': 'shared-session'})
+        other = self.worker('codex')
+        self.store.db.execute("UPDATE workers SET status='running',session='shared-session',fresh=0 WHERE id=?",
+                              (other['id'],))
+        author = dict(self.store.db.execute('SELECT * FROM workers WHERE id=?', (author['id'],)).fetchone())
+        self.assertFalse(can_resume_finished(self.store, author))
+
     async def test_finished_worker_resumes_after_wait_reopens_job_with_session_cleanup_off(self):
         from coordinator import control_api
         from coordinator.service import Service
         self.store.put('session_delete', False)
-        self.store.put('waits_enabled', True)
         worker = self.worker()
         session_id = '00000000-0000-4000-8000-000000000001'
         transcript = self.root / 'primary' / 'projects' / 'test' / (session_id + '.jsonl')
@@ -609,8 +850,12 @@ for line in sys.stdin:
         elif outcome in ('success','held','held-child'):
             emit({'method':'item/completed','params':{'threadId':sid,'turnId':'turn-one',
                 'item':{'type':'agentMessage','text':'finished'}}})
-            emit({'method':'turn/completed','params':{'threadId':sid,
-                'turn':{'id':'turn-one','status':'completed'}}})
+            terminal={'method':'turn/completed','params':{'threadId':sid,
+                'turn':{'id':'turn-one','status':'completed'}}}
+            if outcome=='held-child':
+                print(json.dumps(terminal),end='',flush=True)
+            else:
+                emit(terminal)
             (root/'ending-terminal').touch()
             if outcome=='held':
                 while not (root/'release-provider').exists():
@@ -628,10 +873,12 @@ if child is not None:
         pass
 ''')
         spec = dict(argv=[sys.executable, '-u', str(binary), str(self.root), outcome, session,
-                          str(stubborn), str(detached)], cwd=str(self.root), env={'PATH': os.environ['PATH']},
+            str(stubborn), str(detached)], cwd=str(self.root), env={'PATH': os.environ.get('PATH', os.defpath)},
                     provider='codex', locks=['codex-' + session], initial_payload='build this', fresh=True, model=None)
         if detached:
             spec['ownership'] = 'coalition'
+        elif not host_os.macos():
+            spec['group_owned'] = True
         client = await HostClient.launch(directory, spec, stop_timeout=.1)
         self.addCleanup(client.detach)
         self.addAsyncCleanup(client.stop)
@@ -692,7 +939,7 @@ if child is not None:
 
     async def test_detached_child_is_stopped_without_signalling_an_unrelated_process(self):
         from coordinator import process_ownership
-        detached = sys.platform == 'darwin'
+        detached = host_os.macos()
         unrelated = await asyncio.create_subprocess_exec(sys.executable, '-c', 'import time; time.sleep(120)',
                                                          start_new_session=True)
         async def cleanup():
@@ -762,18 +1009,11 @@ if child is not None:
         self.assertTrue(json.loads(done['result'])['success'], done['result'])
         await self.assert_worker_processes_ended(done, client)
 
-    async def test_terminal_result_with_child_holding_stdout_waits_for_eof(self):
-        pool, worker, client = await self.ending_worker('held-child', detached=sys.platform == 'darwin')
+    async def test_terminal_result_with_child_holding_stdout_is_drained_and_reaped(self):
+        pool, worker, client = await self.ending_worker('held-child', detached=host_os.macos())
         running = asyncio.create_task(pool.run(worker, self.store.topic(TOPIC)))
-        try:
-            await until_exists(self.root / 'ending-terminal')
-            await until(lambda: not alive(client.child_pid), 'the provider to exit while its child holds stdout')
-            self.assertEqual(pool.get(worker['id'])['status'], 'running')
-            self.assertTrue(alive(int((self.root / 'ending-child').read_text())))
-            self.assertFalse(running.done())
-        finally:
-            (self.root / 'release-child').touch()
-            done = await settle(running)
+        await until_exists(self.root / 'ending-terminal')
+        done = await settle(running)
         self.assertTrue(json.loads(done['result'])['success'], done['result'])
         await self.assert_worker_processes_ended(done, client)
 
@@ -1113,7 +1353,7 @@ assert sys.stdin.read()==''
                               options.get('initial_steer')))
                 if len(calls) == 1:
                     return RunResult(session, quota_limited=True, transcript_path=str(transcript),
-                                     rate_limit_info={'status': 'rejected', 'rateLimitType': 'five_hour',
+                                     rate_limit_info={'status': 'rejected', 'rateLimitType': 'seven_day',
                                                       'resetsAt': reset})
                 return RunResult(session, text='resumed', success=True, transcript_path=str(transcript))
 
@@ -1156,7 +1396,7 @@ assert sys.stdin.read()==''
         status['second'] = dict(status['primary'], identity={'email': 'second@example.com', 'logged_in': True})
         self.store.put('accounts', accounts)
         self.store.put('account_status', status)
-        for meter in ('five_hour', 'seven_day'):
+        for meter in ('seven_day', 'seven_day_fable'):
             with self.subTest(meter=meter):
                 self.store.put('account_blocks', {})
                 worker = self.worker()
@@ -1255,7 +1495,7 @@ assert sys.stdin.read()==''
                 status['primary']['usage']['seven_day']['utilization'] = utilization
                 self.store.put('account_status', status)
 
-        usage(98)
+        usage(99)
         worker = self.worker()
         service = Service(self.store, None, Runner(), self.root)
         waiting = await service.workers.run(worker, self.store.topic(TOPIC))
@@ -1300,7 +1540,7 @@ for line in sys.stdin:
     if text.startswith('/goal '):
         if QUOTA_LIMITED:
             print(json.dumps({'type':'rate_limit_event','session_id':sid,'rate_limit_info':
-                {'status':'rejected','resetsAt':4102444800,'rateLimitType':'five_hour'}}),flush=True)
+                {'status':'rejected','resetsAt':4102444800,'rateLimitType':'seven_day'}}),flush=True)
         print(json.dumps({'type':'goal_status','session_id':sid,'status':GOAL_STATUS,
             'condition':text[6:],'reason':'verified','iterations':3}),flush=True)
         print(json.dumps({'type':'result','subtype':'success','session_id':sid,'result':'complete'}),flush=True)
@@ -1348,10 +1588,12 @@ for line in sys.stdin:
         messages = list(self.store.db.execute(
             'SELECT kind,topic,text FROM messages WHERE source_worker=?', (worker['id'],)))
         self.assertEqual([(row['kind'], row['topic']) for row in messages], [('worker_result', TOPIC)])
-        self.assertEqual(json.loads(messages[0]['text']), expected)
+        event = {k: v for k, v in expected.items() if k != 'rate_limit_info'}
+        event['no_handoff'] = None if finished['no_handoff'] is None else bool(finished['no_handoff'])
+        self.assertEqual(json.loads(messages[0]['text']), event)
         problems = [tuple(row) for row in self.store.db.execute(
             'SELECT area,code,detail,topic,task FROM problems WHERE worker=?', (worker['id'],))]
-        self.assertEqual(problems, [] if success else [('worker', code, detail, TOPIC, self.task['id'])])
+        self.assertEqual(problems, [] if success or code in ('blocked', 'partial') else [('worker', code, detail, TOPIC, self.task['id'])])
         states = [row[0] for row in self.store.db.execute(
             'SELECT status FROM goal_worker_statuses WHERE worker=?', (worker['id'],))]
         self.assertNotIn('waiting_for_quota', states)
@@ -1405,6 +1647,29 @@ for line in sys.stdin:
             with self.subTest(provider=provider):
                 runner = SimpleNamespace(run=AsyncMock(return_value=RunResult('saved-session', success=True)))
                 await self.check_run(self.worker(provider), runner)
+
+    async def test_blocked_or_partial_report_is_unsuccessful_done(self):
+        for provider in ('claude', 'codex'):
+            for text, code, detail in (
+                    ('Tests pass on two of three hosts.\nRESULT: partial macOS gate not run', 'partial',
+                     'RESULT: partial macOS gate not run'),
+                    ('Needs a decision.\n\n**RESULT: blocked** owner must pick the schema', 'blocked',
+                     '**RESULT: blocked** owner must pick the schema'),
+                    ('result: Partial', 'partial', 'result: Partial')):
+                with self.subTest(provider=provider, code=code):
+                    runner = SimpleNamespace(run=AsyncMock(return_value=RunResult('saved-session', text=text, success=True)))
+                    await self.check_run(self.worker(provider), runner, success=False, code=code, detail=detail)
+
+    async def test_done_or_missing_report_stays_successful(self):
+        for text in ('PR #9 opened.\nRESULT: done', 'PR #9 opened.', 'RESULT: partial is a word here.\nAll done.'):
+            with self.subTest(text=text):
+                runner = SimpleNamespace(run=AsyncMock(return_value=RunResult('saved-session', text=text, success=True)))
+                await self.check_run(self.worker(), runner)
+
+    async def test_report_keeps_an_earlier_failure(self):
+        runner = SimpleNamespace(run=AsyncMock(return_value=RunResult(
+            'saved-session', text='RESULT: partial', failure_code='execution_failed', failure_detail='boom')))
+        await self.check_run(self.worker(), runner, success=False, code='execution_failed', detail='boom')
 
     async def test_unmet_goal_preserves_existing_failures(self):
         for provider in ('claude', 'codex'):

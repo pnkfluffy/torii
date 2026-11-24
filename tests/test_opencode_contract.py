@@ -248,7 +248,7 @@ async def capture_run(root, binary, base_url, proxy, mode='ok', config_hook=None
         return result
     try:
         runner = ProviderRunner(store.directory, opencode_store=store)
-        with patch('coordinator.providers.platform', 'linux'), \
+        with patch('coordinator.host_os.uses_worker_coalitions', new=lambda: False), \
                 patch('coordinator.opencode_runtime.environment', environment), \
                 patch('coordinator.opencode_runtime.write_config', write), \
                 patch('coordinator.opencode_accounts.account_home', return_value=key_home), \
@@ -284,7 +284,7 @@ class OpenCodeFixtureTests(unittest.TestCase):
                      'Set TORII_OPENCODE_CONTRACT_BINARY to the pinned OpenCode binary')
 class OpenCodeContractTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
-        platform = patch('coordinator.providers.platform', 'linux')
+        platform = patch('coordinator.host_os.uses_worker_coalitions', new=lambda: False)
         platform.start()
         self.addCleanup(platform.stop)
         self.temp = tempfile.TemporaryDirectory(prefix='opencode-contract-')

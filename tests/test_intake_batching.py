@@ -2,6 +2,7 @@ import asyncio
 from collections import Counter
 import json
 import re
+import time
 import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -39,11 +40,11 @@ class BusyParent(FakeSession):
 
 
 class IntakeBatchingTests(ServiceTestsSupport, unittest.IsolatedAsyncioTestCase):
-    async def parent(self, enabled=True):
-        self.store.put('coordinator_intake_batching', enabled)
+    async def parent(self):
         session = BusyParent()
         session.usage_policy = chat_policy(self.store, session.key)
         self.service.sessions[TOPIC] = session
+        self.service.last_turn[TOPIC] = time.monotonic()
         self.sessions.append(session)
         return session
 
@@ -89,17 +90,6 @@ class IntakeBatchingTests(ServiceTestsSupport, unittest.IsolatedAsyncioTestCase)
             self.assertIn('created=', prompt)
         print('flood on: 31 rows, 2 batches (20, 11), owner answered in turn 1, each row received once')
 
-    async def test_switch_off_keeps_main_fifo_admission_while_busy(self):
-        session = await self.parent(enabled=False)
-        workers = [self.result(number + 1) for number in range(30)]
-        owner = self.store.message_save(TOPIC, 'owner', 'Answer this request.')
-        await self.flush()
-        self.assertEqual([identity for identity, _ in session.sent], [message_uuid(row['id']) for row in workers + [owner]])
-        turns = [session.next_turn() for _ in range(31)]
-        self.assertEqual(turns, [[row['id']] for row in workers + [owner]])
-        self.assertTrue(all('sender=' not in text for _, text in session.sent))
-        print('flood off: 31 rows, 31 inputs, owner at FIFO position and fixture turn 31')
-
     async def test_routine_flood_is_admitted_while_busy_and_owner_heads_next_batch(self):
         session = await self.parent()
         workers = [self.result(number + 1) for number in range(30)]
@@ -130,7 +120,6 @@ class IntakeBatchingTests(ServiceTestsSupport, unittest.IsolatedAsyncioTestCase)
 
     async def test_waiting_owner_header_keeps_one_original_tag_per_item(self):
         session = await self.parent()
-        self.store.put('waits_enabled', True)
         waiting = control_api.call(self.store, 'tasks.wait', {'kind': 'owner', 'ask': 'Pick A or B'}, topic=TOPIC)
         self.assertTrue(waiting.ok, waiting.text)
         owner = self.store.message_save(TOPIC, 'owner', 'What is next?')
@@ -202,7 +191,7 @@ class IntakeBatchingTests(ServiceTestsSupport, unittest.IsolatedAsyncioTestCase)
         self.assertFalse(self.store.message_batch_sending([first['id']]))
         self.assertTrue(self.store.message_batch_sending([second['id'], first['id']]))
 
-    async def test_existing_batch_is_not_regrouped_with_new_owner_and_off_still_recovers(self):
+    async def test_existing_batch_is_not_regrouped_with_new_owner(self):
         session = await self.parent()
         a, b = self.result(1), self.result(2)
         self.assertTrue(self.store.message_batch_sending([a['id'], b['id']]))
@@ -210,7 +199,6 @@ class IntakeBatchingTests(ServiceTestsSupport, unittest.IsolatedAsyncioTestCase)
         owner = self.store.message_save(TOPIC, 'owner', 'New independent ask.')
         await self.flush()
         self.assertEqual(session.next_turn(), [owner['id']])
-        self.store.put('coordinator_intake_batching', False)
         session.busy = False
         await self.flush()
         self.assertEqual(session.next_turn(), [a['id'], b['id']])
@@ -257,7 +245,6 @@ class IntakeBatchingTests(ServiceTestsSupport, unittest.IsolatedAsyncioTestCase)
         self.store.requeue_messages(ids)
         with self.store.db:
             self.store.db.execute("UPDATE topics SET enabled=1 WHERE id='other'")
-        self.store.put('coordinator_intake_batching', False)
         with patch.object(self.service, 'start_session', AsyncMock(return_value=session)) as start:
             await self.flush()
         self.assertEqual([call.args[0] for call in start.await_args_list], [TOPIC])
@@ -358,14 +345,3 @@ class IntakeBatchingTests(ServiceTestsSupport, unittest.IsolatedAsyncioTestCase)
         opencode_recovery.save(self.store, session.key, None)
         await self.flush()
         self.assertEqual(session.next_turn(), [owner['id']])
-
-    async def test_switch_is_persisted_off_by_default_and_exposed_to_mcp(self):
-        self.assertIsNone(self.store.get('coordinator_intake_batching'))
-        result = control_api.call(self.store, 'settings.get', {})
-        self.assertIs(result.data['coordinator_intake_batching'], False)
-        for enabled in (True, False):
-            result = control_api.call(self.store, 'service.intake_batching', {'enabled': enabled},
-                                      topic=TOPIC, source='mcp')
-            self.assertTrue(result.ok, result.text)
-            self.assertIs(self.store.get('coordinator_intake_batching'), enabled)
-        self.assertFalse(control_api.call(self.store, 'service.intake_batching', {'enabled': 'invalid'}).ok)

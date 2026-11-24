@@ -16,7 +16,7 @@ import time
 import unittest
 from unittest.mock import AsyncMock, patch
 
-from coordinator import host, opencode_runtime, process_ownership as ownership, worker_storage
+from coordinator import host, host_os, opencode_runtime, process_ownership as ownership, worker_storage, workspaces
 from coordinator.host import CleanupFailed, HostClient, HostDied
 
 
@@ -71,7 +71,7 @@ class FakeBackend:
 
 
 def member(pid=100, unique=1000, version=7, resource=90, uid=501):
-    return ownership.Process(pid, unique, version, resource, 91, uid, 20)
+    return host_os.Process(pid, unique, version, resource, 91, uid, 20)
 
 
 def save_owner(directory, process=None, **fields):
@@ -86,11 +86,15 @@ def save_owner(directory, process=None, **fields):
 class FakeHostBackend(FakeBackend):
     def __init__(self, directory, sticky=False, unavailable=False):
         self.directory = Path(directory)
+        self.darwin = ownership.DarwinBackend()
         self.host = member(os.getpid(), uid=os.getuid())
         super().__init__([self.host])
         self.sticky = sticky
         self.unavailable = unavailable
         self.added = False
+
+    def load(self):
+        return self.darwin.load()
 
     def uid(self):
         return os.getuid()
@@ -140,7 +144,7 @@ class FakeJobs(FakeBackend):
         directory = Path(args[-1])
         self.directories[value['Label']] = directory
         script = ('import sys; from pathlib import Path; '
-                  'from coordinator import host, process_ownership; '
+                  'from coordinator import host, host_os, process_ownership; '
                   'from tests.test_process_ownership import FakeHostBackend; '
                   'process_ownership.backend=FakeHostBackend(Path(sys.argv[1]),%r,%r); '
                   'host.main(sys.argv[1])') % (self.sticky_host, self.unavailable)
@@ -218,7 +222,7 @@ class LaunchctlTests(unittest.TestCase):
                 else:
                     with self.assertRaisesRegex(OSError, operation + ' timed out'):
                         getattr(backend, operation)(argument)
-        with patch.object(ownership.subprocess, 'run', side_effect=subprocess.TimeoutExpired('launchctl', 15)):
+        with patch.object(host_os.subprocess, 'run', side_effect=subprocess.TimeoutExpired('launchctl', 15)):
             self.assertEqual(backend.job_state('test'), 'missing')
             with self.assertRaises(OSError):
                 backend.bootstrap(Path('test.plist'))
@@ -234,7 +238,7 @@ class OwnershipFakeTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
-        self.root = Path(self.temp.name)
+        self.root = Path(self.temp.name).resolve()
         self.fake = FakeBackend([member(), member(101, 1001)])
         backend = patch.object(ownership, 'backend', self.fake)
         backend.start()
@@ -520,7 +524,7 @@ class OwnershipFakeTests(unittest.IsolatedAsyncioTestCase):
             case.addCleanup = resources.callback
             case.setUp()
             try:
-                with patch('coordinator.providers.platform', platform), \
+                with patch('coordinator.host_os.uses_worker_coalitions', new=lambda: platform == 'darwin'), \
                         patch.object(HostClient, 'launch', AsyncMock(side_effect=RuntimeError('captured'))) as launch:
                     await case.run_worker()
                 self.assertEqual(launch.await_args.args[1].get('ownership'),
@@ -536,7 +540,7 @@ class OwnershipFakeTests(unittest.IsolatedAsyncioTestCase):
                 for platform in ('darwin', 'linux'):
                     for worker_id in (None, 9):
                         with self.subTest(provider=provider, platform=platform, worker=worker_id), \
-                                patch('coordinator.providers.platform', platform), \
+                                patch('coordinator.host_os.uses_worker_coalitions', new=lambda: platform == 'darwin'), \
                                 patch.object(HostClient, 'launch', AsyncMock(side_effect=RuntimeError('captured'))) as launch:
                             await case.run_provider(provider, fresh=True, worker_id=worker_id)
                         self.assertEqual(launch.await_args.args[1].get('ownership'),
@@ -573,15 +577,15 @@ class OwnershipFakeTests(unittest.IsolatedAsyncioTestCase):
                 jobs = FakeJobs(sticky=failed)
                 problems = []
                 removals = []
-                remove = worker_storage._remove_tree
-                def checked_remove(root):
+                remove = workspaces.delete_tree
+                async def checked_remove(root, **options):
                     records = list((case.store.directory / 'hosts').glob('*/owner.json'))
                     removals.extend(json.loads(path.read_text())['cleanup'] for path in records)
-                    return remove(root)
+                    return await remove(root, **options)
                 try:
                     case.scenario(scratch_files=True)
-                    with patch('coordinator.providers.platform', 'darwin'), patch.object(ownership, 'backend', jobs), \
-                            patch.object(worker_storage, '_remove_tree', checked_remove):
+                    with patch('coordinator.host_os.uses_worker_coalitions', new=lambda: True), patch.object(ownership, 'backend', jobs), \
+                            patch.object(workspaces, 'delete_tree', checked_remove):
                         result = await case.run_worker(on_problem=lambda *args: problems.append(args))
                         await case.cleanup_storage(result)
                     self.assertTrue(result.success, result)
@@ -590,9 +594,10 @@ class OwnershipFakeTests(unittest.IsolatedAsyncioTestCase):
                     record = ownership.read_owner(directory)
                     self.assertEqual(record['cleanup'], 'failed' if failed else 'ok')
                     self.assertEqual((launch / 'tmp/scratch').exists(), failed)
+                    self.assertEqual((launch / 'cache').exists(), failed)
                     self.assertEqual((launch / 'home/Library/Caches/scratch').exists(), failed)
                     self.assertEqual(len([p for p in problems if p[:2] == ('worker', 'ownership-cleanup')]), int(failed))
-                    self.assertEqual(removals, [] if failed else ['ok', 'ok'])
+                    self.assertEqual(removals, [] if failed else ['ok', 'ok', 'ok'])
                 finally:
                     jobs.close()
                     resources.close()
@@ -618,7 +623,7 @@ class OwnershipFakeTests(unittest.IsolatedAsyncioTestCase):
         case.setUp()
         jobs = FakeJobs(unavailable=True)
         try:
-            with patch('coordinator.providers.platform', 'darwin'), patch.object(ownership, 'backend', jobs):
+            with patch('coordinator.host_os.uses_worker_coalitions', new=lambda: True), patch.object(ownership, 'backend', jobs):
                 result = await case.run_worker()
             self.assertFalse(result.success)
             self.assertEqual(result.failure_code, 'ownership_unavailable')
@@ -689,7 +694,8 @@ class OwnershipFakeTests(unittest.IsolatedAsyncioTestCase):
                 try:
                     with ExitStack() as stack:
                         stack.enter_context(patch.object(ownership, 'backend', jobs))
-                        stack.enter_context(patch.object(host, 'HOST_TIMEOUT', .2 if stage == 'handoff' else 2))
+                        if stage == 'handoff':
+                            stack.enter_context(patch.object(host, 'HOST_TIMEOUT', .2))
                         if stage == 'create':
                             stack.enter_context(patch.object(ownership.plistlib, 'dump', side_effect=failure))
                         elif stage == 'broken-plist':
@@ -767,7 +773,7 @@ class OwnershipFakeTests(unittest.IsolatedAsyncioTestCase):
                 resources.callback(jobs.close)
                 problems = []
                 case.scenario(scratch_files=True)
-                with patch('coordinator.providers.platform', 'darwin'), patch.object(ownership, 'backend', jobs):
+                with patch('coordinator.host_os.uses_worker_coalitions', new=lambda: True), patch.object(ownership, 'backend', jobs):
                     with patch.object(jobs, 'bootout', side_effect=failure) as failed:
                         result = await case.run_worker(on_problem=lambda *args: problems.append(args))
                         self.assertEqual((result.success, result.failure_code), (True, None), result)
@@ -871,9 +877,27 @@ class OwnershipFakeTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(ownership.cleanup(self.root)['status'], 'failed')
 
     async def test_support_is_lazy_and_linux_is_false(self):
-        with patch.object(ownership.sys, 'platform', 'linux'), patch.object(self.fake, 'load') as load:
+        with patch.object(host_os, 'SYSTEM', 'linux'), patch.object(self.fake, 'load') as load:
             self.assertFalse(ownership.supported())
             load.assert_not_called()
+
+
+    async def test_identity_read_retries_when_the_process_changes_during_a_scan(self):
+        versions = iter([1, 2] + [3] * 100)
+        class Lib:
+            def proc_pidinfo(self, pid, flavor, arg, buffer, size):
+                value = buffer._obj
+                if flavor == 17:
+                    value.unique, value.version = 7, next(versions)
+                return size
+        backend = ownership.DarwinBackend()
+        with patch.object(backend, 'load', return_value=Lib()):
+            info = backend.metadata(123)
+        self.assertEqual((info.pid, info.unique, info.version), (123, 7, 3))
+        versions = (index for index in range(1000))
+        with patch.object(backend, 'load', return_value=Lib()):
+            with self.assertRaises(OSError):
+                backend.metadata(123)
 
 
 def register_probe(root, role):
@@ -1008,7 +1032,7 @@ else:
 '''
 
 
-@unittest.skipUnless(sys.platform == 'darwin' and os.environ.get('TORII_OWNERSHIP_DARWIN') == '1',
+@unittest.skipUnless(host_os.macos() and os.environ.get('TORII_OWNERSHIP_DARWIN') == '1',
                      'Set TORII_OWNERSHIP_DARWIN=1 for isolated launchd ownership checks')
 class DarwinOwnershipTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
@@ -1131,7 +1155,7 @@ class DarwinOwnershipTests(unittest.IsolatedAsyncioTestCase):
         ownership.write(directory / 'spec.json', dict(provider='opencode', ownership='coalition',
             argv=[sys.executable, str(self.script), str(self.root), 'stop'], env={}, cwd=str(self.root)))
         script = ('import asyncio,sys; from pathlib import Path; '
-                  'from coordinator import host,process_ownership; '
+                  'from coordinator import host, host_os,process_ownership; '
                   'from tests.test_process_ownership import register_probe,GuardedDarwinBackend; '
                   'register_probe(sys.argv[2],"host"); '
                   'process_ownership.backend=GuardedDarwinBackend(sys.argv[2]); '

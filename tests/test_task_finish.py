@@ -1,10 +1,8 @@
-import subprocess
-import sys
 from pathlib import Path
 import tempfile
 import unittest
 
-from coordinator import control_api, mcp
+from coordinator import control_api
 from coordinator.store import Store
 
 
@@ -49,17 +47,7 @@ class TaskFinishTests(unittest.TestCase):
         self.assertIsNone(home.data['finish'])
         task = self.job()
         self.assertIsNone(task['finish'])
-        self.assertTrue(self.call('tasks.update', task=task['id'], status='done').ok)
-
-    def test_home_chat_can_set_merged_and_clear_its_default(self):
-        configured = control_api.call(self.store, 'tasks.finish_default',
-                                      {'topic': HOME_TOPIC, 'finish': 'merged'}, source='cli')
-        self.assertTrue(configured.ok, configured.text)
-        self.assertEqual(self.call('tasks.create', title='Code', topic=HOME_TOPIC).data['finish'], 'merged')
-        cleared = control_api.call(self.store, 'tasks.finish_default', {'topic': HOME_TOPIC}, source='cli')
-        self.assertTrue(cleared.ok, cleared.text)
-        self.assertIsNone(cleared.data['finish'])
-        self.assertIsNone(self.call('tasks.create', title='Research', topic=HOME_TOPIC).data['finish'])
+        self.assertTrue(self.call('tasks.update', task=task['id'], status='done', summary='Closed in test.').ok)
 
     def test_finish_can_change_while_open_and_is_validated(self):
         task = self.job('merged')
@@ -70,14 +58,14 @@ class TaskFinishTests(unittest.TestCase):
         result = self.call('tasks.update', task=task['id'], finish='unknown')
         self.assertFalse(result.ok, result.text)
         self.assertEqual(self.store.task_get(task['id'])['finish'], 'merged')
-        self.assertTrue(self.call('tasks.update', task=task['id'], status='dropped', note='Cancelled').ok)
+        self.assertTrue(self.call('tasks.update', task=task['id'], status='dropped', summary='Closed in test.', note='Cancelled').ok)
         result = self.call('tasks.update', task=task['id'], finish='answered')
         self.assertFalse(result.ok, result.text)
         self.assertEqual(self.store.task_get(task['id'])['finish'], 'merged')
 
     def test_finish_can_change_in_the_call_that_closes_the_job(self):
         task = self.job('merged')
-        result = self.call('tasks.update', task=task['id'], finish='answered', status='done')
+        result = self.call('tasks.update', task=task['id'], finish='answered', status='done', summary='Closed in test.')
         self.assertTrue(result.ok, result.text)
         self.assertEqual((result.data['finish'], result.data['status']), ('answered', 'done'))
 
@@ -91,20 +79,3 @@ class TaskFinishTests(unittest.TestCase):
         with self.store.db:
             self.store.put('finish_default:1:2', 'answered')
         self.assertEqual(self.call('tasks.create', title='Override').data['finish'], 'answered')
-
-    def test_local_cli_sets_or_clears_topic_default(self):
-        for source in ('mcp', 'telegram'):
-            result = control_api.call(self.store, 'tasks.finish_default',
-                                      {'topic': '1:2', 'finish': 'answered'}, source=source)
-            self.assertFalse(result.ok, result.text)
-            self.assertIn('local CLI', result.text)
-        command = [sys.executable, '-m', 'coordinator', '--state-dir', str(self.store.directory), 'ctl', 'call']
-        done = subprocess.run(command + ['tasks.finish_default', 'topic=1:2', 'finish=answered'],
-                              capture_output=True, text=True, timeout=15)
-        self.assertEqual(done.returncode, 0, done.stderr)
-        self.assertEqual(self.call('tasks.create', title='Configured').data['finish'], 'answered')
-        done = subprocess.run(command + ['tasks.finish_default', 'topic=1:2'],
-                              capture_output=True, text=True, timeout=15)
-        self.assertEqual(done.returncode, 0, done.stderr)
-        self.assertIsNone(self.call('tasks.create', title='Cleared').data['finish'])
-        self.assertNotIn('tasks_finish_default', mcp.TOOLS)

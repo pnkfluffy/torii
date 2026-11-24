@@ -1,13 +1,12 @@
 import asyncio
-from contextlib import redirect_stdout
-from io import StringIO
 import json
 import re
+import time
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
-from coordinator import control_api, mcp, onboarding, topics
+from coordinator import control_api, onboarding, topics
 from coordinator.telegram import Telegram
 from coordinator.waits import owner_header
 from coordinator.formatting import markdown_to_html
@@ -20,6 +19,12 @@ class WaitReviewSupport(ServiceTestsSupport):
         self.origin = self.store.message_save(TOPIC, 'owner', 'Build the job', telegram_message=405)
 
     def call(self, op, context_topic=TOPIC, **params):
+        if op == 'tasks.update' and params.get('status') == 'done':
+            job = self.store.task_get(params['task'])
+            opened = self.store.task_iterations(job['id'])[-1]['opened']
+            if not self.store.db.execute('SELECT 1 FROM outbox WHERE task=? AND created>=?', (job['id'], opened)).fetchone():
+                with self.store.db:
+                    self.store.enqueue_report(job['topic'], 'Result', task=job['id'])
         return control_api.call(self.store, op, params, topic=context_topic)
 
     def ok(self, op, context_topic=TOPIC, **params):
@@ -91,7 +96,6 @@ class WaitReviewSupport(ServiceTestsSupport):
 class WaitReviewTests(WaitReviewSupport, unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         await super().asyncSetUp()
-        self.store.put('waits_enabled', True)
 
     async def test_b1_parked_workers_refuse_blocking_waits(self):
         for status, kind, params in (
@@ -143,12 +147,13 @@ class WaitReviewTests(WaitReviewSupport, unittest.IsolatedAsyncioTestCase):
         wait = self.wait(first, kind='job', key='job:shared-deploy', ask='After the deploy', job=deploy['id'])
         joined = self.wait(second, kind='job', key='job:shared-deploy', ask='After the deploy', job=deploy['id'])
         self.assertEqual(joined['id'], wait['id'])
+        self.assertEqual(self.store.task_get(second['id'])['status'], 'open')
         await self.close_topic(TOPIC)
         self.assertEqual((self.store.wait_get(wait['id'])['state'],
                           self.store.wait_get(wait['id'])['topic']), ('armed', other))
-        self.ok('tasks.update', task=deploy['id'], status='done')
+        self.ok('tasks.update', task=deploy['id'], status='done', summary='Closed in test.')
         self.assertEqual((self.store.task_get(second['id'])['status'],
-                          self.store.task_get(second['id'])['iteration']), ('open', 1))
+                          self.store.task_get(second['id'])['iteration']), ('open', 0))
         self.assertEqual([row['topic'] for row in self.callbacks()], [other])
 
     async def test_b2_waiting_job_without_blocking_wait_gets_one_callback(self):
@@ -168,7 +173,7 @@ class WaitReviewTests(WaitReviewSupport, unittest.IsolatedAsyncioTestCase):
         for status in ('done', 'dropped'):
             with self.subTest(status=status):
                 task = self.job('Round ending ' + status)
-                self.ok('tasks.update', task=task['id'], status='done')
+                self.ok('tasks.update', task=task['id'], status='done', summary='Closed in test.')
                 watch = self.wait(task, kind='time', ask='Watch the delivered result',
                                   at='2030-01-02T00:00:00Z', watch=True)
                 origin = self.store.message_save(TOPIC, 'owner', 'Continue the job')
@@ -178,7 +183,7 @@ class WaitReviewTests(WaitReviewSupport, unittest.IsolatedAsyncioTestCase):
                     self.store.db.execute("UPDATE workers SET status='done' WHERE id=?", (spawned.data['worker'],))
                 owner = self.wait(task, ask='Approve this round?')
                 timer = self.wait(task, kind='time', ask='Retry this round', at='2030-01-03T00:00:00Z')
-                self.ok('tasks.update', task=task['id'], status=status)
+                self.ok('tasks.update', task=task['id'], status=status, **({'summary': 'Closed in test.'} if status in ('done', 'dropped') else {}), **({'note': 'No longer needed'} if status == 'dropped' else {}))
                 self.assertEqual(self.store.task_get(task['id'])['status'], status)
                 self.assertEqual([self.store.wait_get(item['id'])['state'] for item in (owner, timer, watch)],
                                  ['cancelled', 'cancelled', 'armed'])
@@ -194,7 +199,7 @@ class WaitReviewTests(WaitReviewSupport, unittest.IsolatedAsyncioTestCase):
         owner = self.wait(task, ask='Approve the plan?')
         timer = self.wait(task, kind='time', ask='Check tomorrow', at='1970-01-01T00:33:20Z')
         self.wait(task, kind='job', ask='After the dependency', job=dependency['id'])
-        self.ok('tasks.update', task=dependency['id'], status='done')
+        self.ok('tasks.update', task=dependency['id'], status='done', summary='Closed in test.')
         self.assertEqual([self.store.wait_get(item['id'])['state'] for item in (owner, timer)],
                          ['cancelled', 'cancelled'])
         self.assertEqual(self.store.task_get(task['id'])['status'], 'open')
@@ -219,7 +224,7 @@ class WaitReviewTests(WaitReviewSupport, unittest.IsolatedAsyncioTestCase):
                 first, second = self.job('Finishing ' + status), self.job('Still waiting ' + status, other)
                 wait = self.wait(first, key='owner:shared-' + status)
                 self.wait(second, key='owner:shared-' + status)
-                self.ok('tasks.update', task=first['id'], status=status)
+                self.ok('tasks.update', task=first['id'], status=status, **({'summary': 'Closed in test.'} if status in ('done', 'dropped') else {}), **({'note': 'No longer needed'} if status == 'dropped' else {}))
                 remaining = self.store.wait_get(wait['id'])
                 self.assertEqual((remaining['state'], [link['task'] for link in remaining['jobs']]),
                                  ('armed', [second['id']]))
@@ -249,7 +254,7 @@ class WaitReviewTests(WaitReviewSupport, unittest.IsolatedAsyncioTestCase):
         self.assertEqual([item['ask'] for item in self.store.waits_list()],
                          ['After the deploy', 'After the deploy', 'Continue once deploy is live'])
         await self.close_topic(TOPIC)
-        self.ok('tasks.update', task=dependency['id'], status='done')
+        self.ok('tasks.update', task=dependency['id'], status='done', summary='Closed in test.')
         self.assertEqual(self.store.task_get(second['id'])['status'], 'open')
         self.assertEqual([row['topic'] for row in self.callbacks()], [other])
         self.assertIn('After the deploy', self.callbacks()[0]['text'])
@@ -416,7 +421,7 @@ class WaitReviewTests(WaitReviewSupport, unittest.IsolatedAsyncioTestCase):
                                 VALUES ('SAMPLE_TOKEN','Test card','test',?,'filled',1,2,1)''', (TOPIC,)).lastrowid
                             self.store.message_secret_filled(TOPIC, envelope, 'The sample card is filled.')
                     elif trigger == 'job':
-                        self.ok('tasks.update', task=dependency['id'], status='done')
+                        self.ok('tasks.update', task=dependency['id'], status='done', summary='Closed in test.')
                     else:
                         answer = self.store.message_save(TOPIC, 'owner', 'Use A')
                         self.ok('pending.fire', wait=wait['id'], message=answer['id'])
@@ -496,8 +501,14 @@ class WaitReviewTests(WaitReviewSupport, unittest.IsolatedAsyncioTestCase):
         self.assertEqual([row['topic'] for row in self.callbacks()], [TOPIC])
         problems = [dict(row) for row in self.store.db.execute('SELECT * FROM problems')]
         self.assertEqual(len(problems), 1)
-        self.assertEqual((problems[0]['area'], problems[0]['code'], problems[0]['detail']),
-                         ('waits', 'timer-trigger-failed', 'RuntimeError'))
+        self.assertEqual((problems[0]['area'], problems[0]['code']), ('waits', 'timer-trigger-failed'))
+        self.assertRegex(problems[0]['detail'], r'^item=%d failures=1 RuntimeError: Fixture wait write failed at '
+                                                r'test_waits_review\.py:\d+ fire' % bad['id'])
+        with patch.object(self.store, 'wait_fire', side_effect=fire) as retried:
+            await self.service.waits_once()
+        retried.assert_not_called()
+        row = self.store.db.execute('SELECT MIN(retry) FROM sweep_failures').fetchone()
+        self.assertGreater(row[0], time.time() + 30)
 
     async def test_n5_spawn_releases_only_target_shared_link(self):
         other = self.other_topic()
@@ -537,7 +548,7 @@ class WaitReviewTests(WaitReviewSupport, unittest.IsolatedAsyncioTestCase):
         for status in ('done', 'dropped'):
             with self.subTest(status=status):
                 task = self.job('Closed ' + status)
-                self.ok('tasks.update', task=task['id'], status=status)
+                self.ok('tasks.update', task=task['id'], status=status, **({'summary': 'Closed in test.'} if status in ('done', 'dropped') else {}), **({'note': 'No longer needed'} if status == 'dropped' else {}))
                 previous = self.store.task_iterations(task['id'])[-1]
                 result = self.call('tasks.wait', task=task['id'], kind='time', ask='Try later',
                                    at='1970-01-01T00:33:20Z')
@@ -548,7 +559,7 @@ class WaitReviewTests(WaitReviewSupport, unittest.IsolatedAsyncioTestCase):
                 self.assertEqual((self.store.task_get(task['id'])['status'], watch['jobs'][0]['blocking']), (status, 0))
                 await self.service.waits_once()
                 self.assertEqual((self.store.wait_get(watch['id'])['state'],
-                                  self.store.task_get(task['id'])['status']), ('fired', 'open'))
+                                  self.store.task_get(task['id'])['status']), ('fired', status))
                 self.assertEqual(self.store.task_iterations(task['id'])[0], previous)
 
     async def test_n8_slash_reply_keeps_wait_armed(self):
@@ -572,7 +583,8 @@ class WaitReviewTests(WaitReviewSupport, unittest.IsolatedAsyncioTestCase):
         self.wait(self.job('Three'), ask='Third ask ' + 'z' * 3900)
         message = self.store.message_save(TOPIC, 'owner', 'Hello', telegram_message=950)
         prepared = await self.service._prepare_message(message)
-        tag = prepared[:prepared.index('] Owner message:') + 1]
+        self.assertTrue(prepared.endswith('] Hello'))
+        tag = prepared.removesuffix(' Hello')
         self.assertIn('waiting=', tag)
         header, unused = json.JSONDecoder().raw_decode(tag.split(' waiting=', 1)[1])
         self.assertIn('Use "fast" path?', header)
@@ -633,105 +645,24 @@ class WaitReviewTests(WaitReviewSupport, unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.store.task_iterations(waiting['id'])[-1]['reason'], 'chat closed')
 
 
-class WaitSwitchTests(WaitReviewSupport, unittest.IsolatedAsyncioTestCase):
-    async def test_waits_are_off_by_default_and_public_calls_refuse_plainly(self):
-        task = self.job()
-        with self.store.db:
-            self.store.db.execute("UPDATE tasks SET copy='held',copy_reason='Save verification failed' WHERE id=?",
-                                  (task['id'],))
-        refused = self.call('tasks.wait', task=task['id'], kind='owner', ask='Choose a plan')
-        fire = self.call('pending.fire', wait=1, message=self.origin['id'])
-        self.assertEqual((refused.ok, refused.text), (False, "Waits aren't switched on yet."))
-        self.assertEqual((fire.ok, fire.text), (False, "Waits aren't switched on yet."))
-        for owner in (False, True):
-            listed = self.ok('pending.list', owner=owner)
-            self.assertEqual((listed.text, listed.data), ('Nothing is waiting on you.', {'waits': [], 'held': []}))
-        response = mcp.dispatch(self.store, {'method': 'tools/call', 'params': {
-            'name': 'tasks_wait', 'arguments': {'task': task['id'], 'kind': 'owner', 'ask': 'Choose a plan'}}}, topic=TOPIC)
-        self.assertTrue(response['isError'])
-        self.assertEqual(response['content'][0]['text'], "Waits aren't switched on yet.\nnull")
-        self.assertEqual(self.store.task_get(task['id'])['status'], 'open')
-        self.assertEqual(self.store.db.execute('SELECT COUNT(*) FROM waits').fetchone()[0], 0)
-        self.assertEqual(self.store.db.execute('SELECT COUNT(*) FROM outbox').fetchone()[0], 0)
-
-    async def test_off_switch_keeps_existing_hooks_card_header_and_timer_inert(self):
-        self.store.put('waits_enabled', True)
-        owner_task, timer_task, secret_task = self.job(), self.job('Timer'), self.job('Secret')
-        dependency, dependent = self.job('Dependency'), self.job('Dependent')
-        owner = self.wait(owner_task, buttons=[[{'text': 'A', 'callback_data': 'A'}]])
-        timer = self.wait(timer_task, kind='time', ask='Retry', at='1970-01-01T00:33:20Z')
-        secret = self.wait(secret_task, key='secret:SAMPLE_TOKEN', ask='Fill the sample card')
-        job_wait = self.wait(dependent, kind='job', job=dependency['id'], ask='Continue after dependency')
-        await self.deliver_all()
-        ask = self.outbox(owner['ask_outbox'])['telegram_message']
-        self.store.put('waits_enabled', False)
-        before = [tuple(row) for row in self.store.db.execute('SELECT * FROM outbox ORDER BY id')]
-        self.assertEqual(self.store.accept(owner_update(1200, 'Use A', reply=ask)), 'queued')
-        self.assertEqual(self.store.accept(self.callback(owner, ask, update_id=1201)), 'stale_callback')
-        with self.store.transaction():
-            envelope = self.store.db.execute('''INSERT INTO envelopes
-                (name,reason,consumer,topic,state,created,expires,updated)
-                VALUES ('SAMPLE_TOKEN','Test card','test',?,'filled',1,2,1)''', (TOPIC,)).lastrowid
-            self.store.message_secret_filled(TOPIC, envelope, 'The sample card is filled.')
-        await self.service.waits_once()
-        self.ok('tasks.update', task=dependency['id'], status='done')
-        self.store.refresh_owner_waiting()
-        self.assertEqual([self.store.wait_get(item['id'])['state'] for item in (owner, timer, secret, job_wait)],
-                         ['armed', 'armed', 'armed', 'armed'])
-        self.assertEqual([self.store.task_get(task['id'])['status']
-                          for task in (owner_task, timer_task, secret_task, dependent)],
-                         ['waiting', 'waiting', 'waiting', 'waiting'])
-        self.assertEqual(self.callbacks(), [])
-        self.assertEqual([tuple(row) for row in self.store.db.execute('SELECT * FROM outbox ORDER BY id')], before)
-        self.assertEqual(owner_header(self.store, TOPIC), '')
-        self.assertEqual(self.ok('pending.list', owner=True).text, 'Nothing is waiting on you.')
-        self.assertEqual(self.store.accept(owner_update(1202, '/waiting')), 'control')
-        self.assertEqual(self.store.db.execute('SELECT text FROM outbox WHERE reply_to=1202').fetchone()[0],
-                         'Nothing is waiting on you.')
-
-    async def test_command_menu_follows_local_wait_switch(self):
+class WaitMenuTests(WaitReviewSupport, unittest.IsolatedAsyncioTestCase):
+    async def test_command_menu_lists_waiting(self):
         self.service.poll_succeeded = True
         passes = []
 
         def sleep(seconds):
             passes.append(seconds)
-            if len(passes) == 1:
-                self.store.put('waits_enabled', True)
-            elif len(passes) == 2:
-                self.store.put('waits_enabled', False)
-            else:
+            if len(passes) > 1:
                 raise asyncio.CancelledError()
 
         with patch('coordinator.service.asyncio.sleep', side_effect=sleep):
             with self.assertRaises(asyncio.CancelledError):
                 await self.service.command_menu()
         menus = [params['commands'] for method, params in self.telegram.calls if method == 'setMyCommands']
-        self.assertEqual(len(menus), 3)
-        self.assertEqual([any(item['command'] == 'waiting' for item in menu) for menu in menus], [False, True, False])
-        self.assertEqual(next(item['description'] for item in menus[1] if item['command'] == 'waiting'),
+        self.assertEqual(len(menus), 1)
+        self.assertEqual(next(item['description'] for item in menus[0] if item['command'] == 'waiting'),
                          'What is waiting on you')
-        self.assertNotIn('waiting', [item['command'] for item in onboarding.command_menu(self.store)])
-
-    async def test_local_cli_waits_set_enabled_toggles_and_other_transports_refuse(self):
-        from coordinator.__main__ import ctl
-        for enabled, expected in (('true', 'Waits are switched on.'), ('false', 'Waits are switched off.')):
-            with self.subTest(enabled=enabled):
-                output = StringIO()
-                args = SimpleNamespace(operation='call', op='waits.set_enabled', topic=None,
-                                       pairs=['enabled=' + enabled])
-                with patch('coordinator.__main__.calling_app', return_value='Fixture program'), redirect_stdout(output):
-                    status = ctl(args, self.store)
-                result = json.loads(output.getvalue())
-                self.assertEqual((status, result['ok'], result['text']), (0, True, expected))
-                self.assertEqual(self.store.get('waits_enabled'), enabled == 'true')
-                self.assertEqual(tuple(self.store.db.execute(
-                    'SELECT op,state FROM cli_calls ORDER BY id DESC LIMIT 1').fetchone()),
-                    ('waits.set_enabled', 'done'))
-        for source in ('mcp', 'telegram'):
-            with self.subTest(source=source):
-                result = control_api.call(self.store, 'waits.set_enabled', {'enabled': True}, source=source)
-                self.assertFalse(result.ok, result.text)
-                self.assertEqual(self.store.get('waits_enabled'), False)
+        self.assertIn('waiting', [item['command'] for item in onboarding.command_menu(self.store)])
 
 
 if __name__ == '__main__':

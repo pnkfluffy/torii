@@ -35,7 +35,10 @@ def emit(value):
 def read():
     return json.loads(sys.stdin.readline())
 sid = %r
-assert sys.argv[1:] == ['-c', 'model_reasoning_effort=medium', 'app-server', '--listen', 'stdio://']
+args = sys.argv[1:]
+if len(args) >= 2 and args[0] == '-c' and args[1].startswith('hooks.state.'):
+    args = args[2:]
+assert args == ['-c', 'model_reasoning_effort=medium', 'app-server', '--listen', 'stdio://']
 request = read()
 emit({'id': request['id'], 'result': {}})
 read()
@@ -90,6 +93,21 @@ class CodexModelTests(unittest.IsolatedAsyncioTestCase):
                 return entry[key]
         raise AssertionError('the fake provider recorded no command line')
 
+    async def test_worker_launches_when_hook_install_or_trust_fails(self):
+        for target in ('install', 'codex_trust_override'):
+            with self.subTest(target=target):
+                store = Store(self.root / ('state-' + target))
+                runner = ProviderRunner(store.directory, binaries={'codex': str(self.binary)})
+                runner.opencode_store = store
+                with patch.object(runner, '_environment', return_value={'HOME': str(self.root), 'CODEX_HOME': str(self.root / 'account'), 'PATH': '/usr/bin:/bin'}):
+                    with patch('coordinator.worker_storage.prepare_temp', new=AsyncMock(return_value=str(self.root))):
+                        with patch('coordinator.worker_hooks.' + target, side_effect=ValueError('invalid')):
+                            for _ in range(2):
+                                result = await runner.run('codex', 'task', self.root, self.sid, fresh=False, worker_id=1)
+                                self.assertTrue(result.success, result.error)
+                self.assertEqual(store.db.execute("SELECT count(*) FROM problems WHERE code='secret-hook-failed'").fetchone()[0], 1)
+                store.close()
+
     async def test_a_set_codex_model_becomes_the_model_flag(self):
         argv = await self.argv('codex', codex_model=lambda: 'gpt-6-luna')
         self.assertEqual(argv[1:], _CODEX_EXEC + ['--model', 'gpt-6-luna', self.sid, '-'])
@@ -100,6 +118,12 @@ class CodexModelTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(unset[1:], _CODEX_EXEC + [self.sid, '-'])
         self.assertEqual(cleared, unset)
         self.assertNotIn('--model', unset)
+
+    async def test_plugin_switches_become_codex_overrides(self):
+        argv = await self.argv('codex', plugins={'pstack@pstack-claude': False, 'other@market': True})
+        self.assertEqual(argv[1:], ['-c', 'model_reasoning_effort=medium',
+                                    '-c', 'plugins.pstack@pstack-claude.enabled=false',
+                                    '-c', 'plugins.other@market.enabled=true'] + _CODEX_EXEC[2:] + [self.sid, '-'])
 
     async def test_an_explicit_model_still_wins_over_the_setting(self):
         argv = await self.argv('codex', codex_model=lambda: 'gpt-6-luna', model='gpt-6-other')
@@ -120,7 +144,7 @@ class CodexModelTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn('gpt-6-luna', argv)
 
     async def test_effort_levels_reach_both_native_commands(self):
-        for level in ('low', 'medium', 'high', 'max'):
+        for level in ('low', 'medium', 'high', 'xhigh', 'max'):
             codex = await self.argv('codex', effort=level)
             self.assertEqual(codex[1:3], ['-c', 'model_reasoning_effort=' +
                                             ('xhigh' if level == 'max' else level)])
@@ -134,8 +158,11 @@ if __name__ == '__main__':
 
 class CodexWorkerTests(unittest.IsolatedAsyncioTestCase):
     async def test_a_codex_worker_starts_through_the_account_broker_and_real_runner(self):
+        from tests.support import fake_codex_hook_trust
+        fake_codex_hook_trust(self)
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
+            isolate_shared_mcp_home(self, root)
             store = Store(root / 'state')
             binary = root / 'codex'
             binary.write_text((_APP_SERVER % str(uuid.uuid4())).replace(
@@ -178,6 +205,84 @@ class CodexSkillCatalogTests(unittest.IsolatedAsyncioTestCase):
                                            fresh=fresh, **options)
         self.assertTrue(result.success, result.failure_detail or result.error)
         return json.loads((Path(result.log_path).parent / 'spec.json').read_text())['argv']
+
+    async def test_topic_mcp_header_uses_private_environment_and_is_scrubbed(self):
+        from coordinator.shared_mcp import codex_launch
+        value = 'DUMMY-PRIVATE-HEADER-CODEX'
+        entry = {'type': 'http', 'url': 'https://example.invalid/mcp', 'headers': {'Authorization': value}}
+        (Path.home() / '.claude.json').write_text(json.dumps({'mcpServers': {'personal': entry}}))
+        self.store.put('chat_config:1:2', {'mcp_servers': ['personal']})
+        self.runner.opencode_store = self.store
+        _, private = codex_launch({'personal': entry})
+        variable = next(iter(private))
+        self.binary.write_text('''#!/usr/bin/env python3
+import json,os,sys
+sys.stdin.read()
+value=os.environ[%r]
+print(value,file=sys.stderr,flush=True)
+print(json.dumps({'type':'thread.started','thread_id':%r}),flush=True)
+print(json.dumps({'type':'item.completed','item':{'type':'agent_message','text':value}}),flush=True)
+print(json.dumps({'type':'turn.completed'}),flush=True)
+''' % (variable, self.sid))
+        self.binary.chmod(0o700)
+        with patch('coordinator.providers.codex_inherited', new_callable=AsyncMock, return_value={}), \
+                patch.object(self.runner, '_external_writer', AsyncMock(return_value=False)):
+            result = await self.runner.run('codex', 'task', self.root, None, fresh=True, topic='1:2')
+        self.assertTrue(result.success, result.error)
+        host = Path(result.log_path).parent
+        spec = json.loads((host / 'spec.json').read_text())
+        self.assertIn('env_http_headers', json.dumps(spec['argv']))
+        self.assertNotIn(value, json.dumps(spec))
+        self.assertNotIn(variable, spec['env'])
+        self.assertNotIn(value, result.text)
+        for path in host.iterdir():
+            if path.is_file():
+                self.assertNotIn(value, path.read_text(errors='replace'))
+
+    async def test_native_codex_servers_stay_on_and_the_chat_adds_its_own(self):
+        entry = {'type': 'http', 'url': 'https://example.invalid/mcp', 'headers': {}}
+        (Path.home() / '.claude.json').write_text(json.dumps({'mcpServers': {'personal': entry, 'work': entry}}))
+        self.runner.opencode_store = self.store
+        self.binary.write_text(_FAKE % self.sid)
+        self.binary.chmod(0o700)
+        for selected, native, added in ((['personal', 'work'], {'native', 'personal'}, ['work']), ([], {'native'}, None)):
+            with self.subTest(selected=selected):
+                self.store.put('chat_config:1:2', {'mcp_servers': selected})
+                probe = AsyncMock(return_value=native)
+                with patch('coordinator.providers.codex_inherited', probe), \
+                        patch.object(self.runner, '_external_writer', AsyncMock(return_value=False)):
+                    result = await self.runner.run('codex', 'task', self.root, None, fresh=True, topic='1:2')
+                self.assertTrue(result.success, result.error)
+                argv = json.loads((Path(result.log_path).parent / 'spec.json').read_text())['argv']
+                overrides = [argv[index + 1] for index, item in enumerate(argv[:-1])
+                             if item == '-c' and argv[index + 1].startswith('mcp_servers=')]
+                self.assertNotIn('enabled', json.dumps(argv))
+                if added is None:
+                    self.assertEqual((overrides, probe.await_count), ([], 0))
+                else:
+                    self.assertEqual(len(overrides), 1)
+                    self.assertIn('work', overrides[0])
+                    self.assertNotIn('personal', overrides[0])
+                    self.assertNotIn('native', overrides[0])
+        problem = self.store.db.execute("SELECT detail FROM problems WHERE code='codex-name-taken'").fetchone()
+        self.assertEqual(problem[0], 'entries=personal')
+
+    async def test_worker_skills_pointer_names_pstack_unless_it_is_off(self):
+        from coordinator.codex_accounts import CODEX_SKILLS_POINTER
+        self.binary.write_text(_FAKE % self.sid)
+        self.binary.chmod(0o700)
+        sentence = 'For pstack, <source>/<plugin> is pstack-claude/pstack. '
+        for plugins, named in ((None, True), ({'pstack@pstack-claude': True}, True),
+                               ({'pstack@pstack-claude': False}, False), ({'other@market': False}, True)):
+            with self.subTest(plugins=plugins):
+                with patch.object(self.runner, '_external_writer', AsyncMock(return_value=False)):
+                    result = await self.runner.run('codex', 'task', self.root, None, fresh=True,
+                                                   instructions=CODEX_SKILLS_POINTER, plugins=plugins)
+                self.assertTrue(result.success, result.failure_detail or result.error)
+                payload = json.loads((Path(result.log_path).parent / 'spec.json').read_text())['initial_payload']
+                self.assertTrue(payload.startswith('Skills:'))
+                self.assertNotIn(CODEX_SKILLS_POINTER, payload)
+                self.assertEqual(sentence in payload, named)
 
     async def test_goal_less_codex_launch_modes(self):
         expected = {

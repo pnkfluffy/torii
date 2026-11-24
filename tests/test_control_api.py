@@ -12,8 +12,9 @@ import time
 import unittest
 from unittest.mock import AsyncMock, patch
 
-from coordinator import control_api, mcp
+from coordinator import control_api, mcp, records
 from coordinator.controls import handle_control
+from coordinator.extension import available
 from coordinator.service import Service
 from coordinator.store import Store
 
@@ -180,18 +181,6 @@ ORIGIN_MAIN_VALID_PARENT_PICKS = [{'params': {'topic': '1:2', 'provider': 'claud
 
 
 ORIGIN_MAIN_CHAT_CONTROL = {
-    ('policy.chat', 'set'): {
-        'text': 'Chat 1:3 delegation instructions saved (23 characters). Its agent follows them from its next message. Worker settings stay unchanged.',
-        'data': {'topic': '1:3', 'delegation': {'text': 'Use Codex for research.', 'revision': 1}},
-        'setting': ('coordinator:1:3_delegation', '{"text": "Use Codex for research.", "revision": 1}'),
-        'note': 'Delegation updated.',
-    },
-    ('policy.chat', 'clear'): {
-        'text': 'Chat 1:3 delegation instructions cleared. Its agent follows the usage policy from its next message.',
-        'data': {'topic': '1:3', 'delegation': None},
-        'setting': ('coordinator:1:3_delegation', 'null'),
-        'note': 'Delegation cleared.',
-    },
     ('model.parent', 'set'): {
         'text': 'Chat 1:3 agent: codex gpt-6-luna · default thinking. Active turns and native background tasks settle before a change. Worker settings stay unchanged.',
         'data': {'topic': '1:3', 'selection': {'provider': 'codex', 'model': 'gpt-6-luna', 'effort': None, 'revision': 1}},
@@ -209,9 +198,80 @@ ORIGIN_MAIN_CHAT_CONTROL = {
 
 
 CLOSING_CHAT_REFUSAL = 'This chat is closing or closed.'
+MCP_WRITE_KEYS = ('id', 'number', 'worktree', 'scratch', 'base_commit', 'outbox', 'worker', 'task', 'request',
+                  'results', 'wait', 'message')
+
+
+def mcp_write_data(data):
+    if not isinstance(data, dict):
+        return {}
+    return {key: data[key] for key in MCP_WRITE_KEYS
+            if key in data and (data[key] is None or isinstance(data[key], (str, int, float)))}
 
 
 class ControlApiTests(unittest.TestCase):
+    def test_spawn_refuses_pending_steer(self):
+        task = self.store.task_create('1:2', 'Build', worktree=self.temp.name)
+        first = self.call('workers.spawn', {'task': task['id'], 'provider': 'codex', 'prompt': 'First', 'work': 'dev'})
+        steer = self.call('workers.steer', {'worker': first.data['worker'], 'prompt': 'Continue'})
+        self.assertTrue(steer.ok, steer.text)
+        duplicate = self.call('workers.spawn', {'task': task['id'], 'provider': 'codex', 'prompt': 'First', 'work': 'dev'})
+        self.assertTrue(duplicate.ok, duplicate.text)
+        self.assertTrue(duplicate.data['existing'])
+        result = self.call('workers.spawn', {'task': task['id'], 'provider': 'codex', 'prompt': 'Second', 'work': 'dev'})
+        self.assertFalse(result.ok)
+        self.assertIn('steer', result.text.lower())
+        other = self.store.task_create('1:2', 'Other', worktree=self.temp.name)
+        self.assertTrue(self.call('workers.spawn', {'task': other['id'], 'provider': 'codex', 'prompt': 'Other'}).ok)
+        self.store.service_request_settle(steer.data['request'], 'done', {})
+        self.assertTrue(self.call('workers.spawn', {'task': task['id'], 'provider': 'codex', 'prompt': 'After'}).ok)
+
+    def test_pending_steer_only_blocks_dev_spawn_for_dev_worker(self):
+        task = self.store.task_create('1:2', 'Build', worktree=self.temp.name)
+        research = self.call('workers.spawn', {'task': task['id'], 'provider': 'codex', 'prompt': 'Research'})
+        self.call('workers.steer', {'worker': research.data['worker'], 'prompt': 'Continue'})
+        dev = self.call('workers.spawn', {'task': task['id'], 'provider': 'codex', 'prompt': 'Build', 'work': 'dev'})
+        self.assertTrue(dev.ok, dev.text)
+        self.call('workers.steer', {'worker': dev.data['worker'], 'prompt': 'Continue'})
+        result = self.call('workers.spawn', {'task': task['id'], 'provider': 'codex', 'prompt': 'More research'})
+        self.assertTrue(result.ok, result.text)
+
+    def test_spawn_reports_shared_worktree_queue(self):
+        task = self.store.task_create('1:2', 'Build', worktree=self.temp.name)
+        first = self.call('workers.spawn', {'task': task['id'], 'provider': 'codex', 'prompt': 'First', 'work': 'dev'})
+        self.store.db.execute("UPDATE workers SET status='running' WHERE id=?", (first.data['worker'],))
+        result = self.call('workers.spawn', {'task': task['id'], 'provider': 'codex', 'prompt': 'Second', 'work': 'dev'})
+        self.assertTrue(result.ok, result.text)
+        self.assertIn(str(first.data['worker']), result.text)
+        self.assertIn('worktree', result.text.lower())
+
+    def test_records_push_needs_a_provider_and_a_fixed_install_name(self):
+        self.assertFalse(self.call('records.sync', {'enabled': True, 'remote': '/private/one', 'install': 'alpha'}).ok)
+        refused = self.call('records.sync', {'enabled': True, 'remote': 'https://gitlab.com/o/ledger.git', 'install': 'alpha'})
+        self.assertIn('provider', refused.text)
+        self.assertFalse(self.call('records.sync', {'enabled': True, 'remote': 'git@github.com:o/ledger.git'}).ok)
+        self.assertFalse(self.call('records.sync', {'enabled': True, 'remote': 'git@github.com:o/ledger.git',
+                                                    'install': 'Bad_Name'}).ok)
+        result = self.call('records.sync', {'enabled': True, 'remote': 'git@github.com:o/ledger.git', 'install': 'alpha'})
+        self.assertTrue(result.ok, result.text)
+        data = self.call('settings.get').data
+        self.assertEqual((data['records_sync'], data['records_sync_install']), (True, 'alpha'))
+        self.assertTrue(self.call('records.sync', {'enabled': True, 'install': 'beta'}).ok)
+        with self.store.db:
+            self.store.put('records_sync_status', {'last_push': '2026-11-12T00:00:00Z'})
+        refused = self.call('records.sync', {'enabled': True, 'install': 'gamma'})
+        self.assertFalse(refused.ok)
+        self.assertIn('fixed after the first push', refused.text)
+        self.assertTrue(self.call('records.sync', {'enabled': True, 'install': 'beta'}).ok)
+        from coordinator.controls import _status_card
+        with self.store.db:
+            self.store.put('records_sync_status', {'last_push': 'x', 'sha': 'a' * 40, 'ahead': 2, 'error': 'push failed: diverged'})
+        card = _status_card(self.store, '1:2')
+        self.assertIn('push to GitHub install/beta, ahead 2', card)
+        self.assertIn('push failed: diverged', card)
+        self.assertTrue(self.call('records.sync', {'enabled': False}).ok)
+        self.assertFalse(self.call('settings.get').data['records_sync'])
+
     def test_invalid_parent_provider_names_all_accepted_providers(self):
         result = self.call('model.parent', {'topic': '1:2', 'provider': 'invalid', 'model': 'test-model'})
         self.assertFalse(result.ok, result.text)
@@ -236,7 +296,7 @@ class ControlApiTests(unittest.TestCase):
         self.assertEqual(result.text, 'Send claude or codex for provider.')
         self.assertEqual(list(self.store.db.execute('SELECT * FROM topics')), before)
 
-    def test_moved_home_chat_refuses_opencode_without_saving_or_queuing(self):
+    def test_moved_home_chat_accepts_opencode(self):
         with self.store.db:
             self.store.db.execute("INSERT INTO topics(id,chat,thread,name,cwd,enabled) VALUES('1:3',1,3,'new home',?,1)",
                                   (self.temp.name,))
@@ -248,150 +308,9 @@ class ControlApiTests(unittest.TestCase):
         key = 'coordinator:1:3'
         queued_before = self.store.db.execute('SELECT count(*) FROM service_requests').fetchone()[0]
         result = self.call('model.parent', {'topic': '1:3', 'provider': 'opencode'})
-        self.assertFalse(result.ok, result.text)
-        self.assertEqual(result.text, 'The home chat stays on Claude or ChatGPT.')
-        self.assertIsNone(self.store.get(key + '_selection'))
+        self.assertTrue(result.ok, result.text)
+        self.assertEqual(self.store.get(key + '_selection')['provider'], 'opencode')
         self.assertEqual(self.store.db.execute('SELECT count(*) FROM service_requests').fetchone()[0], queued_before)
-
-    def test_chat_policy_refuses_surrogates_and_controls_without_writes_on_cli_and_mcp(self):
-        from coordinator.__main__ import ctl
-        self.store.put('coordinator_home_topic', '1:2')
-        message = self.store.message_save('1:2', 'owner', 'Set delegation.')['id']
-        self.assertTrue(self.call('policy.chat', {'topic': '1:2', 'text': 'Existing instructions.'}).ok)
-        cases = [('\ud800', 'surrogate characters'), ('\udfff', 'surrogate characters')]
-        cases += [(chr(code), 'control characters other than newline and tab')
-                  for code in (*range(32), *range(127, 160)) if code not in (9, 10)]
-        for source in ('cli', 'mcp'):
-            for character, character_class in cases:
-                for text in ('Use Sol.' + character + 'Use Claude.', character + 'Use Sol.' + character):
-                    with self.subTest(source=source, text=repr(text)):
-                        before = self.pick_snapshot()
-                        changes = self.store.db.total_changes
-                        refusal = 'Chat delegation instructions cannot contain ' + character_class + '.'
-                        if source == 'cli':
-                            output = StringIO()
-                            args = Namespace(operation='call', op='policy.chat', topic=None,
-                                             pairs=['topic=1:2', 'text=' + text])
-                            with redirect_stdout(output):
-                                status = ctl(args, self.store)
-                            result = json.loads(output.getvalue())
-                            self.assertEqual((status, result['ok'], result['state'], result['text']),
-                                             (3, False, 'refused', refusal))
-                        else:
-                            response = mcp.dispatch(self.store, {'method': 'tools/call', 'params': {
-                                'name': 'policy_chat', 'arguments': {
-                                    'topic': '1:2', 'message': message, 'text': text}}}, topic='1:2')
-                            self.assertTrue(response['isError'], response)
-                            self.assertEqual(response['content'][0]['text'], refusal + '\nnull')
-                        self.assertEqual(self.pick_snapshot(), before)
-                        self.assertEqual(self.store.db.total_changes, changes + (source == 'cli'))
-                        if source == 'cli':
-                            self.assertEqual(tuple(self.store.db.execute(
-                                'SELECT op,state FROM cli_calls ORDER BY id DESC LIMIT 1').fetchone()),
-                                             ('policy.chat', 'refused'))
-
-    def test_chat_policy_accepts_newline_and_tab_on_cli_and_mcp(self):
-        from coordinator.__main__ import ctl
-        self.store.put('coordinator_home_topic', '1:2')
-        message = self.store.message_save('1:2', 'owner', 'Set delegation.')['id']
-        for source in ('cli', 'mcp'):
-            text = 'Use Sol.\n\tUse Claude for UI. ' + source
-            if source == 'cli':
-                output = StringIO()
-                args = Namespace(operation='call', op='policy.chat', topic=None,
-                                 pairs=['topic=1:2', 'text=' + text])
-                with redirect_stdout(output):
-                    status = ctl(args, self.store)
-                self.assertEqual(status, 0, output.getvalue())
-            else:
-                response = mcp.dispatch(self.store, {'method': 'tools/call', 'params': {
-                    'name': 'policy_chat', 'arguments': {
-                        'topic': '1:2', 'message': message, 'text': text}}}, topic='1:2')
-                self.assertFalse(response['isError'], response)
-            self.assertEqual(self.store.get('coordinator_delegation')['text'], text)
-            self.assertEqual(self.store.db.execute('SELECT text FROM outbox ORDER BY id DESC LIMIT 1')
-                             .fetchone()[0], 'Delegation updated.')
-
-    def test_d5_cli_chat_policy_replies_revisions_notes_and_refusals(self):
-        self.store.put('coordinator_home_topic', '1:2')
-        def notes():
-            return [tuple(row) for row in self.store.db.execute('SELECT topic,text FROM outbox ORDER BY id')]
-        cases = [
-            ({'text': '  Use Sol.  '}, {'text': 'Use Sol.', 'revision': 1},
-             'Chat 1:2 delegation instructions saved (8 characters). Its agent follows them from its next message. Worker settings stay unchanged.',
-             'Delegation updated.'),
-            ({'text': 'Use Sol.'}, {'text': 'Use Sol.', 'revision': 1},
-             'Chat 1:2 delegation instructions are already set to this text.', None),
-            ({'text': 'Use Luna.'}, {'text': 'Use Luna.', 'revision': 2},
-             'Chat 1:2 delegation instructions saved (9 characters). Its agent follows them from its next message. Worker settings stay unchanged.',
-             'Delegation updated.'),
-            ({}, None, 'Chat 1:2 delegation instructions cleared. Its agent follows the usage policy from its next message.',
-             'Delegation cleared.'),
-            ({}, None, 'Chat 1:2 has no delegation instructions of its own. It follows the usage policy.', None)]
-        expected = []
-        for params, saved, reply, note in cases:
-            with self.subTest(params=params):
-                before = self.store.db.total_changes
-                result = self.call('policy.chat', dict(params, topic='1:2'))
-                self.assertTrue(result.ok, result.text)
-                self.assertEqual(result.text, reply)
-                self.assertEqual(result.data, {'topic': '1:2', 'delegation': saved})
-                self.assertEqual(self.store.get('coordinator_delegation'), saved)
-                if note:
-                    expected.append(('1:2', note))
-                else:
-                    self.assertEqual(self.store.db.total_changes, before)
-                self.assertEqual(notes(), expected)
-        refusals = [({'topic': '1:2', 'text': 'x' * 2001},
-                     'Keep chat delegation instructions to 2000 characters or fewer (this text has 2001).'),
-                    ({'topic': '1:2', 'text': '  '}, 'Send text of 1 to 16000 characters for text.'),
-                    ({'topic': '1:2', 'text': 'x' * 16001}, 'Send text of at most 16000 characters (this one has 16001) for text.'),
-                    ({}, 'policy.chat needs topic.'),
-                    ({'topic': 'missing'}, 'Send a known channel ID for topic.')]
-        self.store.db.execute("INSERT INTO topics(id,chat,thread,name,cwd) VALUES ('1:8',1,8,'unlinked','')")
-        refusals.append(({'topic': '1:8'}, 'Choose a linked channel first.'))
-        for params, reply in refusals:
-            with self.subTest(reply=reply):
-                before = self.store.db.total_changes
-                result = self.call('policy.chat', params)
-                self.assertEqual((result.ok, result.state, result.text), (False, 'refused', reply))
-                self.assertEqual(self.store.db.total_changes, before)
-                self.assertEqual(notes(), expected)
-        self.assertTrue(self.call('policy.chat', {'topic': '1:2', 'text': 'x' * 2000}).ok)
-        self.assertEqual(self.store.get('coordinator_delegation')['revision'], 1)
-
-    def test_d6_mcp_chat_policy_uses_shared_owner_gate(self):
-        self.store.put('coordinator_home_topic', '1:2')
-        for target, chat in (('1:3', 1), ('2:4', 2)):
-            self.store.db.execute('INSERT INTO topics(id,chat,thread,name,cwd,enabled) VALUES (?,?,3,?,?,1)',
-                                  (target, chat, target, self.temp.name))
-        owner = self.store.message_save('1:2', 'owner', 'Set chat instructions.')['id']
-        other = self.store.message_save('1:3', 'owner', 'Another chat.')['id']
-        event = self.store.message_save('1:2', 'event', 'Event.')['id']
-        cases = [({'topic': '1:3'}, '1:2', 'Pass message=N for the owner message that asked.'),
-                 ({'topic': '1:3', 'message': event}, '1:2', 'message=N must identify an owner message.'),
-                 ({'topic': '1:3', 'message': other}, '1:2', 'The owner message came from another channel.'),
-                 ({'message': owner}, '1:2', 'policy.chat needs topic.'),
-                 ({'topic': '2:4', 'message': owner}, '1:2', 'Choose a linked channel in the current Telegram group.'),
-                 ({'topic': '1:3', 'message': owner}, None,
-                  'This tool needs the asking parent channel. Restart the parent to load its scoped MCP tools.')]
-        for params, asking, reply in cases:
-            with self.subTest(reply=reply):
-                before = self.store.db.total_changes
-                response = mcp.dispatch(self.store, {'method': 'tools/call', 'params': {
-                    'name': 'policy_chat', 'arguments': dict(params, text='Use Sol.')}}, topic=asking)
-                self.assertTrue(response['isError'], response)
-                self.assertEqual(response['content'][0]['text'], reply + '\nnull')
-                self.assertEqual(self.store.db.total_changes, before)
-        cli = self.call('policy.chat', {'topic': '1:3', 'text': 'Use Sol.'})
-        self.store.put('coordinator:1:3_delegation', None)
-        before = self.store.db.execute('SELECT count(*) FROM outbox').fetchone()[0]
-        response = mcp.dispatch(self.store, {'method': 'tools/call', 'params': {
-            'name': 'policy_chat', 'arguments': {'topic': '1:3', 'text': 'Use Sol.', 'message': owner}}}, topic='1:2')
-        self.assertFalse(response['isError'], response)
-        self.assertEqual(response['content'][0]['text'], cli.text + '\n' + json.dumps(cli.data, separators=(',', ':')))
-        self.assertEqual(self.store.get('coordinator:1:3_delegation'), cli.data['delegation'])
-        self.assertEqual(self.store.db.execute('SELECT count(*) FROM outbox').fetchone()[0], before + 1)
 
     def test_c1_chat_picks_and_instructions_refuse_closing_or_closed_targets(self):
         self.store.db.execute("INSERT INTO topics(id,chat,thread,name,cwd,enabled) VALUES ('1:3',1,3,'target',?,0)",
@@ -404,7 +323,7 @@ class ControlApiTests(unittest.TestCase):
                         with self.subTest(lifecycle=lifecycle_state, op=op, action=action, source=source):
                             params = {'topic': '1:3'}
                             if action == 'set' and op == 'policy.chat':
-                                params['text'] = 'Use Codex for research.'
+                                params['append'] = 'Use Codex for research.'
                             elif action == 'set':
                                 params.update(provider='codex', model='gpt-6-luna')
                             self._reset_chat_control(op, action, queue_existing=True)
@@ -422,7 +341,7 @@ class ControlApiTests(unittest.TestCase):
                                                  (False, op, 'write', 'refused', CLOSING_CHAT_REFUSAL, None))
                             else:
                                 self.assertTrue(result['isError'], result)
-                                self.assertEqual(result['content'][0]['text'], CLOSING_CHAT_REFUSAL + '\nnull')
+                                self.assertEqual(result['content'][0]['text'], CLOSING_CHAT_REFUSAL + '\n{}')
                             self.assertEqual(self.store.db.total_changes, changes + (source == 'cli'))
                             if source == 'cli':
                                 self.assertEqual(tuple(self.store.db.execute(
@@ -443,14 +362,12 @@ class ControlApiTests(unittest.TestCase):
         self.store.db.execute("INSERT INTO topics(id,chat,thread,name,cwd,enabled) VALUES ('1:3',1,3,'target',?,?)",
                               (self.temp.name, enabled))
         message = self.store.message_save('1:2', 'owner', 'Change the target chat setting.')['id']
-        for op in ('policy.chat', 'model.parent'):
+        for op in ('model.parent',):
             for action in ('set', 'clear'):
                 for source in ('cli', 'mcp'):
                     with self.subTest(enabled=enabled, op=op, action=action, source=source):
                         params = {'topic': '1:3'}
-                        if action == 'set' and op == 'policy.chat':
-                            params['text'] = 'Use Codex for research.'
-                        elif action == 'set':
+                        if action == 'set':
                             params.update(provider='codex', model='gpt-6-luna')
                         self._reset_chat_control(op, action)
                         expected = ORIGIN_MAIN_CHAT_CONTROL[(op, action)]
@@ -465,7 +382,7 @@ class ControlApiTests(unittest.TestCase):
                             self.assertFalse(result['isError'], result)
                             text, data = result['content'][0]['text'].split('\n', 1)
                             self.assertEqual(text, expected['text'])
-                            self.assertEqual(json.loads(data), expected['data'])
+                            self.assertEqual(json.loads(data), mcp_write_data(expected['data']))
                         expected_settings = [expected['setting']]
                         if 'cleared' in expected:
                             expected_settings.append(expected['cleared'])
@@ -483,9 +400,7 @@ class ControlApiTests(unittest.TestCase):
                                   "('coordinator:1:3_delegation','coordinator:1:3_selection',"
                                   "'coordinator:1:3_selection_cleared')")
             self.store.db.execute('DELETE FROM outbox')
-            if action == 'clear' and op == 'policy.chat':
-                self.store.put('coordinator:1:3_delegation', {'text': 'Existing instructions.', 'revision': 1})
-            elif action == 'clear':
+            if action == 'clear' and op == 'model.parent':
                 self.store.put('coordinator:1:3_selection', {
                     'provider': 'codex', 'model': 'gpt-6-luna', 'effort': None, 'revision': 1})
             if queue_existing:
@@ -504,15 +419,8 @@ class ControlApiTests(unittest.TestCase):
         return mcp.dispatch(self.store, {'method': 'tools/call', 'params': {
             'name': name, 'arguments': dict(params, message=message)}}, topic='1:2')
 
-    def test_f1_cli_list_and_mcp_describe_global_default_and_model_family(self):
-        expected = (
-            'Pick or clear one chat agent. Over MCP, topic and message=N for the owner message in the asking channel are required. '
-            'Use provider=claude (Claude), codex (ChatGPT) or opencode (OpenCode); omit provider, model and effort to clear the pick. '
-            'Claude and ChatGPT accept optional model and effort. OpenCode uses the selected account model, has no thinking setting and cannot run the home chat. '
-            'The chat moves to the new agent once its current turn and background work settle. Worker settings do not change. '
-            "The default for all chats is the owner's to set through the local CLI: without topic, provider and model set it, "
-            'and omitting both restores automatic selection. A model must belong to its provider, '
-            'for example claude-opus-5-5 for claude and gpt-6.1-sol for codex.')
+    def test_f1_cli_list_and_mcp_share_the_model_parent_description(self):
+        expected = 'Pick or clear chat agents. MCP requires topic and owner message=N. Any agent runs any chat or home: claude, codex or opencode; OpenCode uses its account model. Omit all to clear. A chat moves to the next agent while its own is out. Changes wait for active work. Workers are unchanged.'
         completed = subprocess.run([sys.executable, '-m', 'coordinator', '--state-dir', self.temp.name,
                                     '--token-file', str(Path(self.temp.name) / 'no-token'), 'ctl', 'list'],
                                    capture_output=True, text=True, timeout=30)
@@ -544,8 +452,8 @@ class ControlApiTests(unittest.TestCase):
         self.store.enqueue_report('1:2', 'Existing queued note.')
         self.store.service_request('workers.stop', {'worker': 123})
         cases = [('claude', 'gpt-6-luna', 'Send a Claude model with provider=claude, for example claude-opus-5-5.'),
-                 ('codex', 'claude-opus-5-5', 'Send a ChatGPT model with provider=codex, for example gpt-6.1-sol.'),
-                 ('codex', 'opus', 'Send a ChatGPT model with provider=codex, for example gpt-6.1-sol.')]
+                 ('codex', 'claude-opus-5-5', 'Send a ChatGPT model with provider=codex, for example gpt-6.2-sol.'),
+                 ('codex', 'opus', 'Send a ChatGPT model with provider=codex, for example gpt-6.2-sol.')]
         for source in ('cli', 'mcp'):
             for provider, model, text in cases:
                 with self.subTest(source=source, provider=provider, model=model):
@@ -559,7 +467,7 @@ class ControlApiTests(unittest.TestCase):
                         response = mcp.dispatch(self.store, {'method': 'tools/call', 'params': {
                             'name': 'model_parent', 'arguments': dict(fields, message=message)}}, topic='1:2')
                         self.assertTrue(response['isError'], response)
-                        self.assertEqual(response['content'][0]['text'], text + '\nnull')
+                        self.assertEqual(response['content'][0]['text'], text + '\n{}')
                     self.assertEqual(self.pick_snapshot(), before)
 
     def test_f2c_cli_mismatched_global_default_keeps_selection_and_revision(self):
@@ -592,7 +500,7 @@ class ControlApiTests(unittest.TestCase):
                     'name': 'model_parent', 'arguments': dict(expected['params'], message=message)}}, topic='1:2')
                 self.assertEqual(response['isError'], not expected['ok'])
                 text, data = response['content'][0]['text'].split('\n', 1)
-                self.assertEqual((text, json.loads(data)), (expected['text'], expected['data']))
+                self.assertEqual((text, json.loads(data)), (expected['text'], mcp_write_data(expected['data'])))
                 self.assertEqual([list(row) for row in self.store.db.execute(
                     "SELECT key,value FROM settings WHERE key LIKE '%selection%' ORDER BY key")], expected['settings'])
                 self.assertEqual([dict(row) for row in self.store.db.execute('SELECT * FROM outbox ORDER BY id')], expected['outbox'])
@@ -678,11 +586,16 @@ class ControlApiTests(unittest.TestCase):
         profile.mkdir()
         self.store.put('accounts', {'work': {'config_dir': str(profile), 'enabled': True}})
         self.store.put('account_status', {'work': {'identity': {'logged_in': True, 'email': 'work@example.com'}}})
+        refused = mcp.dispatch(self.store, {'method': 'tools/call', 'params': {'name': 'account_use',
+                               'arguments': {'alias': 'work', 'topic': '1:2'}}}, topic='1:2')
+        self.assertIn('message=N', refused['content'][0]['text'])
+        self.assertIsNone(self.store.get('claude_account_pick'))
+        message = self.store.message_save('1:2', 'owner', 'Use the work account.')['id']
         reply = mcp.dispatch(self.store, {'method': 'tools/call', 'params': {'name': 'account_use',
-                             'arguments': {'alias': 'work', 'topic': '1:2'}}})
-        self.assertEqual(reply['content'][0]['text'], 'work@example.com is picked for Claude; its usage is being checked.\nnull')
+                             'arguments': {'alias': 'work', 'topic': '1:2', 'message': message}}}, topic='1:2')
+        self.assertEqual(reply['content'][0]['text'], 'work@example.com is picked for Claude; its usage is being checked.\n{}')
         self.assertEqual(self.store.get('claude_pick_refresh')['topic'], '1:2')
-        self.assertEqual(self.store.get('claude_account_pick'), 'work')
+        self.assertEqual(self.store.get('claude_account_pick'), {'fable': 'work', 'other': 'work'})
 
     def test_p1_mcp_chat_pick_matches_cli_value_revision_and_reply(self):
         self.store.put('coordinator_home_topic', '1:2')
@@ -762,8 +675,8 @@ class ControlApiTests(unittest.TestCase):
         self.assertNotIn('_meta', tool)
         self.assertNotIn('model_parent', mcp.ALWAYS_LOADED_TOOLS)
         self.assertNotIn('effort_parent', tools)
-        for text in ('topic', 'message=N', 'claude', 'codex', 'current turn', 'background work settle',
-                     'Worker settings do not change'):
+        for text in ('topic', 'message=N', 'claude', 'codex', 'Changes wait for active work',
+                     'Workers are unchanged'):
             self.assertIn(text, tool['description'])
 
     def test_p5_cli_parent_picks_match_computed_origin_main(self):
@@ -807,7 +720,7 @@ class ControlApiTests(unittest.TestCase):
 
     def test_tasks_update_note_appends_with_other_fields(self):
         task = self.store.task_create('1:2', 'Measure', notes='a')
-        result = self.call('tasks.update', {'task': task['id'], 'note': ' b ', 'status': 'done',
+        result = self.call('tasks.update', {'task': task['id'], 'note': ' b ', 'status': 'done', 'summary': 'Closed in test.',
                                           'title': 'Measured', 'stage': 'ready'})
         self.assertTrue(result.ok, result.text)
         self.assertEqual((result.data['notes'], result.data['status'], result.data['title']),
@@ -818,7 +731,7 @@ class ControlApiTests(unittest.TestCase):
 
     def test_stage_and_other_fields_commit_together(self):
         task = self.store.task_create('1:2', 'Measure')
-        result = self.call('tasks.update', {'task': task['id'], 'stage': 'ready', 'notes': 'Built', 'status': 'done'})
+        result = self.call('tasks.update', {'task': task['id'], 'stage': 'ready', 'notes': 'Built', 'status': 'done', 'summary': 'Closed in test.'})
         self.assertTrue(result.ok, result.text)
         self.assertEqual((result.data['notes'], result.data['status']), ('Built', 'done'))
         self.assertEqual(self.store.db.execute('SELECT stage FROM task_stamps').fetchone()[0], 'ready')
@@ -846,6 +759,100 @@ class ControlApiTests(unittest.TestCase):
         self.assertIn('ready', result.text)
         self.assertNotIn('stamps', self.call('tasks.list').data[0])
 
+    def test_tasks_get_bounds_notes_at_a_utf8_line_boundary(self):
+        older = 'old ' + '界' * 2000 + '\n'
+        recent = 'recent α\n' * 700
+        task = self.store.task_create('1:2', 'Long notes', notes=older + recent)
+        params = {'task': task['id']}
+        for i in range(32):
+            self.assertTrue(self.call('tasks.note', dict(params, text=f'Entry {i}')).ok)
+
+        bounded = self.call('tasks.get', params).data
+        notice, tail = bounded['notes'].split('\n', 1)
+        self.assertEqual(notice, f"[{len(older.encode())} bytes of notes omitted. Full journal: {bounded['journal']}]")
+        self.assertEqual(tail, recent)
+        self.assertEqual(bounded['journal_parts'], [bounded['journal']])
+        self.assertEqual([entry['text'] for entry in bounded['entries']], [f'Entry {i}' for i in range(2, 32)])
+        self.assertEqual(self.call('tasks.get', dict(params, full=False)).data, bounded)
+
+        reply = mcp.dispatch(self.store, {'method': 'tools/call', 'params': {
+            'name': 'tasks_get', 'arguments': dict(params, full=True)}})
+        self.assertFalse(reply['isError'], reply)
+        full = json.loads(reply['content'][0]['text'].splitlines()[-1])
+        self.assertEqual(full, dict(bounded, notes=older + recent))
+        self.assertEqual(self.store.task_get(task['id'])['notes'], older + recent)
+
+    def test_tasks_get_keeps_notes_at_the_limit_and_omits_an_overlong_line(self):
+        for size in (8192, 8193):
+            with self.subTest(size=size):
+                notes = 'x' * size
+                task = self.store.task_create('1:2', 'One line', notes=notes)
+                fetched = self.call('tasks.get', {'task': task['id']}).data
+                expected = notes if size == 8192 else f"[{size} bytes of notes omitted. Full journal: {fetched['journal']}]\n"
+                self.assertEqual(fetched['notes'], expected)
+
+    def test_tasks_get_bounds_entries_on_cli_and_mcp(self):
+        from coordinator.__main__ import ctl
+        for notes, retained in (('Short job notes', 4), ('n' * 8192, 3)):
+            with self.subTest(retained=retained):
+                task = self.store.task_create('1:2', 'Journal preview', notes=notes)
+                journal = records.journal_path(self.store.directory, task)
+                entries = [dict(at='2000-01-01T00:00:00Z', kind='note', by='test', text=f'{i} ' + 'j' * 1900)
+                           for i in range(32)]
+                records.journal_append(self.store, task, entries)
+
+                output = StringIO()
+                args = Namespace(operation='call', op='tasks.get', topic=None, pairs=[f"task={task['id']}"])
+                with redirect_stdout(output):
+                    self.assertEqual(ctl(args, self.store), 0)
+                cli = json.loads(output.getvalue())
+                self.assertEqual(output.getvalue(), json.dumps(cli, separators=(',', ':')) + '\n')
+                self.assertEqual(cli['text'], f"Job {task['number']}: Journal preview")
+                self.assertEqual(cli['data']['notes'], notes)
+                self.assertEqual(cli['data']['entries'], entries[-retained:])
+                original_bytes = len(json.dumps(entries[-30:], separators=(',', ':')))
+                shown_bytes = len(json.dumps(cli['data']['entries'], separators=(',', ':')))
+                self.assertLessEqual(shown_bytes, 8192)
+                self.assertEqual(cli['data']['entries_notice'],
+                                 f'[{original_bytes - shown_bytes} bytes of journal entries omitted. Full journal: {journal}]')
+
+                for full in (False, True):
+                    reply = mcp.dispatch(self.store, {'method': 'tools/call', 'params': {
+                        'name': 'tasks_get', 'arguments': {'task': task['id'], 'full': full}}})
+                    self.assertFalse(reply['isError'], reply)
+                    summary, encoded = reply['content'][0]['text'].rsplit('\n', 1)
+                    data = json.loads(encoded)
+                    self.assertEqual(summary, cli['text'])
+                    if full:
+                        self.assertEqual(data['entries'], entries[-30:])
+                        self.assertNotIn('entries_notice', data)
+                    else:
+                        self.assertEqual(data, cli['data'])
+
+    def test_tasks_get_clips_the_newest_entry_when_it_alone_exceeds_the_budget(self):
+        for text, extra in (('quote"🙂\n' * 2000, {}), ('Small text', {'storage': {'kept': 'x' * 9000}})):
+            with self.subTest(oversized_metadata=bool(extra)):
+                task = self.store.task_create('1:2', 'Long journal entry')
+                journal = records.journal_path(self.store.directory, task)
+                entries = [dict(kind='note', text='Earlier entry'),
+                           dict(at='2000-01-01T00:00:00Z', by='test', kind='result', text=text, **extra)]
+                records.journal_append(self.store, task, entries)
+                data = self.call('tasks.get', {'task': task['id']}).data
+                self.assertEqual(len(data['entries']), 1)
+                clipped = data['entries'][0]
+                self.assertEqual({key: clipped[key] for key in ('at', 'by', 'kind')},
+                                 {key: entries[-1][key] for key in ('at', 'by', 'kind')})
+                prefix, marker = clipped['text'].rsplit('\n', 1)
+                self.assertEqual(marker, '[Entry truncated]')
+                self.assertTrue(prefix and text.startswith(prefix))
+                self.assertLessEqual(len(json.dumps(data['entries'], separators=(',', ':'))), 8192)
+                original_bytes = len(json.dumps(entries, separators=(',', ':')))
+                shown_bytes = len(json.dumps([dict(clipped, text=prefix)], separators=(',', ':')))
+                self.assertEqual(data['entries_notice'],
+                                 f'[{original_bytes - shown_bytes} bytes of journal entries omitted. Full journal: {journal}]')
+                self.assertEqual(self.call('tasks.get', {'task': task['id'], 'full': True}).data['entries'], entries)
+                self.assertEqual(records.journal(journal), entries)
+
     def test_mcp_stage_enum_and_tool_list(self):
         tools = mcp.dispatch(self.store, {'method': 'tools/list'})['tools']
         update = next(tool for tool in tools if tool['name'] == 'tasks_update')
@@ -853,16 +860,18 @@ class ControlApiTests(unittest.TestCase):
                          {'type': 'string', 'enum': ['ready', 'reviewed', 'ci', 'merged', 'live']})
         self.assertNotIn('stage', update['inputSchema']['required'])
         self.assertEqual({tool['name'] for tool in tools}, {
-            'telegram_send', 'tasks_create', 'tasks_update', 'tasks_get', 'tasks_list', 'worktree_create',
+            'keep_save', 'keep_drop', 'telegram_send', 'tasks_create', 'tasks_update', 'tasks_get', 'tasks_list', 'worktree_create',
             'workers_spawn', 'workers_steer', 'workers_stop', 'workers_goal', 'workers_list', 'workers_get',
             'service_restart', 'secret_ask', 'secret_list', 'secret_rotate', 'secret_revoke', 'account_use',
             'account_redeem', 'accounts_claude_auto', 'settings_show', 'topics_list', 'topic_show', 'accounts_list', 'account_current',
             'account_show', 'policy_show', 'projects_list', 'problems_list', 'problems_summary', 'tasks_stale',
             'topic_create', 'topic_close', 'model_parent', 'policy_chat',
-            'tasks_wait', 'pending_list', 'pending_fire', 'pending_cancel'})
+            'tasks_wait', 'tasks_link', 'tasks_note', 'pending_list', 'pending_fire', 'pending_cancel', 'followup_propose', 'followup_ready', 'events_post',
+            'loadout_show', 'loadout_swap', 'loadout_unswap'}
+            | ({'trash_move'} if available('trash_move') else set()))
         listed = next(tool for tool in tools if tool['name'] == 'tasks_list')
         self.assertEqual(listed['inputSchema']['properties']['status'],
-                         {'type': 'string', 'enum': ['open', 'interrupted', 'waiting', 'done', 'dropped']})
+                         {'type': 'string', 'enum': ['open', 'interrupted', 'waiting', 'done', 'dropped', 'proposed', 'expired']})
         waiting = next(tool for tool in tools if tool['name'] == 'tasks_wait')
         self.assertEqual(waiting['inputSchema']['properties']['kind'],
                          {'type': 'string', 'enum': ['owner', 'time', 'job', 'pr', 'torii_update', 'signal']})
@@ -932,7 +941,7 @@ class ControlApiTests(unittest.TestCase):
         self.store.put('coordinator_session', 'native-history')
         self.store.put('coordinator_host', {'id': 'running-parent'})
         for provider, other in (('claude', 'codex'), ('codex', 'claude')):
-            for effort in ('low', 'medium', 'high', 'max'):
+            for effort in ('low', 'medium', 'high', 'xhigh', 'max'):
                 with self.subTest(provider=provider, effort=effort):
                     before = self.store.get(other + '_parent_effort')
                     result = self.call('effort.parent', {'provider': provider, 'effort': effort})
@@ -969,7 +978,7 @@ class ControlApiTests(unittest.TestCase):
         for params in ({'topic': 'unknown', 'provider': 'codex'}, {'topic': '1:3', 'provider': 'codex'},
                        {'topic': '1:2', 'provider': 'opencode'}, {'topic': '1:2', 'provider': 'unknown'},
                        {'effort': 'low'}, {'provider': 'codex', 'model': 'gpt-6-luna', 'effort': 'low'},
-                       {'topic': '1:2', 'provider': 'codex', 'effort': 'xhigh'}):
+                       {'topic': '1:2', 'provider': 'codex', 'effort': 'ultra'}):
             with self.subTest(params=params):
                 self.assertFalse(self.call('model.parent', params).ok)
                 self.assertIsNone(self.store.get('coordinator_selection'))
@@ -1014,31 +1023,31 @@ class ControlApiTests(unittest.TestCase):
 
     def test_parent_effort_refuses_invalid_values_without_storing_anything(self):
         for provider in ('claude', 'codex'):
-            for effort in ('xhigh', 'ultra', 'none', 'minimal', '', 1, True, []):
+            for effort in ('ultra', 'none', 'minimal', '', 1, True, []):
                 with self.subTest(provider=provider, effort=effort):
                     before = list(self.store.db.execute('SELECT * FROM settings ORDER BY key'))
                     result = self.call('effort.parent', {'provider': provider, 'effort': effort})
                     self.assertEqual((result.ok, result.state), (False, 'refused'))
                     self.assertEqual(list(self.store.db.execute('SELECT * FROM settings ORDER BY key')), before)
             self.assertTrue(self.call('effort.parent', {'provider': provider, 'effort': 'high'}).ok)
-            self.assertFalse(self.call('effort.parent', {'provider': provider, 'effort': 'xhigh'}).ok)
+            self.assertFalse(self.call('effort.parent', {'provider': provider, 'effort': 'ultra'}).ok)
             self.assertEqual(self.store.get(provider + '_parent_effort'), 'high')
         for params in ({}, {'effort': 'low'}, {'provider': 'unknown', 'effort': 'high'}):
             self.assertFalse(self.call('effort.parent', params).ok)
 
-    def test_events_post_refuses_every_non_cli_source_and_is_not_an_mcp_tool(self):
+    def test_events_post_refuses_other_sources_and_mcp_without_a_calling_chat(self):
         for source in ('mcp', 'telegram', 'service', 'other'):
             with self.subTest(source=source):
                 with self.store.db:
                     result = control_api.call(self.store, 'events.post',
                                               {'topic': '1:2', 'text': 'Lane stopped.'}, source=source)
-                self.assertEqual((result.ok, result.state, result.text),
-                                 (False, 'refused', 'events.post is available only from the local CLI.'))
-        self.assertEqual(len(mcp.tools_list()), 39)
-        self.assertNotIn('events_post', {tool['name'] for tool in mcp.tools_list()})
-        with self.assertRaisesRegex(ValueError, 'Unknown tool: events_post'):
-            mcp.dispatch(self.store, {'method': 'tools/call', 'params': {
-                'name': 'events_post', 'arguments': {'topic': '1:2', 'text': 'Lane stopped.'}}})
+                text = ('An enabled calling chat is required.' if source == 'mcp' else
+                        'events.post is available only from the local CLI or coordinator MCP.')
+                self.assertEqual((result.ok, result.state, result.text), (False, 'refused', text))
+        self.assertEqual(len(mcp.tools_list()), 49 + available('trash_move'))
+        self.assertIn('events_post', {tool['name'] for tool in mcp.tools_list()})
+        self.assertTrue(mcp.dispatch(self.store, {'method': 'tools/call', 'params': {
+            'name': 'events_post', 'arguments': {'topic': '1:2', 'text': 'Lane stopped.'}}})['isError'])
         self.assertEqual(self.store.messages_pending(), [])
 
     def test_events_post_validates_text_and_topic_before_storing(self):
@@ -1161,7 +1170,7 @@ class ControlApiTests(unittest.TestCase):
         self.assertEqual(schema['properties']['alias'], {'type': 'string'})
         self.assertNotIn('alias', schema['required'])
         self.assertNotIn('account_remove', {tool['name'] for tool in mcp.tools_list()})
-        self.assertIn('95%', control_api.find('account.codex_reset').description)
+        self.assertIn('99%', control_api.find('account.codex_reset').description)
 
     def account_fixture(self, provider, logged_in=False):
         directory = Path(self.temp.name) / provider
@@ -1203,20 +1212,32 @@ class ControlApiTests(unittest.TestCase):
                 self.assertFalse(new.exists())
                 self.assertEqual((directory / 'history.jsonl').read_text(), 'native history\n')
 
-    def test_account_add_and_remove_refuse_authenticated_accounts_even_when_disabled(self):
+    def test_signed_in_accounts_are_removed_unless_a_worker_runs_on_them(self):
         self.store.put('bot_username', 'torii_test_bot')
+        with self.store.db:
+            self.store.db.execute("INSERT INTO topics(id,chat,thread,name,cwd,enabled) VALUES ('9:9',9,9,'t','',1)")
         for provider in ('claude', 'codex'):
             with self.subTest(provider=provider):
                 self.store.put('accounts', {})
                 self.store.put('codex_accounts', {})
-                self.account_fixture(provider, logged_in=True)
+                directory, _, key, _, _ = self.account_fixture(provider, logged_in=True)
                 before = list(self.store.db.execute('SELECT key,value FROM settings ORDER BY key'))
                 added = self.call('account.add', {'alias': 'work'})
                 self.assertEqual((added.state, added.text), ('refused', 'work@example.com is already signed in.'))
+                with self.store.db:
+                    worker = self.store.db.execute(
+                        "INSERT INTO workers(topic,provider,prompt,status,account_alias,created,updated) "
+                        "VALUES ('9:9',?,'x','running','work',0,0)", (provider,)).lastrowid
                 removed = self.call('account.remove', {'alias': 'work'})
                 self.assertEqual((removed.state, removed.text),
-                                 ('refused', 'work@example.com is signed in. Only signed-out accounts can be removed.'))
+                                 ('refused', 'A worker is running on work@example.com. Remove it after that worker ends.'))
                 self.assertEqual(list(self.store.db.execute('SELECT key,value FROM settings ORDER BY key')), before)
+                with self.store.db:
+                    self.store.db.execute("UPDATE workers SET status='done' WHERE id=?", (worker,))
+                removed = self.call('account.remove', {'alias': 'work'})
+                self.assertEqual((removed.ok, removed.text), (True, 'Removed work@example.com.'))
+                self.assertNotIn('work', self.store.get(key))
+                self.assertEqual((directory / 'history.jsonl').read_text(), 'native history\n')
 
     def test_account_remove_refuses_pending_target_without_mutation(self):
         for provider in ('claude', 'codex'):
@@ -1288,7 +1309,7 @@ class ControlApiTests(unittest.TestCase):
         self.assertTrue(created.ok)
         task = created.data
         self.assertEqual((task['topic'], task['number'], task['status']), ('1:2', 1, 'open'))
-        updated = self.call('tasks.update', {'task': task['id'], 'status': 'done'})
+        updated = self.call('tasks.update', {'task': task['id'], 'status': 'done', 'summary': 'Closed in test.'})
         self.assertEqual(updated.data['status'], 'done')
         self.assertEqual(self.call('tasks.get', {'task': task['id']}).data['title'], 'Ship unit 2')
         self.assertEqual(len(self.call('tasks.list', {'status': 'done'}).data), 1)
@@ -1297,6 +1318,82 @@ class ControlApiTests(unittest.TestCase):
         row = self.store.db.execute('SELECT * FROM outbox WHERE id=?', (sent.data['outbox'],)).fetchone()
         self.assertEqual(row['text'], 'Done')
         self.assertEqual(json.loads(row['reply_markup'])['inline_keyboard'][0][0]['text'], 'Open')
+
+    def test_owner_job_closes_as_done_without_an_owner_report(self):
+        owner = self.store.message_save('1:2', 'owner', 'Do it', telegram_message=50)['id']
+        job = self.store.task_create('1:2', 'Owner job', origin=owner)
+        result = self.call('tasks.update', {'task': job['id'], 'status': 'done', 'summary': 'Closed in test.'})
+        self.assertTrue(result.ok, result.text)
+        self.assertEqual(self.store.task_get(job['id'])['status'], 'done')
+        self.assertEqual(self.store.task_iterations(job['id'])[-1]['outcome'], 'done')
+        self.assertIsNone(self.store.pending_delivery())
+
+    def test_dropped_and_non_owner_jobs_close_without_report(self):
+        owner = self.store.message_save('1:2', 'owner', 'Do it', telegram_message=51)['id']
+        job = self.store.task_create('1:2', 'Owner job', origin=owner)
+        self.assertFalse(self.call('tasks.update', {'task': job['id'], 'status': 'dropped', 'summary': 'Closed in test.'}).ok)
+        self.assertTrue(self.call('tasks.update', {'task': job['id'], 'status': 'dropped', 'summary': 'Closed in test.', 'note': 'No longer needed'}).ok)
+        internal = self.store.task_create('1:2', 'Internal')
+        self.assertTrue(self.call('tasks.update', {'task': internal['id'], 'status': 'done', 'summary': 'Closed in test.'}).ok)
+
+    def test_ledger_report_and_worker_permissions(self):
+        from coordinator import records
+        owner = self.store.message_save('1:2', 'owner', 'A' * 5000, telegram_message=55)['id']
+        job = self.store.task_create('1:2', 'Ledger', origin=owner)
+        self.store.task_update(job['id'], worktree=self.temp.name)
+        worker = self.call('workers.spawn', {'task': job['id'], 'provider': 'claude', 'prompt': 'Work'}).data['worker']
+        refused = control_api.call(self.store, 'tasks.update', {'task': job['id'], 'status': 'done', 'summary': 'Closed in test.'}, source_worker=worker)
+        self.assertFalse(refused.ok)
+        self.assertIn('Workers do not close jobs', refused.text)
+        refused = control_api.call(self.store, 'tasks.update', {'task': job['id'], 'secrets': 'API_KEY'}, source_worker=worker)
+        self.assertFalse(refused.ok)
+        self.assertIn('Workers do not declare secrets', refused.text)
+        self.assertTrue(control_api.call(self.store, 'tasks.note', {'task': job['id'], 'text': 'Evidence'}, source_worker=worker).ok)
+        outbox = self.store.db.execute('SELECT COUNT(*) FROM outbox').fetchone()[0]
+        refused = control_api.call(self.store, 'telegram.send', {'topic': '1:2', 'task': job['id'], 'text': 'Hi owner'},
+                                   source_worker=worker)
+        self.assertFalse(refused.ok)
+        self.assertEqual(refused.state, 'refused')
+        self.assertIn('events.post', refused.text)
+        self.assertEqual(self.store.db.execute('SELECT COUNT(*) FROM outbox').fetchone()[0], outbox)
+        self.store.worker_complete(worker, {'success': True, 'text': 'Worker result'})
+        records.result_entries_in_thread(self.store.directory)
+        sent = self.call('telegram.send', {'task': job['id'], 'text': 'Owner report'})
+        self.assertTrue(sent.ok, sent.text)
+        entries = records.journal(records.journal_path(self.store.directory, job))
+        self.assertEqual([entry['kind'] for entry in entries], ['note', 'result', 'report'])
+        self.assertIn('storage', entries[1])
+        data, body = records.project(self.store, self.store.task_get(job['id']))
+        self.assertEqual(body['outcome'], 'Owner report')
+        self.assertTrue(body['ask'].endswith('…[+1000 chars]'))
+
+    def test_failed_result_journal_does_not_fail_completion(self):
+        job = self.store.task_create('1:2', 'Ledger')
+        self.store.task_update(job['id'], worktree=self.temp.name)
+        worker = self.call('workers.spawn', {'task': job['id'], 'provider': 'claude', 'prompt': 'Work'}).data['worker']
+        from coordinator import records
+        completed = self.store.worker_complete(worker, {'success': True, 'text': 'Done'})
+        with patch('coordinator.records.journal_append', side_effect=OSError('unavailable')):
+            records.result_entries_in_thread(self.store.directory)
+        self.assertEqual(completed['kind'], 'worker_result')
+        self.assertTrue(self.store.db.execute("SELECT 1 FROM problems WHERE area='records' AND code='journal-failed' AND task=?", (job['id'],)).fetchone())
+        self.assertEqual(self.store.db.execute('SELECT COUNT(*) FROM worker_ledger_pending').fetchone()[0], 1)
+        with self.store.db:
+            self.store.db.execute('UPDATE worker_ledger_pending SET attempted=0')
+        records.result_entries_in_thread(self.store.directory)
+        records.result_entries_in_thread(self.store.directory)
+        entries = records.journal(records.journal_path(self.store.directory, job))
+        self.assertEqual([entry['kind'] for entry in entries], ['result'])
+        self.assertEqual(self.store.db.execute('SELECT COUNT(*) FROM worker_ledger_pending').fetchone()[0], 0)
+
+    def test_system_entry_refuses_an_unavailable_vault(self):
+        from coordinator import records
+        from coordinator.vault import VaultError
+        job = self.store.task_create('1:2', 'Ledger')
+        with patch('coordinator.store._known_token_scrubber', side_effect=VaultError('unavailable')):
+            self.assertFalse(records.system_entry(self.store, job, 'result', 'sensitive', worker=1))
+        self.assertEqual(records.journal(records.journal_path(self.store.directory, job)), [])
+        self.assertTrue(self.store.db.execute("SELECT 1 FROM problems WHERE area='records' AND code='journal-failed' AND task=?", (job['id'],)).fetchone())
 
     def test_telegram_send_refuses_invalid_buttons_without_queueing(self):
         for text, callback in (('ok', ''), ('ok', 'x' * 65), ('ok', 'é' * 33), ('', 'ok')):
@@ -1332,7 +1429,7 @@ class ControlApiTests(unittest.TestCase):
         result_text = 'Ran ./scripts/verify-local.py: 812 tests OK'
         completed = self.store.worker_complete(worker.data['worker'], {'success': True, 'text': result_text})
         self.assertEqual(completed['kind'], 'worker_result')
-        closed = self.call('tasks.update', {'task': task['id'], 'status': 'done'})
+        closed = self.call('tasks.update', {'task': task['id'], 'status': 'done', 'summary': 'Closed in test.'})
         self.assertTrue(closed.ok, closed.text)
         fetched = self.call('tasks.get', {'task': task['id']})
         self.assertTrue(fetched.ok, fetched.text)
@@ -1377,6 +1474,76 @@ class ControlApiTests(unittest.TestCase):
         self.assertTrue(sent.ok)
         self.assertIsNone(row['reply_to'])
 
+    def test_telegram_send_attachment_survives_source_move_and_is_cleaned_after_delivery(self):
+        source = Path(self.store.directory) / 'source.pdf'
+        source.write_bytes(b'attachment contents')
+        sent = self.call('telegram.send', {'text': 'Attached', 'image': str(source)})
+        self.assertTrue(sent.ok, sent.text)
+        row = self.store.db.execute('SELECT image FROM outbox WHERE id=?', (sent.data['outbox'],)).fetchone()
+        queued = Path(row['image'])
+        self.assertNotEqual(queued, source)
+        source.rename(source.with_name('moved.pdf'))
+        self.assertEqual(queued.read_bytes(), b'attachment contents')
+        trash = Path(self.temp.name) / 'trash'
+        with patch('coordinator.host_os.trash_directory', return_value=trash):
+            self.store.delivered(sent.data['outbox'], 12345)
+        self.assertFalse(queued.exists())
+        self.assertFalse(trash.exists())
+
+    def test_telegram_send_missing_during_copy_is_refused_without_orphans(self):
+        source = Path(self.store.directory) / 'source.png'
+        source.write_bytes(b'proof')
+        with patch('coordinator.control_api.shutil.copyfile', side_effect=FileNotFoundError('gone')):
+            sent = self.call('telegram.send', {'text': 'Proof', 'image': str(source)})
+        self.assertFalse(sent.ok)
+        self.assertEqual(sent.state, 'refused')
+        root = Path(self.store.directory) / 'outbox-attachments'
+        self.assertFalse(root.exists() and list(root.iterdir()))
+
+    def test_telegram_send_enqueue_failure_leaves_no_copy(self):
+        source = Path(self.store.directory) / 'source.png'
+        source.write_bytes(b'proof')
+        with patch.object(self.store, 'enqueue_report', side_effect=RuntimeError('enqueue failed')):
+            self.call('telegram.send', {'text': 'Proof', 'image': str(source)})
+        root = Path(self.store.directory) / 'outbox-attachments'
+        self.assertFalse(root.exists() and list(root.iterdir()))
+
+    def test_telegram_send_transaction_rollback_leaves_no_copy(self):
+        source = Path(self.store.directory) / 'source.png'
+        source.write_bytes(b'proof')
+        with self.assertRaises(RuntimeError):
+            with self.store.db:
+                sent = control_api.call(self.store, 'telegram.send', {'text': 'Proof', 'image': str(source)}, topic='1:2')
+                self.assertTrue(sent.ok)
+                raise RuntimeError('rollback')
+        root = Path(self.store.directory) / 'outbox-attachments'
+        self.assertFalse(root.exists() and list(root.iterdir()))
+
+    def test_unavailable_attachment_deletes_copy(self):
+        source = Path(self.store.directory) / 'source.png'
+        source.write_bytes(b'proof')
+        sent = self.call('telegram.send', {'text': 'Proof', 'image': str(source)})
+        staged = Path(self.store.db.execute('SELECT image FROM outbox WHERE id=?', (sent.data['outbox'],)).fetchone()[0])
+        self.store.image_unavailable(sent.data['outbox'])
+        self.assertFalse(staged.parent.exists())
+
+    def test_retired_attachment_is_deleted_after_transaction_commits(self):
+        from coordinator import setup_flow
+        source = Path(self.store.directory) / 'source.png'
+        source.write_bytes(b'proof')
+        sent = self.call('telegram.send', {'text': 'Proof', 'image': str(source)})
+        staged = Path(self.store.db.execute('SELECT image FROM outbox WHERE id=?', (sent.data['outbox'],)).fetchone()[0])
+        with self.assertRaises(RuntimeError):
+            with self.store.db:
+                setup_flow.topic_unreachable(self.store, {'topic': '1:2', 'thread': 2}, 'thread_not_found')
+                self.assertTrue(staged.exists())
+                raise RuntimeError('rollback')
+        self.assertTrue(staged.exists())
+        with self.store.db:
+            setup_flow.topic_unreachable(self.store, {'topic': '1:2', 'thread': 2}, 'thread_not_found')
+            self.assertTrue(staged.exists())
+        self.assertFalse(staged.parent.exists())
+
     def test_telegram_send_image_and_multipart_replies_use_telegram_id(self):
         message = self.store.message_save('1:2', 'owner', 'Question', telegram_message=5006)
         image = Path(self.store.directory) / 'reply.png'
@@ -1387,7 +1554,7 @@ class ControlApiTests(unittest.TestCase):
                                      ('1:2',)).fetchall()
         self.assertGreater(len(rows), 1)
         self.assertEqual([row['reply_to'] for row in rows], [5006] * len(rows))
-        self.assertEqual(rows[0]['image'], str(image))
+        self.assertEqual(Path(rows[0]['image']).read_bytes(), image.read_bytes())
         self.assertTrue(all(row['image'] is None for row in rows[1:]))
 
     def test_telegram_send_as_document_persists_on_image_part_only(self):
@@ -1551,7 +1718,7 @@ class ControlApiTests(unittest.TestCase):
                 self.assertTrue(result.ok, result.text)
                 row = self.store.db.execute('SELECT image FROM outbox WHERE id=?',
                                             (result.data['outbox'],)).fetchone()
-                self.assertEqual(row['image'], str(path.resolve()))
+                self.assertEqual(Path(row['image']).read_bytes(), path.read_bytes())
             outside.write_bytes(b'outside')
             link = root / 'escape.png'
             link.symlink_to(outside)
@@ -1593,7 +1760,7 @@ class ControlApiTests(unittest.TestCase):
     def test_workers_require_worktree_and_both_providers_accept_goals(self):
         task = self.store.task_create('1:2', 'Build')
         self.assertFalse(self.call('workers.spawn', {'task': task['id'], 'provider': 'claude',
-                                                       'prompt': 'Build it'}).ok)
+                                                       'prompt': 'Build it', 'work': 'dev'}).ok)
         self.store.task_update(task['id'], worktree=self.temp.name)
         codex = self.call('workers.spawn', {'task': task['id'], 'provider': 'codex',
                                            'prompt': 'Build it', 'goal': 'Tests pass'})
@@ -1747,6 +1914,12 @@ class ControlApiTests(unittest.TestCase):
                           self.expected_spawn(first.data['worker'], existing=True)))
         self.assertEqual([dict(row) for row in self.store.db.execute('SELECT * FROM workers')], before)
 
+    def test_spawn_records_the_job_folders_its_brief_names(self):
+        task = self.store.task_create('1:2', 'Build', worktree=self.temp.name)
+        self.call('workers.spawn', {'task': task['id'], 'provider': 'codex', 'prompt': 'Read results/task-77/PLAN.md'})
+        self.assertEqual([row[0] for row in self.store.db.execute('SELECT ref FROM task_refs WHERE task=?', (task['id'],))],
+                         ['results/task-77/PLAN.md'])
+
     def test_spawn_dedupe_matches_only_active_statuses(self):
         for status in ('queued', 'waiting_for_secret', 'waiting_for_quota', 'running', 'done', 'interrupted'):
             with self.subTest(status=status):
@@ -1840,7 +2013,7 @@ class ControlApiTests(unittest.TestCase):
                 task = self.store.task_create('1:2', status, worktree=self.temp.name)
                 params = {'task': task['id'], 'provider': 'codex', 'prompt': 'Build it'}
                 first = self.call('workers.spawn', params).data['worker']
-                completed = self.store.worker_complete(first, {'success': True, 'session_id': 'session-1'})
+                completed = self.store.worker_complete(first, {'success': True, 'session_id': 'session-' + status})
                 self.assertEqual((completed['kind'], completed['source_worker']), ('worker_result', first))
                 steer = self.call('workers.steer', {'worker': first, 'prompt': 'Check the tests'})
                 self.assertTrue(steer.ok, steer.text)
@@ -1849,7 +2022,7 @@ class ControlApiTests(unittest.TestCase):
                 resumed = service.workers.get(first)
                 self.assertEqual((resumed['status'], resumed['prompt'], resumed['fresh'], resumed['session'],
                                   resumed['host']),
-                                 ('queued', 'Check the tests', 0, 'session-1',
+                                 ('queued', 'Check the tests', 0, 'session-' + status,
                                   'worker-%d-resume-%d' % (first, steer.data['request'])))
                 with self.store.db:
                     self.store.db.execute('UPDATE workers SET status=? WHERE id=?', (status, first))
@@ -1902,7 +2075,7 @@ class ControlApiTests(unittest.TestCase):
 
     def test_spawn_dedupe_distinguishes_every_request_field(self):
         changes = {'provider': 'claude', 'prompt': 'Build something else', 'work': 'dev',
-                   'model': 'gpt-6.1-sol', 'goal': 'Tests pass', 'effort': 'high', 'task': None}
+                   'model': 'gpt-6.1-sol', 'goal': 'Tests pass', 'effort': 'xhigh', 'task': None}
         for field, value in changes.items():
             with self.subTest(field=field):
                 task = self.store.task_create('1:2', field, worktree=self.temp.name)
@@ -1918,8 +2091,8 @@ class ControlApiTests(unittest.TestCase):
                 self.assertEqual(self.store.db.execute('SELECT count(*) FROM workers WHERE id IN (?,?)',
                                                        (first, second.data['worker'])).fetchone()[0], 2)
 
-    def test_spawn_dedupe_normalizes_missing_effort_to_medium(self):
-        for first_effort, second_effort in (({}, {'effort': 'medium'}), ({'effort': 'medium'}, {})):
+    def test_spawn_dedupe_normalizes_missing_effort_to_the_loadout_default(self):
+        for first_effort, second_effort in (({}, {'effort': 'high'}), ({'effort': 'high'}, {})):
             with self.subTest(first=first_effort):
                 task = self.store.task_create('1:2', 'Build', worktree=self.temp.name)
                 params = {'task': task['id'], 'provider': 'codex', 'prompt': 'Build it'}
@@ -1927,7 +2100,7 @@ class ControlApiTests(unittest.TestCase):
                 second = self.call('workers.spawn', dict(params, **second_effort))
                 self.assertEqual(second.data, self.expected_spawn(first, existing=True))
                 self.assertEqual(self.store.db.execute('SELECT effort FROM workers WHERE task=?',
-                                                       (task['id'],)).fetchall()[0][0], 'medium')
+                                                       (task['id'],)).fetchall()[0][0], 'high')
                 self.assertEqual(self.store.db.execute('SELECT count(*) FROM workers WHERE task=?',
                                                        (task['id'],)).fetchone()[0], 1)
 
@@ -1945,11 +2118,11 @@ class ControlApiTests(unittest.TestCase):
                           json.loads(row['workspace']), row['goal'], row['model'], row['effort'],
                           row['work'], row['status'], row['created'], row['updated']),
                          (task['id'], '1:2', 'codex', 'Build it', self.temp.name,
-                          {'cwd': self.temp.name, 'isolated': True}, None, None, 'medium',
+                          {'cwd': self.temp.name, 'isolated': True}, None, 'gpt-6.2-sol', 'high',
                           'research', 'queued', 123.0, 123.0))
 
     def test_spawn_dedupe_keeps_refusals_before_existing_worker(self):
-        for reason in ('unknown', 'done', 'dropped', 'unset_worktree', 'missing_worktree', 'accounts', 'spawn_refusal'):
+        for reason in ('unknown', 'done', 'dropped', 'missing_worktree', 'accounts', 'spawn_refusal'):
             with self.subTest(reason=reason):
                 task = self.store.task_create('1:2', reason, worktree=self.temp.name)
                 params = {'task': task['id'], 'provider': 'claude', 'prompt': 'Build it'}
@@ -1961,9 +2134,8 @@ class ControlApiTests(unittest.TestCase):
                 elif reason in ('done', 'dropped'):
                     self.store.task_update(task['id'], status=reason)
                     expected = 'Workers require an open job.'
-                elif reason in ('unset_worktree', 'missing_worktree'):
-                    self.store.task_update(task['id'], worktree=None if reason == 'unset_worktree'
-                                           else str(Path(self.temp.name) / 'missing'))
+                elif reason == 'missing_worktree':
+                    self.store.task_update(task['id'], worktree=str(Path(self.temp.name) / 'missing'))
                     expected = 'Create the job worktree first.'
                 elif reason == 'accounts':
                     self.store.put('accounts', {})
@@ -2136,8 +2308,9 @@ finally:
             first = self.call('worktree.create', {'task': task['id']})
             second = self.call('worktree.create', {'task': task['id']})
         self.assertEqual(first.data['cwd'], self.temp.name)
-        self.assertEqual(second.data['worktree'], self.temp.name)
-        create.assert_awaited_once()
+        self.assertEqual(second.data['cwd'], self.temp.name)
+        self.assertEqual(self.store.task_get(task['id'])['worktree'], self.temp.name)
+        self.assertEqual(create.await_args_list[1].kwargs, {'base': None, 'saved_cwd': self.temp.name, 'store': self.store})
 
     def test_worktree_create_passes_base_and_returns_fetched_start(self):
         root = Path(self.temp.name)
@@ -2170,14 +2343,17 @@ finally:
 
     def test_saved_worktree_reports_that_base_was_not_applied_without_fetch(self):
         task = self.store.task_create('1:2', 'Build', worktree=self.temp.name)
-        with patch('coordinator.workspaces.prepare_task_workspace', new=AsyncMock()) as create:
+        workspace = {'cwd': self.temp.name, 'branch': 'torii/task-1', 'isolated': True,
+                     'base_ref': 'HEAD', 'base_commit': 'abc', 'fetched': False}
+        with patch('coordinator.workspaces.prepare_task_workspace', new=AsyncMock(return_value=workspace)) as create:
             result = self.call('worktree.create', {'task': task['id'], 'base': 'missing'})
         self.assertTrue(result.ok, result.text)
         self.assertIn('not applied', result.text)
-        self.assertEqual(result.data['worktree'], self.temp.name)
+        self.assertEqual(result.data['cwd'], self.temp.name)
         self.assertEqual(result.data['base_ref'], 'HEAD')
         self.assertIs(result.data['fetched'], False)
-        create.assert_not_awaited()
+        create.assert_awaited_once_with(Path(self.temp.name), self.store.directory, task['id'], base='missing',
+                                        saved_cwd=self.temp.name, store=self.store)
 
     def test_worktree_create_reports_ignored_base_when_unsaved_worktree_exists(self):
         task = self.store.task_create('1:2', 'Build')
@@ -2187,7 +2363,8 @@ finally:
             result = self.call('worktree.create', {'task': task['id'], 'base': 'missing'})
         self.assertTrue(result.ok, result.text)
         self.assertIn('not applied', result.text)
-        create.assert_awaited_once_with(Path(self.temp.name), self.store.directory, task['id'], base='missing')
+        create.assert_awaited_once_with(Path(self.temp.name), self.store.directory, task['id'], base='missing',
+                                        store=self.store)
 
     def test_two_topics_on_one_repository_create_worktrees_for_their_first_tasks(self):
         repository = Path(self.temp.name) / 'repository'
@@ -2208,20 +2385,75 @@ finally:
                          ['torii/task-%d' % first['id'], 'torii/task-%d' % second['id']])
 
     def test_task_with_an_old_style_branch_keeps_its_saved_worktree(self):
-        repository = Path(self.temp.name) / 'repository'
+        repository = Path(self.temp.name).resolve() / 'repository'
         repository.mkdir()
         subprocess.run(('git', '-C', str(repository), 'init', '-q'), check=True)
         subprocess.run(('git', '-C', str(repository), '-c', 'user.email=t@example.com', '-c', 'user.name=T',
                         'commit', '-q', '--allow-empty', '-m', 'base'), check=True)
         for number in range(4):
             task = self.store.task_create('1:2', 'Earlier %d' % number)
-        legacy = Path(self.temp.name) / 'worktrees' / ('task-%d' % task['id'])
+        legacy = Path(self.temp.name).resolve() / 'worktrees' / ('task-%d' % task['id'])
         subprocess.run(('git', '-C', str(repository), 'worktree', 'add', '-q', '-b',
                         'torii/task-%d' % task['number'], str(legacy)), check=True)
         self.store.task_update(task['id'], worktree=str(legacy))
+        with self.store.db:
+            self.store.db.execute("UPDATE topics SET cwd=? WHERE id='1:2'", (str(repository),))
         reused = self.call('worktree.create', {'task': task['id']})
-        self.assertEqual(reused.data['worktree'], str(legacy))
+        self.assertTrue(reused.ok, reused.text)
+        self.assertEqual(reused.data['cwd'], str(legacy))
         self.assertTrue(self.call('workers.spawn', {'task': task['id'], 'provider': 'claude', 'prompt': 'Go'}).ok)
+
+    def test_workers_cannot_change_accounts_or_restart_the_service(self):
+        job = self.store.task_create('1:2', 'Job')
+        self.store.task_update(job['id'], worktree=self.temp.name)
+        worker = self.call('workers.spawn', {'task': job['id'], 'provider': 'claude', 'prompt': 'Work'}).data['worker']
+        for op, params in (('account.use', {'alias': 'work'}), ('accounts.claude_auto', {}), ('account.redeem', {}),
+                           ('account.codex_reset', {'alias': 'work'}), ('accounts.codex_auto_redeem', {'accounts': '[]'}),
+                           ('service.restart', {'reason': 'try'})):
+            with self.subTest(op=op):
+                result = control_api.call(self.store, op, params, source_worker=worker)
+                self.assertEqual(result.state, 'refused', result.text)
+        self.assertIsNone(self.store.get('claude_account_pick'))
+        self.assertEqual(self.store.service_requests_pending(), [])
+        self.assertEqual(self.call('service.restart', {'reason': 'owner asked'}).state, 'queued')
+
+    def test_mcp_account_ops_need_an_owner_message_in_the_asking_channel(self):
+        self.store.put('coordinator_home_topic', '1:2')
+        event = self.store.message_event('1:2', 'note')['id']
+        for name, arguments in (('accounts_claude_auto', {}), ('accounts_claude_auto', {'message': event}),
+                                ('account_redeem', {}), ('account_use', {'alias': 'work'})):
+            with self.subTest(name=name, arguments=arguments):
+                reply = mcp.dispatch(self.store, {'method': 'tools/call', 'params': {'name': name, 'arguments': arguments}},
+                                     topic='1:2')
+                self.assertTrue(reply['isError'], reply)
+        message = self.store.message_save('1:2', 'owner', 'Back to automatic.')['id']
+        reply = mcp.dispatch(self.store, {'method': 'tools/call', 'params': {'name': 'accounts_claude_auto',
+                             'arguments': {'message': message}}}, topic='1:2')
+        self.assertFalse(reply['isError'], reply)
+
+    def test_codex_auto_redeem_setting_queues_one_reset_an_hour_for_listed_accounts(self):
+        from coordinator.codex_accounts import CodexBroker
+        self.store.put('coordinator_home_topic', '1:2')
+        self.assertEqual(self.call('accounts.codex_auto_redeem', {}).data['codex_auto_redeem'], [])
+        self.assertFalse(self.call('accounts.codex_auto_redeem', {'accounts': '"x"'}).ok)
+        self.assertFalse(control_api.call(self.store, 'accounts.codex_auto_redeem', {'accounts': '[]'}, source='mcp').ok)
+        self.assertTrue(self.call('accounts.codex_auto_redeem', {'accounts': '["me@example.com"]'}).ok)
+        self.store.put('codex_account_status', {'codex': {'identity': {'email': 'me@example.com'}, 'resets_available': 2},
+                                                'other': {'identity': {'email': 'other@example.com'}}})
+        broker = CodexBroker(self.store)
+        broker.auto_redeem('other')
+        self.assertEqual(self.store.service_requests_pending(), [])
+        broker.auto_redeem('codex')
+        broker.auto_redeem('codex')
+        pending = self.store.service_requests_pending()
+        self.assertEqual([(row['op'], json.loads(row['params'])) for row in pending],
+                         [('account.codex_reset', {'alias': 'codex', '_topic': '1:2'})])
+        self.store.put('codex_auto_redeem_at', {'codex': time.time() - 3601})
+        self.store.put('codex_account_status', {'codex': {'identity': {'email': 'me@example.com'}, 'resets_available': 0}})
+        broker.auto_redeem('codex')
+        self.assertEqual(len(self.store.service_requests_pending()), 1)
+        self.assertTrue(self.call('accounts.codex_auto_redeem', {'accounts': '[]'}).ok)
+        self.assertIsNone(self.store.get('codex_auto_redeem'))
 
     def test_account_menu_still_uses_available_ops(self):
         with self.store.db:
@@ -2322,7 +2554,7 @@ class RestartTests(unittest.IsolatedAsyncioTestCase):
                                  .fetchone()[0], 'done')
             control.steer.assert_not_awaited()
 
-    async def test_steering_a_queued_worker_cannot_grow_its_brief_past_the_limit(self):
+    async def test_steering_a_queued_worker_keeps_every_steer_after_a_long_brief(self):
         with tempfile.TemporaryDirectory() as root:
             store = Store(Path(root))
             store.put('accounts', {'work': {'config_dir': None, 'enabled': True}})
@@ -2338,11 +2570,34 @@ class RestartTests(unittest.IsolatedAsyncioTestCase):
                 service = Service(store, object(), object(), Path(root))
                 self.assertTrue(await service.controls_once())
                 prompt = store.db.execute('SELECT prompt FROM workers WHERE id=?', (worker,)).fetchone()[0]
-                self.assertEqual(prompt, brief + '\n\nFollow-up:\nshort follow-up')
-                states = [tuple(row) for row in store.db.execute('SELECT state,result FROM service_requests ORDER BY id')]
-                self.assertEqual(states[0], ('done', None))
-                self.assertEqual(states[1][0], 'refused')
-                self.assertIn('would exceed', states[1][1])
+                self.assertEqual(prompt, brief + '\n\nFollow-up:\nshort follow-up\n\nFollow-up:\n' + 'x' * 200)
+                states = [tuple(row) for row in store.db.execute(
+                    "SELECT state,result FROM service_requests WHERE op='workers.steer' ORDER BY id")]
+                self.assertEqual(states, [('done', None), ('done', None)])
+            finally:
+                store.close()
+
+    async def test_steering_a_worker_handed_to_another_agent_keeps_the_takeover_preface(self):
+        from coordinator import moves
+        with tempfile.TemporaryDirectory() as root:
+            store = Store(Path(root))
+            store.put('accounts', {'work': {'config_dir': None, 'enabled': True}})
+            try:
+                with store.db:
+                    store.db.execute("INSERT INTO topics(id,chat,thread,name,cwd,enabled) VALUES ('1:2',1,2,'test','',1)")
+                task = store.task_create('1:2', 'Build', worktree=root)
+                service = Service(store, object(), object(), Path(root))
+                steered, plain = (control_api.call(store, 'workers.spawn', {
+                    'task': task['id'], 'provider': 'claude', 'prompt': brief}).data['worker']
+                    for brief in ('Build', 'Review'))
+                control_api.call(store, 'workers.steer', {'worker': steered, 'prompt': 'Use blue.'})
+                self.assertTrue(await service.controls_once())
+                for worker, brief in ((steered, 'Build\n\nFollow-up:\nUse blue.'), (plain, 'Review')):
+                    store.db.execute('UPDATE workers SET prompt=? WHERE id=?', (moves.HANDOFF + brief, worker))
+                    control_api.call(store, 'workers.steer', {'worker': worker, 'prompt': 'Then push.'})
+                    self.assertTrue(await service.controls_once())
+                    prompt = store.db.execute('SELECT prompt FROM workers WHERE id=?', (worker,)).fetchone()[0]
+                    self.assertEqual(prompt, moves.HANDOFF + brief + '\n\nFollow-up:\nThen push.')
             finally:
                 store.close()
 

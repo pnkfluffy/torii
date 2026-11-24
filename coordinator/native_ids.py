@@ -9,7 +9,7 @@ def valid(provider, session_id):
         return False
     if provider == 'opencode':
         return re.fullmatch(r'ses_[0-9A-Za-z]{26}', session_id) is not None
-    if provider not in ('claude', 'codex', 'muse'):
+    if provider not in ('claude', 'codex', 'antigravity'):
         return False
     try:
         return str(uuid.UUID(session_id)) == session_id

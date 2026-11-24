@@ -168,6 +168,7 @@ class OnboardingTests(OnboardingFixture):
             {'command': 'projects', 'description': "Projects, new projects, this topic's folder"},
             {'command': 'tldr', 'description': 'Catch up on this topic'},
             {'command': 'health', 'description': 'Running agents and system load'},
+            {'command': 'waiting', 'description': 'What is waiting on you'},
             {'command': 'secrets', 'description': 'Stored keys: rotate, revoke, ask again'},
             {'command': 'ping', 'description': 'Check that Torii is listening'},
             {'command': 'help', 'description': 'All commands'},
@@ -347,6 +348,9 @@ class LegacyTopicContractTests(unittest.TestCase):
                     self.assertIsNone(row.pop('reaction_first_failed'))
             for row in value['outbox']:
                 self.assertEqual(row.pop('as_document'), 0)
+                self.assertIsNone(row.pop('image_source'))
+                self.assertIsNone(row.pop('task'))
+                self.assertIsNone(row.pop('sender'))
             value['settings'] = {key: case.store.get(key) for key in (
                 'control_topic', 'coordinator_home_topic', 'projects_root', 'group_projects', 'execution')}
             if hasattr(case, 'telegram'):

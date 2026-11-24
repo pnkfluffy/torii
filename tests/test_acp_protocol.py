@@ -15,7 +15,7 @@ from coordinator.host import HostClient
 from coordinator.native_protocol import RunControl, steer_wire
 from coordinator.opencode_runtime import environment
 from tests.fake_opencode import SESSION_ID, install_fake_opencode
-from tests.support import settle, stop_test_hosts
+from tests.support import settle, stop_test_hosts, until
 
 
 SESSION = 'session-a'
@@ -143,6 +143,8 @@ class ScriptedAgent:
             for notification in self.load_history:
                 self.emit(notification)
             self.reply(event['id'])
+        elif method in ('session/resume', 'test/configure'):
+            self.reply(event['id'], {'configured': event['params']})
         elif method == 'session/prompt' and self.auto_prompt:
             self.emit(chunk('answer'))
             self.reply(event['id'], {'stopReason': 'end_turn'})
@@ -153,7 +155,7 @@ class ScriptedAgent:
         elif method == 'session/cancel' and self.cancel_reply:
             prompts = [event for event in self.writes if event.get('method') == 'session/prompt']
             if prompts:
-                self.reply(prompts[-1]['id'], {'stopReason': 'cancelled'})
+                self.reply(prompts[-1]['id'], {'stopReason': 'cancelled', 'tokens': 5})
 
 
 class AcpProtocolTests(unittest.IsolatedAsyncioTestCase):
@@ -534,7 +536,6 @@ class AcpProtocolTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([event['method'] for event in agent.writes],
                          ['initialize', 'authenticate', 'session/new', 'session/prompt'])
         self.assertTrue(agent.auth)
-        self.assertTrue(protocol.prompt_sent)
 
     async def test_auth_step_can_reject_a_successful_response_before_session_creation(self):
         async def authenticate(protocol):
@@ -547,7 +548,6 @@ class AcpProtocolTests(unittest.IsolatedAsyncioTestCase):
         await self.launch(protocol)
         self.assertEqual(protocol.failure, 'quota')
         self.assertEqual([event['method'] for event in agent.writes], ['initialize', 'authenticate'])
-        self.assertFalse(protocol.prompt_sent)
 
     async def test_new_request_ids_start_after_host_maximum(self):
         agent = ScriptedAgent(writes=[request(42, 'old/request', {})])
@@ -587,7 +587,6 @@ class AcpProtocolTests(unittest.IsolatedAsyncioTestCase):
         await self.launch(protocol)
         self.assertEqual(protocol.outcome, 'succeeded')
         self.assertEqual(agent.writes, writes)
-        self.assertTrue(protocol.prompt_sent)
 
     async def test_reattach_replays_multiple_paid_turns_and_continues_ids(self):
         writes, events = self.saved()
@@ -782,6 +781,150 @@ class AcpProtocolTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await protocol.steer('late', 'too late'), 'closed')
         self.assertEqual(await protocol.control.steer('late', 'too late'), 'closed')
         self.assertEqual(agent.stdin.close_count, 1)
+
+    async def test_resume_method_replaces_load_for_a_saved_session(self):
+        protocol, agent, observed = self.build(adapter=replace(self.adapter, resume_method='session/resume'),
+                                               session=SESSION)
+        task = self.launch(protocol, fresh=False)
+        await settle(task)
+        await settle(protocol.input_closed)
+        self.assertEqual(agent.writes[1], request(2, 'session/resume',
+                                                  {'sessionId': SESSION, 'cwd': CWD, 'mcpServers': []}))
+        self.assertEqual((protocol.outcome, observed), ('succeeded', [SESSION]))
+
+    async def test_session_ready_runs_before_the_first_prompt_and_replays_on_reattach(self):
+        seen = []
+
+        async def ready(protocol, response, model, options):
+            seen.append((response, model, options))
+            await protocol.request('test/configure', {'model': model, **options})
+
+        adapter = replace(self.adapter, session_ready=ready)
+        protocol, agent, _ = self.build(adapter=adapter)
+        task = asyncio.create_task(protocol.start('hello', Path(CWD), True, 'model-a', thread_options={'effort': 'low'}))
+        self.tasks.append(task)
+        await settle(task)
+        await settle(protocol.input_closed)
+        self.assertEqual(seen, [({'sessionId': SESSION}, 'model-a', {'effort': 'low'})])
+        self.assertEqual([event['method'] for event in agent.writes],
+                         ['initialize', 'session/new', 'test/configure', 'session/prompt'])
+        self.assertEqual(protocol.outcome, 'succeeded')
+        saved = ScriptedAgent(agent.writes, agent.events[:3])
+        saved.auto_prompt = False
+        again, saved, _ = self.build(saved, adapter=adapter, reattaching=True)
+        task = asyncio.create_task(again.start('hello', Path(CWD), True, 'model-a', thread_options={'effort': 'low'}))
+        self.tasks.append(task)
+        await saved.reached(4)
+        self.assertEqual(saved.writes, agent.writes)
+        saved.reply(4, {'stopReason': 'end_turn'})
+        await settle(task)
+        await settle(again.input_closed)
+        self.assertEqual(again.outcome, 'succeeded')
+
+    async def test_session_ready_can_reject_the_session(self):
+        async def ready(protocol, response, model, options):
+            protocol.complete('failed', 'model_unavailable')
+
+        protocol, agent, _ = self.build(adapter=replace(self.adapter, session_ready=ready))
+        await settle(self.launch(protocol))
+        await settle(protocol.input_closed)
+        self.assertEqual((protocol.outcome, protocol.failure), ('failed', 'model_unavailable'))
+        self.assertEqual([event['method'] for event in agent.writes], ['initialize', 'session/new'])
+
+    async def test_continue_prompt_sends_more_prompts_up_to_the_limit(self):
+        for answers, expected in ((['wait', None], ['hello', 'wait']), (['again'] * 9, ['hello'] + ['again'] * 3)):
+            with self.subTest(answers=answers):
+                asked = list(answers)
+                protocol, agent, _ = self.build(adapter=replace(self.adapter, continue_prompt=lambda sid: asked.pop(0)))
+                task = self.launch(protocol)
+                await settle(task)
+                await until(lambda: protocol.terminal)
+                await settle(protocol.input_closed)
+                self.assertEqual(protocol.outcome, 'succeeded')
+                self.assertEqual([event['params']['prompt'][0]['text'] for event in agent.writes
+                                  if event.get('method') == 'session/prompt'], expected)
+
+    def steer_prompt_adapter(self):
+        return replace(self.adapter, steer_prompt=True, queued_receipt='queued',
+                       usage=lambda result, update: {'input_tokens': result.get('tokens', 0)})
+
+    async def test_steer_prompt_writes_at_once_and_the_superseded_result_adds_usage(self):
+        protocol, agent, _ = self.build(adapter=self.steer_prompt_adapter())
+        agent.auto_prompt = False
+        outcomes = []
+        protocol.control.on_outcome = lambda mid, state: outcomes.append((mid, state))
+        task = self.launch(protocol)
+        await agent.reached(3)
+        self.assertEqual(await protocol.control.steer('one', 'change course'), 'queued')
+        await agent.reached(4)
+        self.assertEqual(agent.writes[-1], request(4, 'session/prompt', {
+            **prompt_params('change course'), '_meta': {'toriiSteers': ['one']}}))
+        self.assertEqual(outcomes, [('one', 'received')])
+        self.assertFalse(protocol.terminal)
+        agent.emit(chunk('old'))
+        agent.reply(3, {'stopReason': 'end_turn', 'tokens': 5})
+        self.assertFalse(protocol.terminal)
+        agent.emit(chunk('steered'))
+        agent.reply(4, {'stopReason': 'end_turn', 'tokens': 7})
+        await settle(task)
+        await settle(protocol.input_closed)
+        self.assertEqual((protocol.outcome, protocol.text, protocol.spend),
+                         ('succeeded', 'steered', {'input_tokens': 12}))
+        self.assertEqual(agent.stdin.close_count, 1)
+
+    async def test_steer_prompt_after_the_turn_ended_runs_as_the_next_prompt(self):
+        protocol, agent, _ = self.build(adapter=self.steer_prompt_adapter())
+        agent.auto_prompt = False
+        task = self.launch(protocol)
+        await agent.reached(3)
+        self.assertEqual(await protocol.control.steer('one', 'first'), 'queued')
+        await agent.reached(4)
+        self.assertEqual(await protocol.control.steer('two', 'second'), 'queued')
+        await agent.reached(5)
+        self.assertEqual(agent.writes[-1]['params']['_meta'], {'toriiSteers': ['two']})
+        for number in (3, 4, 5):
+            agent.reply(number, {'stopReason': 'end_turn', 'tokens': 1})
+        await settle(task)
+        await settle(protocol.input_closed)
+        self.assertEqual((protocol.outcome, protocol.spend), ('succeeded', {'input_tokens': 3}))
+
+    async def test_steer_prompt_stop_and_failure_end_the_run(self):
+        for ending in ('cancel', 'refusal'):
+            with self.subTest(ending=ending):
+                protocol, agent, _ = self.build(adapter=self.steer_prompt_adapter())
+                agent.auto_prompt = False
+                task = self.launch(protocol)
+                await agent.reached(3)
+                await protocol.control.steer('one', 'first')
+                await agent.reached(4)
+                agent.reply(3, {'stopReason': 'end_turn', 'tokens': 4})
+                if ending == 'cancel':
+                    await settle(protocol.cancel())
+                    expected = ('stopped', 'owner_stopped')
+                else:
+                    agent.reply(4, {'stopReason': 'refusal'})
+                    expected = ('failed', 'refusal')
+                await settle(task)
+                await settle(protocol.input_closed)
+                self.assertEqual((protocol.outcome, protocol.failure), expected)
+                self.assertEqual(protocol.spend, {'input_tokens': 9 if ending == 'cancel' else 4})
+
+    async def test_steer_prompt_reattach_waits_on_the_latest_saved_prompt(self):
+        writes, events = self.saved()
+        steer = {**prompt_params('change course'), '_meta': {'toriiSteers': ['one']}}
+        writes.append(request(4, 'session/prompt', steer))
+        events.append({'jsonrpc': '2.0', 'id': 3, 'result': {'stopReason': 'end_turn', 'tokens': 5}})
+        protocol, agent, _ = self.build(ScriptedAgent(writes, events), adapter=self.steer_prompt_adapter(),
+                                        reattaching=True)
+        agent.auto_prompt = False
+        task = self.launch(protocol)
+        await agent.reached(4)
+        self.assertEqual(agent.writes, writes)
+        self.assertFalse(protocol.terminal)
+        agent.reply(4, {'stopReason': 'end_turn', 'tokens': 7})
+        await settle(task)
+        await settle(protocol.input_closed)
+        self.assertEqual((protocol.outcome, protocol.spend), ('succeeded', {'input_tokens': 12}))
 
     def native_adapter(self):
         native = AcpNativeSteer('test/interject',
@@ -1179,6 +1322,8 @@ class AcpProtocolTests(unittest.IsolatedAsyncioTestCase):
                 await self.release_host_prompt(process)
                 self.assertEqual((await settle(output.get()))['messages'], ['three'])
                 self.assertEqual(await settle(resumed.steer('four', 'new text')), 'received')
+                await until(lambda: any(json.loads(raw).get('params', {}).get('_meta', {}).get('toriiSteers') == ['four']
+                                        for raw in process.written_lines()), 'the new prompt to be written')
                 await self.host_chunk(process)
                 prompts = [json.loads(raw) for raw in process.written_lines()
                            if json.loads(raw).get('method') == 'session/prompt']
@@ -1291,8 +1436,9 @@ class AcpProtocolTests(unittest.IsolatedAsyncioTestCase):
             updates.append(update)
             return result.get('usage')
         protocol, agent, _ = await self.persistent_protocol(adapter=replace(self.adapter, usage=usage))
-        for mid, amount in [('one', 2), ('two', 3), ('three', None)]:
+        for number, (mid, amount) in enumerate([('one', 2), ('two', 3), ('three', None)], 3):
             self.assertEqual(await settle(protocol.steer(mid, mid)), 'received')
+            await until(lambda: agent.writes[-1].get('id') == number, 'prompt %d to be written' % number)
             result = {'stopReason': 'end_turn'}
             if amount is not None:
                 result['usage'] = {'input_tokens': amount}

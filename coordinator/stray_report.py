@@ -6,7 +6,6 @@ from datetime import datetime, timedelta
 import json
 import os
 from pathlib import Path
-import plistlib
 from pwd import getpwuid
 import re
 import stat
@@ -14,7 +13,9 @@ import subprocess
 import threading
 import time
 
+from . import host_os
 from .close_saves import scratch
+from .host_os import user_lsof_paths as process_paths
 from .control_api import Refused, Result
 from .worker_storage import FINAL, results_directory
 from .workspaces import _workspace_target
@@ -25,14 +26,13 @@ SCAN_SECONDS = 1800
 PROTECTED = frozenset(('.claude-accounts', '.claude', '.codex', '.codex-accounts',
                        '.grok-accounts', '.grok', '.opencode-accounts'))
 TASK = re.compile(r'(?:^|[^a-z0-9])(?:task|job)[-_]?(\d+)(?=$|[^0-9])', re.I)
-PATH_FIELDS = ('WorkingDirectory', 'Program', 'StandardOutPath', 'StandardErrorPath')
 
 
 def configuration(store):
     homes = dict.fromkeys((Path.home(), Path(getpwuid(os.getuid()).pw_dir)))
     return dict(state_root=str(store.directory.parent),
-                launch_agents=[str(home / 'Library' / 'LaunchAgents') for home in homes]
-                + ['/Library/LaunchAgents', '/Library/LaunchDaemons'],
+                launch_agents=[str(host_os.user_launch_agents(home)) for home in homes]
+                + [str(host_os.system_launch_agents()), str(host_os.system_launch_daemons())],
                 service_paths=[], results_min_bytes=1024 ** 3, growth_bytes=2 * 1024 ** 3,
                 keep=7) | (store.get('stray_report_config') or {})
 
@@ -132,41 +132,12 @@ def ownership(store, settings):
     return Ownership(tuple(trees), tuple(references), tasks, active)
 
 
-def process_paths():
-    result = subprocess.run(['/usr/sbin/lsof', '-nP', '-a', '-u', str(os.getuid()), '-Fn'],
-                            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                            env={'PATH': '/usr/bin:/bin:/usr/sbin:/sbin'}, text=True, timeout=30)
-    if result.returncode:
-        raise OSError('Process path probe failed')
-    return [Path(line[1:]) for line in result.stdout.splitlines() if line.startswith('n/')]
+def launch_references(folders):
+    yield from host_os.launch_agent_references(folders, open_directory)
 
 
 def launch_paths(folders):
-    paths = []
-    for folder in map(Path, folders):
-        try:
-            descriptor = open_directory(folder)
-        except FileNotFoundError:
-            continue
-        try:
-            with os.scandir(descriptor) as entries:
-                for entry in entries:
-                    if not entry.name.endswith('.plist') or not entry.is_file(follow_symlinks=False):
-                        continue
-                    fd = os.open(entry.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=descriptor)
-                    with os.fdopen(fd, 'rb') as handle:
-                        data = handle.read(1024 * 1024 + 1)
-                        if len(data) > 1024 * 1024:
-                            raise ValueError('LaunchAgent metadata exceeds limit')
-                        value = plistlib.loads(data)
-                    if not isinstance(value, dict) or not isinstance(value.get('ProgramArguments', []), list):
-                        raise ValueError('Invalid LaunchAgent path metadata')
-                    values = [value.get(key) for key in PATH_FIELDS]
-                    values.extend(value.get('ProgramArguments', []))
-                    paths.extend(Path(v) for v in values if isinstance(v, str) and v.startswith('/'))
-        finally:
-            os.close(descriptor)
-    return paths
+    return [Path(value) for _, values in launch_references(folders) for value in values if value.startswith('/')]
 
 
 def contains(parent, child):

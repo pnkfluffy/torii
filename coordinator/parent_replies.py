@@ -6,10 +6,10 @@ from . import reactions
 from .usage_notice import clear_unknown_limit_notice
 
 
-FORWARD_RULES = {'opencode': 'all', 'claude': 'owner', 'codex': 'owner'}
+FORWARD_RULES = {'opencode': 'all', 'claude': 'owner', 'codex': 'owner', 'antigravity': 'owner'}
 
 
-def started(session, turn, messages, outbox=None):
+def started(session, turn, messages, outbox=None, initial=None):
     store = session.store
     topic = (session.key.split(':', 1)[1] if session.key != 'coordinator' else
              store.get('coordinator_session_topic') or store.get('coordinator_home_topic'))
@@ -26,6 +26,17 @@ def started(session, turn, messages, outbox=None):
             ON CONFLICT(host,turn) DO UPDATE SET outbox_start=MIN(outbox_start,excluded.outbox_start)
             WHERE checked=0''',
                          (session.host_id, str(turn), session.provider, topic, outbox, json.dumps(sorted(messages))))
+        initial_key = 'parent_reply_initial:%s:%s' % (session.host_id, turn)
+        if initial and not store.get(initial_key):
+            store.put(initial_key, sorted(initial))
+
+
+def abandoned(session, turn=None):
+    prefix = 'parent_reply_initial:%s:' % session.host_id
+    if turn is None:
+        session.store.db.execute('DELETE FROM settings WHERE substr(key,1,?)=?', (len(prefix), prefix))
+    else:
+        session.store.db.execute('DELETE FROM settings WHERE key=?', (prefix + str(turn),))
 
 
 def completed(session, turn, messages, text):
@@ -50,6 +61,9 @@ def completed(session, turn, messages, text):
                                      (session.host_id, str(turn))).fetchone()
         if saved['checked']:
             return
+        initial_key = 'parent_reply_initial:%s:%s' % (session.host_id, turn)
+        initial = store.get(initial_key) or []
+        store.db.execute('DELETE FROM settings WHERE key=?', (initial_key,))
         carried = sorted(set(json.loads(saved['messages'])) | set(messages))
         owners = [dict(row) for message in carried for row in store.db.execute(
             "SELECT * FROM messages WHERE id=? AND kind='owner' AND delivered IN ('received','sent')", (message,))]
@@ -58,9 +72,15 @@ def completed(session, turn, messages, text):
         store.db.executemany('''INSERT INTO parent_reply_owners(message,host,turn) VALUES (?,?,?)
             ON CONFLICT(message) DO UPDATE SET host=excluded.host,turn=excluded.turn''',
                              [(owner['id'], session.host_id, str(turn)) for owner in owners])
-        if store.db.execute("SELECT 1 FROM outbox WHERE topic=? AND id>? "
-                            "AND kind NOT IN ('local-note','owner-waiting','status','wait-ask') LIMIT 1",
-                            (saved['topic'], saved['outbox_start'])).fetchone():
+        initial_kinds = [row['kind'] for message in initial for row in
+                         store.db.execute('SELECT kind FROM messages WHERE id=?', (message,))]
+        event_turn = (owners and initial_kinds and
+                      'owner' not in initial_kinds and any(kind in ('event', 'worker_result') for kind in initial_kinds))
+        cursor = max((owner['turn_outbox'] for owner in owners if owner['turn_outbox'] is not None),
+                     default=saved['outbox_start']) if event_turn else saved['outbox_start']
+        predicate = "kind='report'" if event_turn else "kind NOT IN ('local-note','owner-waiting','status','wait-ask')"
+        if store.db.execute("SELECT 1 FROM outbox WHERE topic=? AND sender=? AND id>? AND " + predicate + " LIMIT 1",
+                            (saved['topic'], saved['topic'], cursor)).fetchone():
             return
         for owner in owners:
             if not store.db.execute('SELECT 1 FROM tasks WHERE origin=?', (owner['id'],)).fetchone():
@@ -69,7 +89,7 @@ def completed(session, turn, messages, text):
                 FORWARD_RULES[session.provider] == 'owner' and not owners):
             return
         newest = owners[-1] if owners else None
-        outbox = store.enqueue_report(saved['topic'], text, kind='parent-reply',
+        outbox = store.enqueue_report(saved['topic'], text, kind='parent-reply', sender=saved['topic'],
             reply_to=(newest['telegram_message'] or newest['reacted_to']) if newest else None)
         store.db.execute('UPDATE parent_reply_turns SET outbox=? WHERE host=? AND turn=?',
                          (outbox, session.host_id, str(turn)))

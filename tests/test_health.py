@@ -5,7 +5,9 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from coordinator import control_api, health
+from coordinator import control_api, health, host_os
+from coordinator.accounts import AccountBroker
+from coordinator.codex_accounts import CodexBroker
 from coordinator.health import _codex, _subscription, format_health, system_pressure
 from coordinator.store import Store
 from coordinator.controls import handle_control
@@ -58,7 +60,7 @@ class HealthTests(HealthTestsSupport, unittest.TestCase):
                    {'topic': '1:2', 'status': 'done', 'number': 3, 'title': 'Waiting'},
                    {'topic': '1:3', 'status': 'running', 'number': 8, 'title': 'Check *UI*'},
                    {'topic': '1:3', 'status': 'done', 'number': 7, 'title': 'Done'}]
-        text = format_health(topics, workers, ['CPU: 1.0 load / 8 cores'], '**Subscriptions left** (5h · week · Fable)')
+        text = format_health(topics, workers, ['CPU: 1.0 load / 8 cores'], '**Subscriptions left** (week · Fable)')
         self.assertIn('**Agents running: 2**', text)
         self.assertIn('**Torii**: 1 running\n- Job 4: Build /health', text)
         self.assertIn('**Orbit**: 1 running\n- Job 8: Check \\*UI\\*', text)
@@ -75,6 +77,34 @@ class HealthTests(HealthTestsSupport, unittest.TestCase):
         self.assertIn('**Orbit**: 1 running · parent wound down\n- Job 8: Check', text)
         self.assertNotIn('Parent:', text)
 
+    def test_formatter_sorts_by_count_then_activity_and_name(self):
+        topics = [{'id': name, 'name': name, 'enabled': 1}
+                  for name in ('Zed', 'Beta', 'Alpha', 'Recent', 'Busy')]
+        workers = [{'topic': name, 'status': 'running', 'number': 1, 'title': name}
+                   for name in ('Recent', 'Busy')]
+        text = format_health(topics, workers, [], '', {'Busy': 'live'},
+                             activity={'Recent': 100, 'Busy': 1, 'Zed': 50})
+        names = [text.index('**' + name + '**:') for name in ('Busy', 'Recent', 'Zed', 'Alpha', 'Beta')]
+        self.assertEqual(names, sorted(names))
+        self.assertIn('**Agents running: 3**', text)
+
+    def test_health_activity_uses_all_workers_and_message_creation_time(self):
+        with self.store.db:
+            self.store.db.execute("INSERT INTO workers(topic,provider,prompt,status,created,updated) "
+                                  "VALUES ('1:2','claude','p','done',1,30)")
+            self.store.db.execute("INSERT INTO workers(topic,provider,prompt,status,created,updated) "
+                                  "VALUES ('1:3','claude','p','done',1,20)")
+            self.store.db.execute("INSERT INTO messages(topic,kind,text,created,updated) "
+                                  "VALUES ('1:3','owner','test',40,40)")
+        with patch('coordinator.health.system_pressure', return_value=[]):
+            text = control_api.call(self.store, 'health.show').text
+        self.assertLess(text.index('**Orbit**:'), text.index('**Torii**:'))
+        with self.store.db:
+            self.store.db.execute("UPDATE messages SET created=10,updated=100 WHERE topic='1:3'")
+        with patch('coordinator.health.system_pressure', return_value=[]):
+            text = control_api.call(self.store, 'health.show').text
+        self.assertLess(text.index('**Torii**:'), text.index('**Orbit**:'))
+
     def test_system_pressure_parses_bounded_mac_commands(self):
         outputs = {
             ('sysctl', '-n', 'hw.ncpu'): '8\n',
@@ -90,7 +120,7 @@ class HealthTests(HealthTestsSupport, unittest.TestCase):
             self.assertEqual(timeout, 1)
             return type('Completed', (), {'stdout': outputs[tuple(args)]})()
 
-        with patch('coordinator.host_os.SYSTEM', 'darwin'), patch('coordinator.health.subprocess.run', side_effect=run), patch('coordinator.health.os.getloadavg', return_value=(2.5, 1, 1)):
+        with patch('coordinator.host_os.SYSTEM', 'darwin'), patch('coordinator.host_os.subprocess.run', side_effect=run), patch('coordinator.host_os.os.getloadavg', return_value=(2.5, 1, 1)):
             lines = system_pressure(self.temp.name)
         self.assertEqual(lines, ['CPU: 2.5 load / 8 cores',
                                  'RAM: 8.0G used / 16.0G, 36% pressure free, swap 0.2G',
@@ -105,7 +135,7 @@ class HealthTests(HealthTestsSupport, unittest.TestCase):
         row = self.store.db.execute('SELECT text,kind,reply_to FROM outbox ORDER BY id DESC LIMIT 1').fetchone()
         self.assertEqual((row['kind'], row['reply_to']), ('status', 42))
         self.assertIn('**Agents running: 1**\n**Torii**: 1 running · parent wound down\n- Job 1: Report status', row['text'])
-        self.assertIn('**Subscriptions left** (5h · week · Fable)\n🟡 work: 78% · 19% · ?, stale since unknown', row['text'])
+        self.assertIn('**Subscriptions left** (week · Fable)\n🟡 work: 19% · ?, stale since unknown', row['text'])
         self.assertNotRegex(row['text'], r'/[A-Za-z]')
         self.assertEqual(self.store.db.execute('SELECT COUNT(*) FROM workers').fetchone()[0], 1)
 
@@ -157,13 +187,128 @@ class HealthTests(HealthTestsSupport, unittest.TestCase):
         self.assertNotRegex(text, r'\d{9,}', text)
         self.assertNotIn('None', text)
         lines = text.split('\n')
-        self.assertEqual(lines[0], '**Subscriptions left** (5h · week · Fable)')
+        self.assertEqual(lines[0], '**Subscriptions left** (week · Fable)')
         self.assertEqual(len(lines), 5, text)
-        self.assertRegex(text, r'\n🟡 old@example\.com: 99% · \? · \?, stale since 20\d\d-[^\n]*UTC\n', text)
-        self.assertIn('\n🟡 reset@example.com: 99% · ? · ?, stale since unknown', text)
-        self.assertRegex(text, r'\n🔴 full@example\.com: 99% · \? · \?, resets in 1h 59m\n', text)
-        self.assertIn('\n⚫ off@example.com: 99% · ? · ?, disabled', text)
+        self.assertRegex(text, r'\n🟡 old@example\.com: \? · \?, stale since 20\d\d-[^\n]*UTC\n', text)
+        self.assertIn('\n🟡 reset@example.com: ? · ?, stale since unknown', text)
+        self.assertRegex(text, r'\n🔴 full@example\.com: \? · \?, back in 1h 59m\n', text)
+        self.assertIn('\n⚫ off@example.com: off', text)
         self.assertNotRegex(text, r'/[A-Za-z]')
+
+    def test_subscription_stays_green_when_only_fable_is_full(self):
+        now = time.time()
+        home = Path(self.temp.name) / 'fable'
+        home.mkdir()
+        with self.store.db:
+            self.store.put('accounts', {'fable': {'config_dir': str(home), 'enabled': True}})
+            self.store.put('account_status', {'fable': {
+                'identity': {'email': 'fable@example.com', 'logged_in': True}, 'observed_at': now,
+                'usage': {'seven_day': {'utilization': 59, 'resets_at': now + 7200},
+                          'seven_day_fable': {'utilization': 100, 'resets_at': now + 7200}}}})
+        text = _subscription(self.store)
+        self.assertIn('\n🟢 fable@example.com: 41% · 0%, week resets in 1h 59m, Fable paused', text)
+
+    def test_subscription_lists_the_opus_account_first_when_others_are_only_fable_full(self):
+        now = time.time()
+        accounts, status = {}, {}
+        for alias, week, fable in (('a-full', 99, 50), ('b-open', 59, 100)):
+            home = Path(self.temp.name) / alias
+            home.mkdir()
+            accounts[alias] = {'config_dir': str(home), 'enabled': True}
+            status[alias] = {'identity': {'email': alias + '@example.com', 'logged_in': True}, 'observed_at': now,
+                             'usage': {'seven_day': {'utilization': week, 'resets_at': now + 7200},
+                                       'seven_day_fable': {'utilization': fable, 'resets_at': now + 7200}}}
+        with self.store.db:
+            self.store.put('accounts', accounts)
+            self.store.put('account_status', status)
+        lines = _subscription(self.store).split('\n')
+        self.assertTrue(lines[1].startswith('🟢 b-open@example.com:'), lines)
+
+    def test_subscription_uses_routing_order_then_limited_resets_then_inactive(self):
+        now = time.time()
+        accounts, status = {}, {}
+        rows = (('a-later', 10, 6 * 86400), ('b-none', 10, None), ('c-full', 100, 86400),
+                ('d-soon', 10, 2 * 86400), ('e-off', 100, 3600), ('f-none', 10, None),
+                ('g-full', 100, 7200), ('h-full-unknown', 100, None), ('i-signed-out', 100, 1800))
+        for alias, week, reset in rows:
+            accounts[alias] = {'config_dir': self.temp.name, 'enabled': alias != 'e-off'}
+            status[alias] = {'identity': {'email': alias + '@example.com', 'logged_in': alias != 'i-signed-out'},
+                             'observed_at': None if alias == 'b-none' else now,
+                             'usage': {'seven_day': {'utilization': week,
+                                       **({'resets_at': now + reset} if reset else {})}}}
+        with self.store.db:
+            self.store.put('accounts', accounts)
+            self.store.put('account_status', status)
+        router = AccountBroker(self.store)
+        expected = ['d-soon', 'a-later', 'b-none', 'f-none', 'g-full', 'c-full',
+                    'h-full-unknown', 'e-off', 'i-signed-out']
+        for pick in (None, {'fable': 'd-soon', 'other': 'a-later'}, 'g-full'):
+            with self.subTest(pick=pick), patch('coordinator.health.time.time', return_value=now):
+                self.store.put('claude_account_pick', pick)
+                lines = _subscription(self.store).split('\n')[1:]
+                names = [line.split(' ')[1].split('@')[0] for line in lines]
+                ordered = (['a-later', 'd-soon'] + expected[2:]) if isinstance(pick, dict) else expected
+                self.assertEqual(names, ordered, lines)
+                self.assertEqual(router.select(model='opus'), ordered[0])
+                self.assertEqual(router.selection_order(model='opus'), ordered[:4])
+                self.assertEqual(router.select(attempted=ordered[:1], model='opus'), ordered[1])
+                self.assertTrue(lines[ordered.index('b-none')].startswith('🟡 '))
+                self.assertTrue(all(line.startswith('🔴 ') for line in lines[4:7]))
+                self.assertTrue(lines[7].startswith('⚫ '))
+                self.assertTrue(lines[8].startswith('⚪ '))
+
+    def test_codex_uses_selected_then_routing_order_then_limited_resets_then_inactive(self):
+        now = time.time()
+        accounts, status = {}, {}
+        rows = (('a-later', 10, 6 * 86400), ('b-none', 10, None), ('c-full', 100, 86400),
+                ('d-soon', 10, 2 * 86400), ('e-off', 100, 3600), ('f-none', 10, None),
+                ('g-full', 100, 7200), ('h-full-unknown', 100, None), ('i-signed-out', 100, 1800))
+        for alias, week, reset in rows:
+            accounts[alias] = {'config_dir': self.temp.name, 'enabled': alias != 'e-off'}
+            status[alias] = {'identity': {'email': alias + '@example.com', 'logged_in': alias != 'i-signed-out'},
+                             'observed_at': None if alias == 'b-none' else now,
+                             'usage': {'seven_day': {'utilization': week,
+                                       **({'resets_at': now + reset} if reset else {})}}}
+        with self.store.db:
+            self.store.put('codex_accounts', accounts)
+            self.store.put('codex_account_status', status)
+            self.store.put('codex_active_account', 'a-later')
+        broker = CodexBroker(self.store)
+        for automatic in (False, True):
+            with self.subTest(automatic=automatic), patch('coordinator.health.time.time', return_value=now):
+                self.store.put('codex_auto_switch', automatic)
+                lines = _codex(self.store).split('\n')[1:]
+                names = [line.split(' ')[1].split('@')[0] for line in lines]
+                expected = (['d-soon', 'a-later'] if automatic else ['a-later', 'd-soon']) + [
+                    'b-none', 'f-none', 'g-full', 'c-full', 'h-full-unknown', 'e-off', 'i-signed-out']
+                self.assertEqual(names, expected, lines)
+                self.assertEqual(broker.select(), expected[0])
+                self.assertIn(' · active', lines[0])
+                self.assertEqual(broker.selection_order(), ['d-soon', 'a-later', 'b-none', 'f-none'])
+                self.assertEqual(broker.select(attempted=expected[:1]), 'a-later' if automatic else None)
+                self.assertTrue(lines[2].startswith('🟡 '))
+                self.assertTrue(all(line.startswith('🔴 ') for line in lines[4:7]))
+                self.assertTrue(lines[7].startswith('⚫ '))
+                self.assertTrue(lines[8].startswith('⚪ '))
+
+    def test_subscription_and_claude_card_ignore_old_five_hour_usage(self):
+        from coordinator.controls import _account_card
+        now = time.time()
+        with self.store.db:
+            self.store.put('account_status', {'work': {'identity': {'email': 'work', 'logged_in': True},
+                'observed_at': now, 'usage': {'five_hour': {'utilization': 100},
+                'seven_day': {'utilization': 51, 'resets_at': now + 3600},
+                'seven_day_fable': {'utilization': 7}}}})
+        with patch('coordinator.health._until', return_value='1h 0m'):
+            subscription = _subscription(self.store)
+        card = _account_card(self.store, 'work')
+        self.assertIn('🟢 work: 49% · 93%, week resets in 1h 0m', subscription)
+        self.assertNotIn(', ,', subscription)
+        for text in (subscription, card):
+            self.assertNotIn('5h', text)
+            self.assertNotIn('5-hour', text)
+        self.assertIn('Weekly (all models):', card)
+        self.assertIn('Fable weekly:', card)
 
     def test_subscription_weekly_reset_is_shown_only_for_available_accounts(self):
         now = time.time()
@@ -175,7 +320,7 @@ class HealthTests(HealthTestsSupport, unittest.TestCase):
         with patch('coordinator.health.time.time', return_value=now), patch(
                 'coordinator.health._until', return_value='1d 1h'):
             text = _subscription(self.store)
-        self.assertIn('🟡 work: 78% · 19% · ?, stale since unknown, week resets in 1d 1h', text)
+        self.assertIn('🟡 work: 19% · ?, stale since unknown, week resets in 1d 1h', text)
 
         for reset in (None, now - 1):
             usage['seven_day'].pop('resets_at', None)
@@ -190,7 +335,7 @@ class HealthTests(HealthTestsSupport, unittest.TestCase):
         with self.store.db:
             self.store.put('account_blocks', {'work': {'until': now + 7200, 'reason': 'quota'}})
         with patch('coordinator.health.time.time', return_value=now):
-            self.assertIn('🔴 work: 78% · 19% · ?, resets in 2h 0m', _subscription(self.store))
+            self.assertIn('🔴 work: 19% · ?, back in 2h 0m', _subscription(self.store))
             self.assertNotIn('week resets in', _subscription(self.store))
 
     def test_codex_block_shows_cached_weekly_left_active_account_and_banked_resets(self):
@@ -198,33 +343,35 @@ class HealthTests(HealthTestsSupport, unittest.TestCase):
         now = time.time()
         accounts = {}
         status = {}
-        for alias, enabled, signed, observed, used, banked in (
-                ('orbit', True, True, now, 74, 3), ('full', True, True, now, 100, 2), ('old', True, True, now - 3600, 40, 0),
-                ('off', False, True, now, 10, 1), ('new', True, False, None, None, None)):
+        for alias, enabled, signed, observed, used, banked, reset in (
+                ('orbit', True, True, now, 74, 3, 41 * 3600 + 30), ('full', True, True, now, 100, 2, 5 * 3600 + 30),
+                ('old', True, True, now - 3600, 40, 0, 20 * 3600 + 30), ('off', False, True, now, 10, 1, 3600),
+                ('new', True, False, None, None, None, 3600)):
             home = Path(self.temp.name) / ('codex-' + alias)
             home.mkdir()
             accounts[alias] = {'config_dir': str(home), 'enabled': enabled}
             status[alias] = {'identity': {'email': alias + '@example.com', 'logged_in': signed}, 'observed_at': observed,
-                             'resets_available': banked, 'credits': {'has_credits': True, 'balance': '5'},
-                             'usage': {'seven_day': {'utilization': used, 'resets_at': now + 41 * 3600 + 30}}
+                             'resets_available': banked, 'credits': {'has_credits': False, 'balance': '0'},
+                             'usage': {'seven_day': {'utilization': used, 'resets_at': now + reset}}
                              if used is not None else {}}
         with self.store.db:
             self.store.put('codex_accounts', accounts)
             self.store.put('codex_account_status', status)
             self.store.put('codex_active_account', 'orbit')
-        text = _codex(self.store)
+        with patch('coordinator.health.time.time', return_value=now):
+            text = _codex(self.store)
         self.assertEqual(text.split('\n'), [
             '**ChatGPT left** (week)',
-            '🟢 orbit@example.com: 26%, week resets in 1d 17h · active · 3 resets banked',
-            '🔴 full@example.com: 0%, resets in 1d 17h · 2 resets banked',
-            '⚫ off@example.com: 90%, disabled · 1 reset banked',
-            text.split('\n')[4],
-            '⚪ new@example.com: ?, not signed in'])
-        self.assertRegex(text, r'\n🟡 old@example\.com: 60%, stale since 20\d\d-[^\n]*UTC, week resets in 1d 17h\n')
-        self.assertNotIn('redit', text)
+            '🟢 orbit@example.com: 26%, week resets in 1d 17h · active · 3 resets banked · 0 credits',
+            text.split('\n')[2],
+            '🔴 full@example.com: 0%, back in 5h 0m · 2 resets banked · 0 credits',
+            '⚫ off@example.com: off',
+            '⚪ new@example.com: signed out'])
+        self.assertRegex(text, r'\n🟡 old@example\.com: 60%, stale since 20\d\d-[^\n]*UTC, week resets in 20h 0m · 0 credits\n')
         with patch('coordinator.health.system_pressure', return_value=['CPU: test']):
             shown = control_api.call(self.store, 'health.show').text
-        self.assertIn('**ChatGPT left** (week)\n🟢 orbit@example.com: 26%, week resets in 1d 17h · active', shown)
+        self.assertIn('**ChatGPT left** (week)\n🟢 orbit@example.com: 26%', shown)
+        self.assertIn('\n🟢 orbit@example.com: 26%, week resets in 1d 17h · active', shown)
 
     def test_health_keeps_original_host_owner_after_home_changes_and_clears(self):
         with self.store.db:
@@ -264,9 +411,9 @@ class PressureReaderTests(unittest.TestCase):
             ('memory_pressure', '-Q'): 'System-wide memory free percentage: 36%\n',
             ('sysctl', '-n', 'vm.swapusage'): 'total = 1024.00M  used = 256.00M  free = 768.00M\n'}
         with patch('coordinator.host_os.SYSTEM', 'darwin'), \
-                patch.object(health, '_command', side_effect=lambda *args: outputs[args]), \
-                patch.object(health.os, 'getloadavg', return_value=(2.5, 1, 1)):
-            result = health.read_pressure()
+                patch.object(host_os, '_probe_output', side_effect=lambda *args: outputs[args]), \
+                patch.object(host_os.os, 'getloadavg', return_value=(2.5, 1, 1)):
+            result = host_os.read_pressure()
         self.assertEqual(result, {'load1': 2.5, 'cores': 8, 'memory_used': 8589934592,
                                   'memory_total': 17179869184, 'swap_used': 268435456, 'pressure': 36.0})
 
@@ -276,36 +423,36 @@ class PressureReaderTests(unittest.TestCase):
                  'pressure/memory': 'some avg10=0.25 avg60=0.10 avg300=0.00 total=123\n'}
         with patch('coordinator.host_os.SYSTEM', 'linux'), \
                 patch('coordinator.host_os.proc_text', side_effect=lambda name: files.get(name, '')), \
-                patch.object(health.os, 'getloadavg', return_value=(2.5, 1, 1)), \
-                patch.object(health.os, 'cpu_count', return_value=8):
-            result = health.read_pressure()
+                patch.object(host_os.os, 'getloadavg', return_value=(2.5, 1, 1)), \
+                patch.object(host_os.os, 'cpu_count', return_value=8):
+            result = host_os.read_pressure()
         self.assertEqual(result, {'load1': 2.5, 'cores': 8, 'memory_used': 8589934592,
                                   'memory_total': 17179869184, 'swap_used': 268435456, 'pressure': 0.25})
 
     def test_garbage_and_unreadable_values_are_null(self):
         for system in ('darwin', 'linux'):
             with self.subTest(system=system), patch('coordinator.host_os.SYSTEM', system), \
-                    patch.object(health, '_command', return_value='garbage'), \
+                    patch.object(host_os, '_probe_output', return_value='garbage'), \
                     patch('coordinator.host_os.proc_text', return_value='some avg10=1.2.3\n'), \
-                    patch.object(health.os, 'getloadavg', side_effect=OSError), \
-                    patch.object(health.os, 'cpu_count', return_value=None):
-                self.assertEqual(health.read_pressure(), {'load1': None, 'cores': None, 'memory_used': None,
+                    patch.object(host_os.os, 'getloadavg', side_effect=OSError), \
+                    patch.object(host_os.os, 'cpu_count', return_value=None):
+                self.assertEqual(host_os.read_pressure(), {'load1': None, 'cores': None, 'memory_used': None,
                                                          'memory_total': None, 'swap_used': None, 'pressure': None})
 
     def test_partial_mac_pressure_survives_unreadable_memory(self):
         outputs = {('sysctl', '-n', 'hw.ncpu'): '4', ('memory_pressure', '-Q'):
                    'System-wide memory free percentage: 25%', ('sysctl', '-n', 'vm.swapusage'): 'used = 1.5G'}
         with patch('coordinator.host_os.SYSTEM', 'darwin'), \
-                patch.object(health, '_command', side_effect=lambda *args: outputs.get(args, 'garbage')), \
-                patch.object(health.os, 'getloadavg', return_value=(0.5, 1, 1)):
-            self.assertEqual(health.read_pressure(), {'load1': 0.5, 'cores': 4, 'memory_used': None,
+                patch.object(host_os, '_probe_output', side_effect=lambda *args: outputs.get(args, 'garbage')), \
+                patch.object(host_os.os, 'getloadavg', return_value=(0.5, 1, 1)):
+            self.assertEqual(host_os.read_pressure(), {'load1': 0.5, 'cores': 4, 'memory_used': None,
                                                      'memory_total': None, 'swap_used': 1610612736, 'pressure': 25.0})
 
     def test_host_commands_keep_one_second_timeouts(self):
         with patch('coordinator.host_os.SYSTEM', 'darwin'), \
-                patch.object(health.subprocess, 'run', side_effect=subprocess.TimeoutExpired('probe', 1)) as run, \
-                patch.object(health.os, 'getloadavg', side_effect=OSError):
-            self.assertEqual(health.read_pressure(), {'load1': None, 'cores': None, 'memory_used': None,
+                patch.object(host_os.subprocess, 'run', side_effect=subprocess.TimeoutExpired('probe', 1)) as run, \
+                patch.object(host_os.os, 'getloadavg', side_effect=OSError):
+            self.assertEqual(host_os.read_pressure(), {'load1': None, 'cores': None, 'memory_used': None,
                                                      'memory_total': None, 'swap_used': None, 'pressure': None})
         self.assertTrue(run.call_args_list)
         self.assertTrue(all(call.kwargs['timeout'] == 1 for call in run.call_args_list))
@@ -315,14 +462,14 @@ class PressureReaderTests(unittest.TestCase):
                  'pressure/memory': 'some avg10=0.00 avg60=0.00 avg300=0.00 total=0\n'}
         with patch('coordinator.host_os.SYSTEM', 'linux'), \
                 patch('coordinator.host_os.proc_text', side_effect=lambda name: files.get(name, '')), \
-                patch.object(health.os, 'getloadavg', return_value=(0, 0, 0)), \
-                patch.object(health.os, 'cpu_count', return_value=4), patch.object(health, '_disk', return_value=None):
+                patch.object(host_os.os, 'getloadavg', return_value=(0, 0, 0)), \
+                patch.object(host_os.os, 'cpu_count', return_value=4), patch.object(health, '_disk', return_value=None):
             self.assertEqual(health.system_pressure('/tmp/state'),
                              ['CPU: 0.0 load / 4 cores', 'RAM: 0.5G used / 1.0G, 0.00% pressure stall, swap 0.0G'])
 
     def test_unreadable_command_encoding_returns_null_pressure(self):
         with patch('coordinator.host_os.SYSTEM', 'darwin'), \
-                patch.object(health.subprocess, 'run', side_effect=UnicodeDecodeError('utf-8', b'\xff', 0, 1, 'invalid')), \
-                patch.object(health.os, 'getloadavg', side_effect=OSError):
-            self.assertEqual(health.read_pressure(), {'load1': None, 'cores': None, 'memory_used': None,
+                patch.object(host_os.subprocess, 'run', side_effect=UnicodeDecodeError('utf-8', b'\xff', 0, 1, 'invalid')), \
+                patch.object(host_os.os, 'getloadavg', side_effect=OSError):
+            self.assertEqual(host_os.read_pressure(), {'load1': None, 'cores': None, 'memory_used': None,
                                                      'memory_total': None, 'swap_used': None, 'pressure': None})

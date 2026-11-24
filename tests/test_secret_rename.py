@@ -44,7 +44,10 @@ class SecretRenameTests(unittest.IsolatedAsyncioTestCase):
             return control_api.call(self.store, op, params, topic=te.TOPIC, source='cli')
 
     async def fill(self, name=OLD, value=te.VALUE, task=None):
-        result = self.call('secret.ask', name=name, reason='Release', consumer='release worker', task=task)
+        stored = self.store.db.execute("SELECT 1 FROM envelopes WHERE name=? AND state='filled'", (name,)).fetchone()
+        result = (self.call('secret.rotate', name=name) if stored else
+                  self.call('secret.ask', name=name, reason='Release', consumer='release worker',
+                            task=task, confirm=True))
         self.assertTrue(result.ok, result.text)
         envelope = result.data['envelope']
         await envelopes.run_effects(self.store, self.telegram)
@@ -203,7 +206,7 @@ class SecretRenameTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(vault.path.read_bytes(), sealed)
         for state in ('open', 'armed'):
             with self.subTest(source_state=state):
-                opened = self.call('secret.ask', name=OLD, reason='Rotate', consumer='test').data['envelope']
+                opened = self.call('secret.rotate', name=OLD).data['envelope']
                 with self.store.db:
                     self.store.db.execute('UPDATE envelopes SET state=? WHERE id=?', (state, opened))
                 try:

@@ -1,4 +1,4 @@
-"""Several Codex (ChatGPT) accounts: one CODEX_HOME per login, shared threads, rotation at 95% or a rejection."""
+"""Several Codex (ChatGPT) accounts: one CODEX_HOME per login, shared threads, rotation at 99% or a rejection."""
 import asyncio
 import json
 import os
@@ -62,7 +62,7 @@ def limits(used):
                             'resetsAt': int(time.time()) + 3600}, 'secondary': weekly}
                if 'five_hour' in config() else {'primary': weekly, 'secondary': None})
     return dict(windows, limitId='codex', limitName=None, planType='pro',
-                credits=config().get('credits', {'hasCredits': True, 'unlimited': False, 'balance': '12.5'}))
+                credits=config().get('credits', {'hasCredits': False, 'unlimited': False, 'balance': '0'}))
 
 
 def reset_details():
@@ -166,6 +166,8 @@ class CodexFixture(unittest.IsolatedAsyncioTestCase):
         self.bin = self.root / 'bin'
         self.bin.mkdir()
         self.binary = self.bin / 'codex'
+        from tests.support import fake_codex_hook_trust
+        fake_codex_hook_trust(self)
         self.binary.write_text(FAKE_CODEX)
         self.binary.chmod(0o755)
         self.behave({})
@@ -212,20 +214,12 @@ class CodexFixture(unittest.IsolatedAsyncioTestCase):
             'message': {'message_id': 1000 + row['id'], 'message_thread_id': 4,
                         'chat': {'id': -10042, 'type': 'supergroup'}}}})
 
-    def reset_card(self, alias, credits):
+    def spend(self, alias, credits):
         status = self.store.get('codex_account_status')
         status[alias]['resets_available'] = credits
         with self.store.db:
             self.store.put('codex_account_status', status)
-        self.store.accept(update(350, '/accounts'))
-        self.assertEqual(self.tap('Reset ' + alias + '@example.com (' + str(credits) + ')'), 'control_callback')
-        row = self.store.db.execute('SELECT * FROM outbox ORDER BY id DESC LIMIT 1').fetchone()
-        self.assertIn('Spend 1 of ' + str(credits) + ' banked reset', row['text'])
-        self.assertEqual(self.store.service_requests_pending(), [])
-        self.assertFalse(any(call['method'] == 'account/rateLimitResetCredit/consume' for call in self.calls()))
-        buttons = json.loads(row['reply_markup'])['inline_keyboard']
-        self.assertEqual([button['text'] for line in buttons for button in line], ['Spend reset', 'Back'])
-        return buttons[0][0]['callback_data']
+            return control_api.call(self.store, 'account.codex_reset', {'alias': alias}, source='telegram', topic=TOPIC)
 
     def home(self, name, signed_in=True):
         """An added account home, signed in unless told otherwise."""
@@ -252,7 +246,9 @@ class CodexFixture(unittest.IsolatedAsyncioTestCase):
 
     def use(self, alias):
         with self.store.db:
-            return control_api.call(self.store, 'account.use', {'alias': alias}, source='mcp')
+            message = self.store.message_save(TOPIC, 'owner', 'Use ' + alias)['id']
+            return control_api.call(self.store, 'account.use', {'alias': alias, 'message': message},
+                                    topic=TOPIC, source='mcp')
 
     def notices(self):
         return [row[0] for row in self.store.db.execute('SELECT text FROM outbox ORDER BY id')
@@ -359,11 +355,11 @@ class CodexBlockRecoveryTests(CodexFixture):
         broker, _ = self.limited_account('threshold')
         self.assert_recovered(broker)
 
-    async def test_refresh_recovers_the_account_after_an_automatic_95_percent_hold(self):
+    async def test_refresh_recovers_the_account_after_an_automatic_99_percent_hold(self):
         broker, _ = self.limited_account('threshold')
         with self.store.db:
             broker.record_rate_limit('codex', {'primary': {
-                'usedPercent': 95, 'windowDurationMins': 10080, 'resetsAt': time.time() + 4 * 86400}})
+                'usedPercent': 99, 'windowDurationMins': 10080, 'resetsAt': time.time() + 4 * 86400}})
         block = self.store.get('codex_account_blocks')['codex']
         self.assertEqual(block['reason'], 'threshold')
         self.assert_limited(broker, block)
@@ -424,7 +420,7 @@ class CodexBlockRecoveryTests(CodexFixture):
     async def test_newer_full_window_does_not_clear_a_block(self):
         for reason in ('quota', 'threshold'):
             for meter in ('five_hour', 'seven_day'):
-                for used in (95, 100):
+                for used in (99, 100):
                     with self.subTest(reason=reason, meter=meter, used=used):
                         broker, block = self.limited_account(reason)
                         status = self.store.get('codex_account_status')
@@ -447,14 +443,14 @@ class CodexBlockRecoveryTests(CodexFixture):
                             self.store.put('codex_account_status', status)
                         self.assert_limited(broker, block)
 
-    async def test_newer_usage_below_95_clears_only_threshold_or_undated_blocks(self):
+    async def test_newer_usage_below_99_clears_only_threshold_or_undated_blocks(self):
         for reason in ('quota', 'threshold'):
             for until in (None, time.time() + 4 * 86400):
                 with self.subTest(reason=reason, until=until):
                     broker, block = self.limited_account(reason)
                     block['until'] = until
                     status = self.store.get('codex_account_status')
-                    status['codex']['usage'] = {meter: {'utilization': 94, 'resets_at': time.time() + 3600}
+                    status['codex']['usage'] = {meter: {'utilization': 98, 'resets_at': time.time() + 3600}
                                                for meter in ('five_hour', 'seven_day')}
                     status['codex']['usage_allowed'] = True
                     with self.store.db:
@@ -539,7 +535,7 @@ class CodexSelectionTests(CodexFixture):
                     result = await broker.run(run, 'codex', 'prompt', self.root, None, stopped=lambda: True)
                 self.assertEqual(result.failure_code, 'owner_stopped')
 
-    async def test_each_ordinary_meter_keeps_94_and_limits_at_95_percent(self):
+    async def test_each_ordinary_meter_keeps_98_and_limits_at_99_percent(self):
         self.automatic()
         self.register({'codex': (self.default, 10, 24)})
         broker = CodexBroker(self.store)
@@ -547,23 +543,23 @@ class CodexSelectionTests(CodexFixture):
         status = self.store.get('codex_account_status')
         for meter in ('five_hour', 'seven_day'):
             with self.subTest(meter=meter):
-                status['codex']['usage'][meter] = {'utilization': 94, 'resets_at': reset}
+                status['codex']['usage'][meter] = {'utilization': 98, 'resets_at': reset}
                 with self.store.db:
                     self.store.put('codex_account_status', status)
                 self.assertEqual(broker.select(), 'codex', meter)
                 self.assertEqual(broker.account_state('codex')['state'], 'available', meter)
-                status['codex']['usage'][meter]['utilization'] = 95
+                status['codex']['usage'][meter]['utilization'] = 99
                 with self.store.db:
                     self.store.put('codex_account_status', status)
                 self.assertIsNone(broker.select(), meter)
                 self.assertEqual(broker.account_state('codex')['state'], 'limited', meter)
                 status['codex']['usage'][meter]['utilization'] = 10
 
-    async def test_selection_skips_accounts_at_95_percent_and_prefers_the_soonest_weekly_reset(self):
+    async def test_selection_skips_accounts_at_99_percent_and_prefers_the_soonest_weekly_reset(self):
         self.automatic()
         broker = CodexBroker(self.store)
         homes = {name: self.home(name) for name in ('b', 'c', 'd')}
-        self.register({'codex': (self.default, 40, 72), 'codex-b': (homes['b'], 96, 24),
+        self.register({'codex': (self.default, 40, 72), 'codex-b': (homes['b'], 99, 24),
                        'codex-c': (homes['c'], 10, 48), 'codex-d': (homes['d'], 10, 1)})
         accounts = self.store.get('codex_accounts')
         accounts['codex-d']['enabled'] = False
@@ -601,10 +597,10 @@ class CodexSelectionTests(CodexFixture):
         self.assertEqual(self.store.get('codex_account_blocks')['codex']['until'], reset)
         self.assertEqual(CodexBroker(self.store).select(), 'codex-second')
 
-    async def test_a_turn_that_reports_95_percent_moves_the_next_launch_to_another_account(self):
+    async def test_a_turn_that_reports_99_percent_moves_the_next_launch_to_another_account(self):
         self.automatic()
         second = self.home('second')
-        self.behave({'codex-home': {'used': 96}, 'second': {'used': 20}})
+        self.behave({'codex-home': {'used': 99}, 'second': {'used': 20}})
         self.register({'codex': (self.default, 50, 24), 'codex-second': (second, 20, 48)})
         finished, result = await self.run_worker()
         self.assertTrue(result['success'], result.get('error'))
@@ -680,7 +676,7 @@ class CodexSelectionTests(CodexFixture):
         from coordinator.service import Service
         self.automatic()
         home = self.separate_home_topic()
-        self.register({'codex': (self.default, 97, 24)})
+        self.register({'codex': (self.default, 99, 24)})
         service = Service(self.store, None, ProviderRunner(self.store.directory, binaries={'codex': str(self.binary)}),
                           self.root)
         worker = self.worker()
@@ -694,7 +690,7 @@ class CodexSelectionTests(CodexFixture):
         self.assertEqual([row['topic'] for row in notices], [home])
         self.assertIn('every enabled Codex account', notices[0]['text'])
         self.assertIn('Automatic switching is on', notices[0]['text'])
-        self.assertIn('resumes the same thread', notices[0]['text'])
+        self.assertIn('continues on the first route that has capacity again', notices[0]['text'])
         self.assertEqual(self.callbacks(), [])
         await service.workers_once()
         self.assertEqual(service.workers.get(worker['id'])['status'], 'waiting_for_quota')
@@ -763,7 +759,7 @@ class CodexActiveAccountTests(CodexFixture):
                 self.assertEqual(self.store.get('codex_active_account'), chosen)
         self.assertEqual(self.store.accept(update(101, '/accounts')), 'control')
         text = self.store.db.execute('SELECT text FROM outbox ORDER BY id DESC LIMIT 1').fetchone()[0]
-        self.assertIn('🟢 b@example.com: ? · 90% · active', text)
+        self.assertRegex(text, r'🟢 b@example\.com: 90%, week resets in \d+[dh] \d+[hm] · active')
         finished, result = await self.run_worker()
         self.assertTrue(result['success'], result.get('error'))
         self.assertEqual((finished['account_alias'], result['text']), ('b', 'done on second'))
@@ -802,12 +798,12 @@ class CodexActiveAccountTests(CodexFixture):
 
     async def test_manual_account_keeps_running_past_the_automatic_switch_point(self):
         second = self.home('second')
-        self.behave({'codex-home': {'used': 96}, 'second': {'used': 20}})
-        self.register({'codex': (self.default, 96, 24), 'codex-second': (second, 20, 48)})
+        self.behave({'codex-home': {'used': 99}, 'second': {'used': 20}})
+        self.register({'codex': (self.default, 99, 24), 'codex-second': (second, 20, 48)})
         broker = CodexBroker(self.store)
         with self.store.db:
             broker.record_rate_limit('codex', {'limitId': 'codex', 'primary': {
-                'usedPercent': 96, 'windowDurationMins': 10080, 'resetsAt': time.time() + 86400}})
+                'usedPercent': 99, 'windowDurationMins': 10080, 'resetsAt': time.time() + 86400}})
         self.assertEqual(broker.account_state('codex')['state'], 'available')
         finished, result = await self.run_worker()
         self.assertTrue(result['success'], result.get('error'))
@@ -851,7 +847,8 @@ class CodexActiveAccountTests(CodexFixture):
     async def test_the_coordinator_can_switch_the_active_codex_account_but_not_the_automatic_setting(self):
         self.assertIn('account_use', mcp.TOOLS)
         self.assertNotIn('accounts_codex_auto', mcp.TOOLS)
-        self.assertIn('only when the owner picks it', mcp.TOOLS['account_use'].description)
+        self.assertIn('the owner picked', mcp.TOOLS['account_use'].description)
+        self.assertIn('message=N', mcp.TOOLS['account_use'].description)
         self.assertIn('originating topic', mcp.TOOLS['account_use'].description)
 
     async def test_worker_crossing_80_percent_in_project_chat_queues_no_usage_card(self):
@@ -954,12 +951,12 @@ class CodexActiveAccountTests(CodexFixture):
         self.register({'codex': (self.default, 70, 24)})
         broker = CodexBroker(self.store)
         status = self.store.get('codex_account_status')
-        status['codex']['usage']['five_hour'] = {'utilization': 96, 'resets_at': time.time() + 3600}
+        status['codex']['usage']['five_hour'] = {'utilization': 99, 'resets_at': time.time() + 3600}
         with self.store.db:
             self.store.put('codex_account_status', status)
             broker.notify_limit('codex', rejected=True)
         self.assertEqual(len(self.notices()), 1)
-        status['codex']['usage']['seven_day']['utilization'] = 96
+        status['codex']['usage']['seven_day']['utilization'] = 99
         with self.store.db:
             self.store.put('codex_account_status', status)
             broker.notify_limit('codex', rejected=True)
@@ -968,7 +965,7 @@ class CodexActiveAccountTests(CodexFixture):
         with self.store.db:
             self.store.put('codex_account_status', status)
             broker.notify_limit('codex', rejected=True)
-        status['codex']['usage']['five_hour']['utilization'] = 96
+        status['codex']['usage']['five_hour']['utilization'] = 99
         with self.store.db:
             self.store.put('codex_account_status', status)
             broker.notify_limit('codex', rejected=True)
@@ -1091,7 +1088,7 @@ class CodexActiveAccountTests(CodexFixture):
         self.assertEqual(finished['account_alias'], 'codex')
         self.assertEqual(self.notices(), [])
         status = self.store.get('codex_account_status')
-        status['codex-second']['usage']['seven_day']['utilization'] = 96
+        status['codex-second']['usage']['seven_day']['utilization'] = 99
         with self.store.db:
             self.store.put('codex_account_status', status)
         finished, _ = await self.run_worker()
@@ -1105,8 +1102,8 @@ class CodexResetTests(CodexFixture):
 
     async def test_slow_redeem_does_not_hold_telegram_intake(self):
         from coordinator.service import Service
-        self.register({'codex': (self.default, 95, 24)})
-        self.behave({'codex-home': {'used': 95, 'reset_credits': 1}})
+        self.register({'codex': (self.default, 99, 24)})
+        self.behave({'codex-home': {'used': 99, 'reset_credits': 1}})
         (self.bin / 'slow').touch()
         with self.codex_path():
             queued = control_api.call(self.store, 'account.codex_reset', {'alias': 'codex'},
@@ -1129,7 +1126,7 @@ class CodexResetTests(CodexFixture):
 
     async def test_fake_app_server_redeems_one_reset_and_returns_refreshed_limits(self):
         from coordinator.codex_accounts import redeem_codex_reset
-        self.behave({'codex-home': {'email': 'owner@example.com', 'used': 97, 'five_hour': 96,
+        self.behave({'codex-home': {'email': 'owner@example.com', 'used': 100, 'five_hour': 99,
                                    'reset_credits': 2}})
         result = await redeem_codex_reset({'config_dir': str(self.default)}, binary=str(self.binary), guarded=True)
         self.assertTrue(result['redeemed'])
@@ -1143,7 +1140,7 @@ class CodexResetTests(CodexFixture):
     async def test_reset_spends_the_earliest_expiring_available_credit_without_logging_ids(self):
         from coordinator.codex_accounts import redeem_codex_reset
         details = self.reset_details()
-        self.behave({'codex-home': {'used': 97, 'reset_credits': 3, 'reset_details': details}})
+        self.behave({'codex-home': {'used': 99, 'reset_credits': 3, 'reset_details': details}})
         with self.assertLogs('coordinator.codex_accounts', level='INFO') as logs:
             result = await redeem_codex_reset({'config_dir': str(self.default)}, binary=str(self.binary), guarded=True)
         consumed = [call for call in self.calls() if call['method'] == 'account/rateLimitResetCredit/consume']
@@ -1157,7 +1154,7 @@ class CodexResetTests(CodexFixture):
 
     async def test_reset_leaves_credit_selection_to_codex_when_schema_support_is_off(self):
         from coordinator.codex_accounts import redeem_codex_reset
-        self.behave({'codex-home': {'used': 97, 'reset_credits': 3, 'reset_details': self.reset_details(),
+        self.behave({'codex-home': {'used': 99, 'reset_credits': 3, 'reset_details': self.reset_details(),
                                    'backend_credit_id': 'late'}})
         with patch.dict(RESET_CREDIT_SCHEMA, credit_id=False), \
                 self.assertLogs('coordinator.codex_accounts', level='INFO') as logs:
@@ -1170,7 +1167,7 @@ class CodexResetTests(CodexFixture):
 
     async def test_count_only_reset_does_not_send_a_credit_id(self):
         from coordinator.codex_accounts import redeem_codex_reset
-        self.behave({'codex-home': {'used': 97, 'reset_credits': 2, 'reset_details': None}})
+        self.behave({'codex-home': {'used': 99, 'reset_credits': 2, 'reset_details': None}})
         with self.assertLogs('coordinator.codex_accounts', level='INFO') as logs:
             result = await redeem_codex_reset({'config_dir': str(self.default)}, binary=str(self.binary), guarded=True)
         consumed = [call for call in self.calls() if call['method'] == 'account/rateLimitResetCredit/consume']
@@ -1181,15 +1178,15 @@ class CodexResetTests(CodexFixture):
         self.assertIsNone(result['reset_expires'])
         self.assertEqual(logs.output, ['INFO:coordinator.codex_accounts:reset spend ordered=no'])
 
-    async def test_guard_refuses_no_credit_and_usage_below_95_without_consuming(self):
+    async def test_guard_refuses_no_credit_and_usage_below_99_without_consuming(self):
         from coordinator.codex_accounts import redeem_codex_reset
-        for credits, used, message in ((0, 97, 'no banked reset'), (1, 94, 'below 95%')):
+        for credits, used, message in ((0, 99, 'no banked reset'), (1, 98, 'below 99%')):
             self.behave({'codex-home': {'used': used, 'reset_credits': credits}})
             with self.assertRaisesRegex(ValueError, message):
                 await redeem_codex_reset({'config_dir': str(self.default)}, binary=str(self.binary), guarded=True)
         self.assertFalse(any(call['method'] == 'account/rateLimitResetCredit/consume' for call in self.calls()))
 
-    async def test_guard_allows_a_limit_or_refused_ordinary_usage_below_95(self):
+    async def test_guard_allows_a_limit_or_refused_ordinary_usage_below_99(self):
         from coordinator.codex_accounts import redeem_codex_reset
         for limited, allowed in ((True, True), (False, False)):
             with self.subTest(limited=limited, ordinary_allowed=allowed):
@@ -1206,18 +1203,17 @@ class CodexResetTests(CodexFixture):
                                  ('alreadyRedeemed', 'This reset request was already redeemed'),
                                  ('unknown', 'Codex did not confirm the reset')):
             with self.subTest(outcome=outcome):
-                self.behave({'codex-home': {'used': 97, 'reset_credits': 1, 'reset_outcome': outcome}})
+                self.behave({'codex-home': {'used': 99, 'reset_credits': 1, 'reset_outcome': outcome}})
                 with self.assertRaisesRegex(ValueError, message):
                     await redeem_codex_reset({'config_dir': str(self.default)}, binary=str(self.binary), guarded=True)
         self.assertEqual(sum(call['method'] == 'account/rateLimitResetCredit/consume' for call in self.calls()), 4)
 
     async def test_owner_command_confirms_and_redeems_named_account_with_notice(self):
         second = self.home('second')
-        self.register({'codex': (self.default, 20, 24), 'codex-second': (second, 95, 48)})
-        self.behave({'codex-home': {'used': 20}, 'second': {'used': 95, 'reset_credits': 1}})
+        self.register({'codex': (self.default, 20, 24), 'codex-second': (second, 99, 48)})
+        self.behave({'codex-home': {'used': 20}, 'second': {'used': 99, 'reset_credits': 1}})
         with self.codex_path():
-            self.reset_card('codex-second', 1)
-            self.assertEqual(self.tap('Spend reset'), 'control_callback')
+            self.assertTrue(self.spend('codex-second', 1).ok)
             queued, = self.store.service_requests_pending()
             self.assertEqual((queued['op'], json.loads(queued['params'])),
                              ('account.codex_reset', {'alias': 'codex-second', '_topic': TOPIC}))
@@ -1237,13 +1233,11 @@ class CodexResetTests(CodexFixture):
         self.assertEqual(self.store.db.execute('SELECT state FROM service_requests WHERE id=?',
                                               (queued['id'],)).fetchone()[0], 'done')
 
-    async def test_repeated_confirm_redeems_only_once(self):
-        self.register({'codex': (self.default, 96, 24)})
-        self.behave({'codex-home': {'used': 96, 'reset_credits': 2}})
+    async def test_a_queued_reset_redeems_only_once(self):
+        self.register({'codex': (self.default, 99, 24)})
+        self.behave({'codex-home': {'used': 99, 'reset_credits': 2}})
         with self.codex_path():
-            confirm = self.reset_card('codex', 2)
-            self.assertEqual(self.tap('Spend reset', confirm), 'control_callback')
-            self.assertEqual(self.tap('Spend reset', confirm), 'stale_callback')
+            self.assertTrue(self.spend('codex', 2).ok)
             queued, = self.store.service_requests_pending()
             self.assertEqual((queued['op'], json.loads(queued['params'])),
                              ('account.codex_reset', {'alias': 'codex', '_topic': TOPIC}))
@@ -1266,28 +1260,27 @@ class CodexResetTests(CodexFixture):
         self.assertEqual(sum('Codex banked reset redeemed for codex@example.com' in row[0]
                              for row in self.store.db.execute('SELECT text FROM outbox')), 1)
 
-    async def test_confirmed_reset_refuses_live_usage_below_95_without_spending(self):
-        self.register({'codex': (self.default, 96, 24)})
-        self.behave({'codex-home': {'used': 94, 'reset_credits': 2}})
+    async def test_confirmed_reset_refuses_live_usage_below_99_without_spending(self):
+        self.register({'codex': (self.default, 99, 24)})
+        self.behave({'codex-home': {'used': 98, 'reset_credits': 2}})
         with self.codex_path():
-            self.reset_card('codex', 2)
-            self.assertEqual(self.tap('Spend reset'), 'control_callback')
+            self.assertTrue(self.spend('codex', 2).ok)
             from coordinator.service import Service
             service = Service(self.store, object(), ProviderRunner(self.store.directory), self.root)
             self.assertTrue(await service.controls_once())
         request, = self.store.db.execute('SELECT op,state,result FROM service_requests').fetchall()
         self.assertEqual(request[:2], ('account.codex_reset', 'refused'))
         self.assertEqual(json.loads(request['result'])['text'],
-                         'This Codex account is below 95% on its resettable meters')
+                         'This Codex account is below 99% on its resettable meters')
         self.assertFalse(any(call['method'] == 'account/rateLimitResetCredit/consume' for call in self.calls()))
 
     async def test_ctl_operation_and_mcp_tool_use_their_respective_accounts(self):
         second = self.home('second')
-        self.register({'codex': (self.default, 96, 24), 'codex-second': (second, 95, 48)})
-        self.behave({'codex-home': {'used': 96, 'reset_credits': 1},
-                     'second': {'used': 95, 'reset_credits': 1}})
+        self.register({'codex': (self.default, 100, 24), 'codex-second': (second, 99, 48)})
+        self.behave({'codex-home': {'used': 100, 'reset_credits': 1},
+                     'second': {'used': 99, 'reset_credits': 1}})
         self.assertIn('account_redeem', mcp.TOOLS)
-        self.assertEqual(mcp.TOOLS['account_redeem'].params, {})
+        self.assertEqual(mcp.TOOLS['account_redeem'].params, {'message': 'int?'})
         self.assertNotIn('account_codex_reset', mcp.TOOLS)
         with self.codex_path():
             result = subprocess.run([sys.executable, '-m', 'coordinator', '--state-dir', str(self.store.directory),
@@ -1295,8 +1288,15 @@ class CodexResetTests(CodexFixture):
                                     capture_output=True, text=True, check=False, env=os.environ.copy())
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertTrue(json.loads(result.stdout)['ok'])
+            refused = mcp.dispatch(self.store, {'method': 'tools/call',
+                                                'params': {'name': 'account_redeem', 'arguments': {}}}, topic=TOPIC)
+            self.assertTrue(refused['isError'])
+            self.assertIn('message=N', refused['content'][0]['text'])
+            with self.store.db:
+                message = self.store.message_save(TOPIC, 'owner', 'Redeem a reset')['id']
             response = mcp.dispatch(self.store, {'method': 'tools/call',
-                                                 'params': {'name': 'account_redeem', 'arguments': {}}})
+                                                 'params': {'name': 'account_redeem', 'arguments': {'message': message}}},
+                                    topic=TOPIC)
         self.assertFalse(response['isError'])
         consumed = [Path(call['home']).name for call in self.calls()
                     if call['method'] == 'account/rateLimitResetCredit/consume']
@@ -1397,7 +1397,8 @@ class CodexStatusTests(CodexFixture):
 
     async def test_the_usage_check_reads_login_windows_credits_and_resets_without_a_model_turn(self):
         reset = int(time.time()) + 3 * 86400
-        self.behave({'codex-home': {'email': 'Owner@Example.com', 'used': 58, 'reset_at': reset, 'reset_credits': 2}})
+        self.behave({'codex-home': {'email': 'Owner@Example.com', 'used': 58, 'reset_at': reset, 'reset_credits': 2,
+                                   'credits': {'hasCredits': True, 'unlimited': False, 'balance': '12.5'}}})
         status = await collect_codex_status({'config_dir': str(self.default)}, binary=str(self.binary))
         self.assertEqual(status['identity'], {'email': 'Owner@Example.com', 'type': 'ChatGPT Pro', 'logged_in': True})
         self.assertEqual(status['usage'], {'seven_day': {'utilization': 58, 'resets_at': reset}})
@@ -1523,6 +1524,14 @@ class CodexSignInTests(CodexFixture):
         self.assertEqual(CodexBroker(self.store).parent_account(), 'codex-Jane-Doe')
         self.assertEqual({tuple(call['credentials']) for call in self.calls()}, {()})
         self.assertEqual(self.store.get('accounts', {}), {})
+
+    async def test_an_unsent_starting_message_gives_way_to_the_device_card(self):
+        self.add()
+        placeholder = self.store.get(KEY)['starting']
+        self.assertEqual(self.store.db.execute('SELECT text FROM outbox WHERE id=?', (placeholder,)).fetchone()[0],
+                         'Starting the Codex sign-in…')
+        await self.card()
+        self.assertEqual(self.store.db.execute('SELECT retired FROM outbox WHERE id=?', (placeholder,)).fetchone()[0], 1)
 
     async def test_adding_a_codex_account_replaces_a_signed_out_pick(self):
         self.register({'codex': (self.default, 50, 72)})
@@ -1724,16 +1733,15 @@ class CodexAccountViewTests(CodexFixture):
             control_ui.view(self.store, TOPIC, 'accounts:0')
         row = self.store.db.execute('SELECT * FROM outbox ORDER BY id DESC LIMIT 1').fetchone()
         labels = [button['text'] for line in json.loads(row['reply_markup'])['inline_keyboard'] for button in line]
-        self.assertIn('**ChatGPT** · auto-switch off (left: 5h · week)\n🟢 owner@example.com: ? · 60% · active · 2 resets',
-                      row['text'])
-        self.assertIn('Turn on ChatGPT auto-switch', labels)
-        self.assertIn('🟢 codex-second@example.com: ? · 3%', row['text'])
-        self.assertEqual(labels[:2], ['Use codex-second@example.com for ChatGPT', 'Reset owner@example.com (2)'])
+        self.assertRegex(row['text'], r'\*\*ChatGPT\*\* · auto-switch off \(left: week\)\n🟢 owner@example\.com: 60%, week resets in \d+[dh] \d+[hm] · active · 2 resets banked')
+        self.assertNotIn('Turn on ChatGPT auto-switch', labels)
+        self.assertIn('🟢 codex-second@example.com: 3%', row['text'])
+        self.assertEqual(labels[:2], ['Remove owner (ChatGPT)', 'Remove codex-second (ChatGPT)'])
         self.assertIn('Add ChatGPT', labels)
         self.assertIn('Add Claude', labels)
         text, _ = self.view('/accounts')
-        self.assertIn('auto-switch off (left: 5h · week)\n🟢 owner@example.com: ? · 60% · active', text)
-        self.assertIn('🟢 codex-second@example.com: ? · 3%', text)
+        self.assertRegex(text, r'auto-switch off \(left: week\)\n🟢 owner@example\.com: 60%, week resets in \d+[dh] \d+[hm] · active')
+        self.assertIn('🟢 codex-second@example.com: 3%', text)
         card = control_api.call(self.store, 'account.show', {'alias': 'codex'}).text
         self.assertIn('Type: ChatGPT Pro', card)
         self.assertIn('Weekly: ', card)
@@ -1742,10 +1750,10 @@ class CodexAccountViewTests(CodexFixture):
         reply, _ = self.account('account.disable', alias='codex-second')
         self.assertFalse(self.store.get('codex_accounts')['codex-second']['enabled'])
         self.assertIn('⚫ codex-second@example.com: off', reply)
-        self.assertEqual(self.tap('Turn on codex-second@example.com'), 'control_callback')
+        self.assertEqual(self.tap('Turn on codex-second (ChatGPT)'), 'control_callback')
         self.assertEqual(self.tap('Turn on'), 'control_callback')
         self.assertTrue(self.store.get('codex_accounts')['codex-second']['enabled'])
-        self.assertIn('🟢 codex-second@example.com: ? · 3%', self.last_card()[0])
+        self.assertIn('🟢 codex-second@example.com: 3%', self.last_card()[0])
         reply, _ = self.account('account.add', alias='codex')
         self.assertIn('owner@example.com is already signed in.', reply)
         self.assertNotIn('codex login', reply)
@@ -1755,39 +1763,32 @@ class CodexAccountViewTests(CodexFixture):
             self.store.put('codex_account_status', status)
         reply, labels = self.view('/accounts')
         self.assertIn('⚪ codex-second@example.com: signed out', reply)
-        self.assertIn('Sign in codex-second@example.com', labels)
+        self.assertIn('Sign in codex-second (ChatGPT)', labels)
         self.assertNotIn('/accounts enable', reply)
-        self.assertEqual(self.tap('Sign in codex-second@example.com'), 'control_callback')
+        self.assertEqual(self.tap('Sign in codex-second (ChatGPT)'), 'control_callback')
         self.assertEqual(self.tap('Sign in'), 'control_callback')
         record = self.store.get(KEY)
         self.assertEqual((record['provider'], record['target']), ('codex', 'codex-second'))
 
-    async def test_the_owner_picks_the_active_codex_account_and_turns_automatic_switching_on_from_accounts(self):
+    async def test_the_codex_pick_and_auto_switch_change_by_text_and_show_on_accounts(self):
         second = self.home('second')
         self.register({'codex': (self.default, 40, 72), 'codex-second': (second, 20, 24)})
         _, labels = self.view('/accounts')
-        self.assertIn('Use codex-second@example.com for ChatGPT', labels)
-        self.assertNotIn('Use codex@example.com for ChatGPT', labels)
-        self.assertEqual(self.tap('Use codex-second@example.com for ChatGPT'), 'control_callback')
-        self.assertIn('🟢 codex-second@example.com: ? · 80% · active', self.last_card()[0])
-        self.assertEqual(self.store.get('codex_active_account'), 'codex-second')
-        self.assertEqual(self.tap('Turn on ChatGPT auto-switch'), 'control_callback')
-        reply, labels = self.last_card()
-        self.assertIn('**ChatGPT** · auto-switch on', reply)
-        self.assertNotIn('Use codex@example.com for ChatGPT', labels)
-        self.assertIs(self.store.get('codex_auto_switch'), True)
-        from coordinator import control_ui
+        self.assertFalse(any(label.startswith('Use ') or 'auto-switch' in label for label in labels))
         with self.store.db:
-            control_ui.view(self.store, TOPIC, 'accounts:0')
-        row = self.store.db.execute('SELECT * FROM outbox ORDER BY id DESC LIMIT 1').fetchone()
-        self.assertIn('**ChatGPT** · auto-switch on', row['text'])
-        self.assertIn('Turn off ChatGPT auto-switch',
-                      [button['text'] for line in json.loads(row['reply_markup'])['inline_keyboard'] for button in line])
-        self.assertEqual(self.tap('Turn off ChatGPT auto-switch'), 'control_callback')
-        reply, labels = self.last_card()
-        self.assertIn('auto-switch off (left: 5h · week)\n🟢 codex-second@example.com: ? · 80% · active', reply)
-        self.assertIn('Use codex@example.com for ChatGPT', labels)
-        self.assertIs(self.store.get('codex_auto_switch'), False)
+            self.assertTrue(control_api.call(self.store, 'account.use', {'alias': 'codex-second'}).ok)
+        reply, _ = self.view('/accounts')
+        self.assertRegex(reply, r'🟢 codex-second@example\.com: 80%, week resets in \d+[dh] \d+[hm] · active')
+        self.assertEqual(self.store.get('codex_active_account'), 'codex-second')
+        with self.store.db:
+            self.assertTrue(control_api.call(self.store, 'accounts.codex_auto', {'enabled': True}).ok)
+        reply, _ = self.view('/accounts')
+        self.assertIn('**ChatGPT** · auto-switch on', reply)
+        self.assertIs(self.store.get('codex_auto_switch'), True)
+        with self.store.db:
+            self.assertTrue(control_api.call(self.store, 'accounts.codex_auto', {'enabled': False}).ok)
+        reply, _ = self.view('/accounts')
+        self.assertRegex(reply, r'auto-switch off \(left: week\)\n🟢 codex-second@example\.com: 80%, week resets in \d+[dh] \d+[hm] · active')
         with self.store.db:
             settings = control_api.call(self.store, 'settings.get', {})
         self.assertEqual((settings.data['codex_auto_switch'], settings.data['codex_active_account']),
@@ -1806,7 +1807,7 @@ class CodexAccountViewTests(CodexFixture):
     async def test_delegation_view_reports_when_every_codex_account_is_limited(self):
         from coordinator import control_ui
         self.automatic()
-        self.register({'codex': (self.default, 97, 2)})
+        self.register({'codex': (self.default, 99, 2)})
         with self.store.db:
             control_ui.view(self.store, TOPIC, 'delegation')
         self.assertIn('every Codex account is limited, back in 1h', self.texts()[-1])
@@ -1820,6 +1821,184 @@ class CodexAccountViewTests(CodexFixture):
             control_ui.view(self.store, TOPIC, 'delegation')
         self.assertIn('the active Codex account codex@example.com is limited, back in 1h', self.texts()[-1])
 
+
+
+class CodexClaudeFallbackTests(CodexFixture):
+    """With automatic switching on, a Codex worker with no Codex account runs on Claude Opus 5.5.
+    A worker that already started a Codex thread continues there from a handoff."""
+
+    async def asyncSetUp(self):
+        await super().asyncSetUp()
+        self.opus = True
+        self.selected = []
+
+        def select(broker, accounts=None, attempted=(), model=None):
+            self.selected.append(model)
+            return 'claude-a' if self.opus else None
+
+        async def run(broker, run, provider, prompt, cwd, session_id, notice_topic=None, stopped=None, **options):
+            options.pop('on_account', None)
+            return await run(provider, prompt, cwd, session_id, stopped=stopped, **options)
+        for name, replacement in (('select', select), ('run', run)):
+            patcher = patch.object(AccountBroker, name, replacement)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.runs = []
+        test = self
+
+        class Runner:
+            codex_broker = None
+
+            async def run(self, provider, prompt, cwd, session_id, **options):
+                test.runs.append((provider, options.get('model'), options.get('fresh'), session_id, prompt))
+                if provider == 'codex':
+                    options['on_session']('thread-1')
+                    return RunResult('thread-1', error='You hit your usage limit.', quota_limited=True)
+                return RunResult(session_id, text='done on opus', success=True)
+        self.runner = Runner()
+
+    async def run_fake(self, worker=None):
+        pool = WorkerPool(self.store, self.runner, AccountBroker(self.store), codex_accounts=CodexBroker(self.store))
+        finished = await pool.run(worker or self.worker(), self.store.topic(TOPIC))
+        return finished, json.loads(finished['result'])
+
+    def switch_notices(self):
+        return [row[0] for row in self.store.db.execute('SELECT text FROM outbox ORDER BY id')
+                if row[0].startswith(('ChatGPT is out.', 'ChatGPT is back.'))]
+
+    def problems(self):
+        return self.store.db.execute('SELECT count(*) FROM problems').fetchone()[0]
+
+    async def test_a_new_codex_worker_with_no_codex_account_starts_on_opus(self):
+        self.automatic()
+        self.register({'codex': (self.default, 99, 24)})
+        finished, result = await self.run_fake()
+        self.assertTrue(result['success'], result.get('error'))
+        self.assertEqual((finished['provider'], finished['model'], finished['status']),
+                         ('claude', 'claude-opus-5-5', 'done'))
+        self.assertEqual(len(self.runs), 1)
+        provider, model, fresh, session, prompt = self.runs[0]
+        self.assertEqual((provider, model, fresh, prompt), ('claude', 'claude-opus-5-5', True, 'build this'))
+        self.assertEqual(finished['session'], session)
+        self.assertIn('claude-opus-5-5', self.selected)
+        self.assertEqual(self.switch_notices(), ['ChatGPT is out. New ChatGPT work now runs on Claude Opus 5.5.'])
+        self.assertEqual(self.problems(), 0)
+
+    async def test_fallback_toggle_notifies_once_for_outage_recovery_and_later_outage(self):
+        from coordinator import records
+        self.automatic()
+        self.register({'codex': (self.default, 99, 24)})
+        home = self.separate_home_topic()
+        notice = 'ChatGPT is out. New ChatGPT work now runs on Claude Opus 5.5.'
+        for _ in range(3):
+            finished, result = await self.run_fake()
+            self.assertTrue(result['success'])
+            self.assertEqual(finished['provider'], 'claude')
+            job = self.store.task_get(finished['task'])
+            entries = records.journal(records.journal_path(self.store.directory, job))
+            self.assertNotIn('ChatGPT is out; worker %d runs on Claude Opus 5.5.' % finished['id'],
+                             [entry['text'] for entry in entries])
+            self.assertIn('ChatGPT is out; worker %d runs on Claude Opus 5.5.' % finished['id'], job['notes'])
+        self.assertEqual(self.switch_notices(), [notice])
+        pool = WorkerPool(self.store, self.runner, AccountBroker(self.store))
+        for _ in range(3):
+            self.assertFalse(pool.check_recovery())
+        self.assertEqual(self.switch_notices(), [notice])
+        self.register({'codex': (self.default, 50, 24)})
+        now = time.time()
+        self.store.put('codex_account_blocks', {'codex': {'reason': 'quota', 'until': now + 60}})
+        self.assertFalse(pool.check_recovery())
+        back = 'ChatGPT is back. New ChatGPT work runs on ChatGPT again.'
+        with patch('coordinator.codex_accounts.time.time', return_value=now + 61):
+            self.assertTrue(pool.check_recovery())
+            self.assertFalse(pool.check_recovery())
+        self.assertEqual(self.switch_notices(), [notice, back])
+        self.assertFalse(self.store.get('fallback_since'))
+        self.register({'codex': (self.default, 99, 24)})
+        finished, result = await self.run_fake()
+        self.assertTrue(result['success'])
+        self.assertEqual(finished['provider'], 'claude')
+        self.assertEqual(self.switch_notices(), [notice, back, notice])
+        topics = [row[0] for row in self.store.db.execute(
+            "SELECT topic FROM outbox WHERE text LIKE 'ChatGPT is out.%' OR text LIKE 'ChatGPT is back.%'")]
+        self.assertEqual(topics, [home, home, home])
+
+    async def test_worker_loop_checks_codex_recovery_each_minute(self):
+        from types import SimpleNamespace
+        from unittest.mock import AsyncMock, Mock
+        from coordinator import service as service_module
+        service = service_module.Service(self.store, None, self.runner, self.root)
+        clock = [0]
+        seen = []
+        service.workers_once = AsyncMock(return_value=False)
+        service.workers.check_recovery = Mock(side_effect=lambda: seen.append(clock[0]))
+
+        async def tick(delay):
+            clock[0] += 30
+            if clock[0] > 120:
+                raise asyncio.CancelledError
+
+        with patch.object(service_module, 'time', SimpleNamespace(monotonic=lambda: clock[0])), \
+                patch.object(service_module, 'asyncio', SimpleNamespace(sleep=tick, to_thread=AsyncMock(return_value=[]))):
+            with self.assertRaises(asyncio.CancelledError):
+                await service.workers_loop()
+        self.assertEqual(seen, [0, 60, 120])
+
+    async def test_a_started_codex_worker_that_hits_the_limit_continues_on_opus_from_a_handoff(self):
+        from coordinator import moves
+        self.automatic()
+        self.register({'codex': (self.default, 50, 24)})
+        finished, result = await self.run_fake()
+        self.assertTrue(result['success'], result.get('error'))
+        self.assertEqual((finished['provider'], finished['model'], finished['status']),
+                         ('claude', 'claude-opus-5-5', 'done'))
+        self.assertEqual([run[:3] for run in self.runs],
+                         [('codex', 'gpt-6.2-sol', True), ('claude', 'claude-opus-5-5', True)])
+        self.assertNotEqual(self.runs[1][3], 'thread-1')
+        self.assertEqual(self.runs[1][4], moves.HANDOFF + 'build this')
+        self.assertEqual(self.switch_notices(), ['ChatGPT is out. New ChatGPT work now runs on Claude Opus 5.5.'])
+
+    async def test_a_started_codex_worker_waits_on_its_thread_when_opus_is_also_unavailable(self):
+        self.automatic()
+        self.opus = False
+        self.register({'codex': (self.default, 50, 24)})
+        finished, result = await self.run_fake()
+        self.assertEqual((finished['provider'], finished['status'], finished['session']),
+                         ('codex', 'waiting_for_quota', 'thread-1'))
+        self.assertEqual([run[:3] for run in self.runs], [('codex', 'gpt-6.2-sol', True)])
+        self.assertEqual(self.switch_notices(), [])
+
+    async def test_a_codex_worker_waits_when_opus_is_also_unavailable_then_switches_when_claude_frees(self):
+        from coordinator.service import Service
+        self.automatic()
+        self.opus = False
+        self.register({'codex': (self.default, 99, 24)})
+        service = Service(self.store, None, self.runner, self.root)
+        worker = self.worker()
+        waiting = await service.workers.run(worker, self.store.topic(TOPIC))
+        self.assertEqual((waiting['provider'], waiting['status']), ('codex', 'waiting_for_quota'))
+        self.assertEqual(self.runs, [])
+        self.assertEqual(self.switch_notices(), [])
+        texts = [row[0] for row in self.store.db.execute('SELECT text FROM outbox')]
+        self.assertTrue(any('every other route of its work are unavailable' in text for text in texts), texts)
+        await service.workers_once()
+        self.assertEqual(service.workers.get(worker['id'])['status'], 'waiting_for_quota')
+        self.opus = True
+        await service.workers_once()
+        await asyncio.gather(*service.worker_tasks.values())
+        finished = service.workers.get(worker['id'])
+        self.assertEqual((finished['provider'], finished['status']), ('claude', 'done'))
+        self.assertTrue(json.loads(finished['result'])['success'])
+
+    async def test_with_automatic_switching_off_a_limited_codex_worker_waits(self):
+        self.automatic(False)
+        self.register({'codex': (self.default, 100, 24)})
+        finished, result = await self.run_fake()
+        self.assertEqual((finished['provider'], finished['model'], finished['status']),
+                         ('codex', None, 'waiting_for_quota'))
+        self.assertEqual(self.runs, [])
+        self.assertEqual(self.selected, [])
+        self.assertEqual(self.switch_notices(), [])
 
 if __name__ == '__main__':
     unittest.main()

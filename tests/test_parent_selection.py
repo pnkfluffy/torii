@@ -13,11 +13,10 @@ from unittest.mock import AsyncMock, patch
 import uuid
 
 from coordinator import control_api, parent, parent_state
-from coordinator.policy import REPLY_FIRST
 from coordinator.providers import ProviderRunner
 from coordinator.service import Service
 from coordinator.store import Store
-from tests.support import expected_codex_skills_pointer, isolate_shared_mcp_home, origin_codex_skills_pointer, read_jsonl, settle, stop_test_hosts, until
+from tests.support import expected_codex_skills_pointer, isolate_shared_mcp_home, origin_codex_skills_pointer, plain, read_jsonl, settle, stop_test_hosts, until
 from tests.test_codex_parent import APP_SERVER
 from tests.test_parent_turns import FAKE
 
@@ -85,15 +84,17 @@ ORIGIN_MAIN_DEFAULTS = {'controls': [{'data': {'parent_selection': {'model': 'te
                      '--session-id',
                      '@SESSION@',
                      '--append-system-prompt',
-                     'policy\nCurrent usage policy:\nowner policy',
+                     'policy\nKeep your memory index at or below 40 lines. If it exceeds 40 lines, trim the index without deleting memory notes.\n\nCurrent usage policy:\nowner policy',
                      '--system-prompt-snapshot',
                      'off',
+                     '--disallowedTools',
+                     'SendUserFile',
                      '--mcp-config',
                      '@ROOT@/state/coordinator-mcp-@HOME_SCOPE@.json'],
             'content': {'cli': {'binary': 'fixture-cli'},
                         'effort': 'max',
-                        'flags': ['--system-prompt-snapshot', 'off'],
-                        'instructions': 'policy',
+                        'flags': ['--system-prompt-snapshot', 'off', '--disallowedTools', 'SendUserFile'],
+                        'instructions': 'policy\nKeep your memory index at or below 40 lines. If it exceeds 40 lines, trim the index without deleting memory notes.\n',
                         'mcp_configs': ['@MCP_HASH@'],
                         'model': 'claude-opus-5-5',
                         'settings': '@SETTINGS@',
@@ -109,7 +110,7 @@ ORIGIN_MAIN_DEFAULTS = {'controls': [{'data': {'parent_selection': {'model': 'te
                        '"--state-dir", "@ROOT@/state", "mcp", "--topic=home"], "env": {"PYTHONPATH": "@REPO@"}}}}',
             'selection_changed': [False, False, True, False, True, False, True, True],
             'settings': {'ultracode': False,
-                         'autoMemoryDirectory': '@ROOT@/state/coordinator-memory',
+                         'autoMemoryDirectory': '@ROOT@/state/chats/home/memory',
                          'claudeMdExcludes': '@EXCLUDES@'}},
  'codex': {'argv': ['@ROOT@/codex',
                     '-c',
@@ -137,7 +138,7 @@ ORIGIN_MAIN_DEFAULTS = {'controls': [{'data': {'parent_selection': {'model': 'te
                        'cli': {'binary': 'fixture-cli'},
                        'effort': 'xhigh',
                        'instructions': (
-                           'policy\nCurrent usage policy:\nowner policy\n## Codex skills\n\nSkills: this launch has no list'
+                           'policy\n## Codex skills\n\nSkills: this launch has no list'
                            " of installed skills, so read a skill's SKILL.md before you use it. If CODEX_HOME is "
                            'unset, use ~/.codex for the paths below. A skill named <plugin>:<name> is normally at '
                            '$CODEX_HOME/plugins/cache/<source>/<plugin>/<version>/skills/<name>/SKILL.md; use local if'
@@ -178,7 +179,7 @@ ORIGIN_MAIN_DEFAULTS = {'controls': [{'data': {'parent_selection': {'model': 'te
 class ParentSelectionTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.temporary = tempfile.TemporaryDirectory()
-        self.root = Path(self.temporary.name)
+        self.root = Path(self.temporary.name).resolve()
         self.addCleanup(self.temporary.cleanup)
         self.addCleanup(stop_test_hosts, self.root)
         isolate_shared_mcp_home(self, self.root)
@@ -234,8 +235,8 @@ class ParentSelectionTests(unittest.IsolatedAsyncioTestCase):
         projects.mkdir()
         self.store.put('projects_root', str(projects))
         self.service.telegram = GroupTelegram()
-        for provider, model, effort in (('claude', 'claude-opus-5-5', 'high'),
-                                        ('codex', 'test-astra', 'low')):
+        for provider, model, effort in (('claude', 'claude-opus-5-5', 'xhigh'),
+                                        ('codex', 'test-astra', 'xhigh')):
             with self.subTest(provider=provider):
                 self.select('codex' if provider == 'claude' else 'claude',
                             'default-model' if provider == 'claude' else 'claude-opus-5-5')
@@ -254,6 +255,8 @@ class ParentSelectionTests(unittest.IsolatedAsyncioTestCase):
                     self.assertIsNotNone(session)
                     self.parents.append(session)
                     host = self.store.get(session.key + '_host')
+                    from coordinator.controls import _status_card
+                    self.assertIn('xhigh thinking', _status_card(self.store, target))
                     self.assertEqual({field: host[field] for field in ('provider', 'model', 'effort', 'picked')},
                                      dict(provider=provider, model=model, effort=effort, picked=True))
                     self.assertEqual(self.store.get(session.key + '_selection_revision'), 1)
@@ -308,7 +311,7 @@ class ParentSelectionTests(unittest.IsolatedAsyncioTestCase):
                         self.pick('other', 'codex', 'test-astra', 'low')
                     self.store.put('coordinator:other_host', {'id': 'other-live', 'provider': 'opencode',
                                    'account': 'other', 'model': 'other'} if other_provider == 'opencode' else None)
-                    (self.store.directory / 'USAGE.md').write_text('owner policy')
+                    (self.store.directory / 'personal.md').write_text('owner policy')
                     with patch('coordinator.cli_identity.identity', return_value={'binary': 'fixture-cli'}), \
                             patch('coordinator.mcp.tools_hash', return_value='fixture-tools'):
                         session = await parent.start(self.store, self.runner, self.root, 'claude-opus-5-5',
@@ -352,7 +355,7 @@ class ParentSelectionTests(unittest.IsolatedAsyncioTestCase):
                                 topic='home', key='coordinator')
                         self.assertEqual((inputs.model, inputs.effort, inputs.settings, inputs.prompt),
                                          (content['model'], content['effort'], content['settings'],
-                                          'policy\nCurrent usage policy:\nowner policy'))
+                                          'policy\nKeep your memory index at or below 40 lines. If it exceeds 40 lines, trim the index without deleting memory notes.\n\nCurrent usage policy:\nowner policy'))
                     expected_fingerprint = hashlib.sha256(json.dumps(
                         content, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
                     host = self.store.get('coordinator_host')
@@ -362,7 +365,7 @@ class ParentSelectionTests(unittest.IsolatedAsyncioTestCase):
                     if provider == 'codex':
                         request = next(row for row in reversed(read_jsonl(self.root / 'requests'))
                                        if row.get('method') == 'thread/start')
-                        self.assertEqual(request['params']['developerInstructions'], content['instructions'])
+                        self.assertEqual(request['params']['developerInstructions'], content['instructions'].replace('policy\n', 'policy\nCurrent usage policy:\nowner policy\n', 1))
                         self.assertEqual(request['params']['model'], content['model'])
                     await session.stop()
                     results = []
@@ -376,9 +379,10 @@ class ParentSelectionTests(unittest.IsolatedAsyncioTestCase):
                         ({'provider': 'codex', 'model': 'new'}, 'old', 'codex', True),
                         ({'provider': 'codex', 'model': 'new'}, 'old', 'claude', True)):
                         self.store.put('parent_selection', selection)
-                        self.store.put('probe_host', {'provider': actual})
+                        self.store.put('coordinator:probe_host', {'provider': actual})
                         with patch('coordinator.parent_state.AccountBroker.select', return_value='c' if available else None):
-                            results.append(parent_state.selection_changed(SimpleNamespace(store=self.store, key='probe', model=model)))
+                            results.append(parent_state.selection_changed(SimpleNamespace(
+                                store=self.store, key='coordinator:probe', model=model)))
                     self.assertEqual(results, reference['selection_changed'])
 
     async def test_t1_default_service_cycle_ignores_another_chats_pick(self):
@@ -423,26 +427,141 @@ class ParentSelectionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(list(self.store.db.execute('SELECT * FROM problems')), [])
         self.assertEqual(list(self.store.db.execute('SELECT * FROM outbox')), [])
 
-    async def test_disabled_home_with_exhausted_pick_still_gets_its_own_pause(self):
+    async def test_home_with_exhausted_pick_runs_on_claude(self):
         self.pick('home', 'codex', 'test-astra', 'low')
         reset = time.time() + 3600
         self.store.put('codex_account_blocks', {'g': {'reason': 'quota', 'until': reset}})
-        self.store.db.execute("UPDATE topics SET enabled=0 WHERE id='home'")
-        self.assertIsNone(await self.service.start_session('home'))
-        self.assertNotIn('home', self.service.sessions)
-        self.assertEqual(self.store.get('coordinator_selection_retry_at'), reset)
-        notice = self.store.get('coordinator_selection_notice')
-        self.assertEqual(notice['topics'], [])
-        self.assertIn('out of usage', notice['text'])
-        self.assertIsNone(self.store.get('coordinator_account_retry_at'))
-        self.assertIsNone(self.store.get('coordinator_account_notice'))
-        self.assertEqual([tuple(row) for row in self.store.db.execute('SELECT topic,area,code FROM problems')],
-                         [('home', 'accounts', 'unavailable')])
-        self.assertEqual(list(self.store.db.execute('SELECT topic,text FROM outbox')), [])
-        self.store.db.execute("UPDATE topics SET enabled=1 WHERE id='home'")
-        self.assertIsNone(await self.service.start_session('home'))
-        self.assertEqual(self.store.db.execute('SELECT count(*) FROM outbox').fetchone()[0], 1)
+        home = await self.start('home')
+        self.assertEqual(home.provider, 'claude')
+        self.assertIsNone(self.store.get('coordinator_selection_retry_at'))
+        self.assertIsNone(self.store.get('coordinator_selection_notice'))
         self.assertEqual((await self.start('other')).provider, 'claude')
+
+    def no_other_route(self):
+        """Give each chat no route but its own, as a route list that ends with stop does."""
+        own = patch('coordinator.moves.chain', lambda store, work: [
+            {'provider': work['provider'], 'model': work['model'], 'effort': None}])
+        own.start()
+        self.addCleanup(own.stop)
+
+    async def pause_codex_parent(self, automatic):
+        self.no_other_route()
+        self.pick('other', 'codex', 'test-astra', 'low')
+        profile = self.root / 'second-codex-home'
+        profile.mkdir()
+        reset = time.time() + 3600
+        with self.store.db:
+            self.store.put('codex_auto_switch', automatic)
+            self.store.put('codex_accounts', {**self.store.get('codex_accounts'), 'second': {
+                'config_dir': str(profile), 'enabled': True}})
+            self.store.put('codex_account_status', {**self.store.get('codex_account_status'), 'second': {
+                'identity': {'logged_in': True, 'email': 'second@example.test'}}})
+            self.store.put('codex_account_blocks', {
+                alias: {'reason': 'quota', 'until': reset} for alias in ('g', 'second')})
+            waiting = self.store.message_save('other', 'event', 'saved event while ChatGPT is out')
+        self.assertIsNone(self.service.codex_accounts.select())
+        await self.service.feed_once()
+        self.assertEqual(self.store.get('coordinator:other_selection_retry_at'), reset)
+        self.assertNotIn('other', self.service.sessions)
+        blocks = self.store.get('codex_account_blocks')
+        blocks['second']['until'] = time.time() - 1
+        with self.store.db:
+            self.store.put('codex_account_blocks', blocks)
+        return reset, waiting
+
+    async def test_paused_codex_pick_delivers_event_when_another_account_frees_before_reset(self):
+        reset, waiting = await self.pause_codex_parent(True)
+        notice = self.store.get('coordinator:other_selection_notice')['text']
+        self.assertIn('continue when any ChatGPT account frees up', notice)
+        self.assertNotIn('does not switch ChatGPT accounts on its own', notice)
+        self.assertEqual(self.service.codex_accounts.select(), 'second')
+        self.assertLess(time.time(), reset)
+        self.assertTrue(await self.service.feed_once())
+        session = self.service.sessions['other']
+        self.parents.append(session)
+        await settle(asyncio.gather(*self.service.feed_tasks.values()))
+        await until(session.idle)
+        self.assertEqual((session.provider, session.account_alias, session.model), ('codex', 'second', 'test-astra'))
+        self.assertIsNone(self.store.get('coordinator:other_selection_retry_at'))
+        self.assertIsNone(self.store.get('coordinator:other_selection_notice'))
+        self.assertEqual(tuple(self.store.db.execute('SELECT delivered,receipt FROM messages WHERE id=?',
+                                                    (waiting['id'],)).fetchone()), ('received', 'replayed'))
+        self.assertEqual(self.store.get('codex_account_blocks')['g']['until'], reset)
+        self.assertFalse((self.root / 'launches.jsonl').exists())
+        await self.service.feed_once()
+        self.assertIs(await self.service.start_session('other'), session)
+        self.assertFalse(session.movable())
+
+    async def test_paused_codex_pick_keeps_waiting_when_auto_switch_is_off(self):
+        reset, waiting = await self.pause_codex_parent(False)
+        notice = self.store.get('coordinator:other_selection_notice')['text']
+        self.assertIn('does not switch ChatGPT accounts on its own', notice)
+        for _ in range(2):
+            await self.service.feed_once()
+        self.assertNotIn('other', self.service.sessions)
+        self.assertEqual(self.store.get('codex_active_account'), 'g')
+        self.assertEqual(self.store.get('coordinator:other_selection_retry_at'), reset)
+        self.assertEqual(self.store.db.execute('SELECT delivered FROM messages WHERE id=?',
+                                              (waiting['id'],)).fetchone()[0], 'pending')
+        self.assertFalse((self.root / 'launches').exists())
+        self.assertFalse((self.root / 'launches.jsonl').exists())
+
+    def chat_notes(self, topic='other'):
+        return [row[0] for row in self.store.db.execute('SELECT text FROM outbox WHERE topic=? ORDER BY id', (topic,))]
+
+    async def test_codex_pick_runs_on_the_next_agent_while_chatgpt_is_out_and_returns_after_work(self):
+        self.pick('other', 'codex', 'test-astra', 'low')
+        first = await self.start('other')
+        self.assertEqual(first.provider, 'codex')
+        await first.stop()
+        with self.store.db:
+            self.store.put('codex_account_blocks', {'g': {'reason': 'quota', 'until': time.time() + 3600}})
+        moved = await self.start('other')
+        self.assertEqual((moved.provider, moved.account_alias, moved.model), ('claude', 'c', 'claude-opus-5-5'))
+        self.assertIsNone(self.store.get('coordinator:other_selection_retry_at'))
+        self.assertIsNone(self.store.get('coordinator:other_selection_notice'))
+        self.assertEqual(self.chat_notes(), [
+            'ChatGPT is out of usage; this chat runs on Claude Opus 5.5 until ChatGPT can run again.'])
+        for _ in range(2):
+            await self.service.feed_once()
+            self.assertFalse(parent_state.selection_changed(moved))
+            self.assertFalse(moved.rejected)
+        with self.store.db:
+            self.store.put('codex_account_blocks', {})
+        self.assertTrue(parent_state.selection_changed(moved))
+        moved.protocol.background = [{'task_id': 'settling-work'}]
+        await self.service.feed_once()
+        self.assertFalse(moved.rejected)
+        moved.protocol.background = []
+        await self.service.feed_once()
+        await settle(moved.wait_closed())
+        back = await self.start('other')
+        self.assertEqual((back.provider, back.model), ('codex', 'test-astra'))
+        self.assertEqual(self.chat_notes()[1:], ['ChatGPT can take work again; this chat is back on ChatGPT.'])
+
+    async def test_a_chat_pauses_when_no_agent_of_its_queue_can_run_or_its_pick_is_signed_out(self):
+        for signed_out in (False, True):
+            with self.subTest(signed_out=signed_out):
+                self.pick('other', 'codex', 'test-astra', 'low')
+                with self.store.db:
+                    if signed_out:
+                        self.store.put('account_blocks', {})
+                        self.store.put('codex_accounts', {'g': {**self.store.get('codex_accounts')['g'], 'enabled': False}})
+                    else:
+                        self.store.put('account_blocks', {'c': {'reason': 'quota', 'until': time.time() + 3600}})
+                        self.store.put('codex_account_blocks', {'g': {'reason': 'quota', 'until': time.time() + 3600}})
+                self.assertEqual(parent_state.provider_out(self.store, 'coordinator:other', 'codex'), not signed_out)
+                self.assertIsNone(await self.service.start_session('other'))
+                self.assertIsNotNone(self.store.get('coordinator:other_selection_retry_at'))
+                self.assertNotIn('other', self.service.sessions)
+                self.assertEqual(self.chat_notes(), [])
+
+    def test_model_parent_takes_no_fallback(self):
+        with self.store.db:
+            result = control_api.call(self.store, 'model.parent', {
+                'topic': 'other', 'provider': 'codex', 'model': 'test-astra', 'fallback': 'claude-sonnet-5-5'})
+        self.assertFalse(result.ok)
+        self.assertIsNone(self.store.get('coordinator:other_selection'))
 
     async def test_claude_fingerprints_follow_only_own_pick_and_tool_config(self):
         from coordinator.session import CoordinatorSession
@@ -508,8 +627,8 @@ class ParentSelectionTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotEqual(changed_home[0], home[0])
         self.assertNotEqual(changed_home[1], home[1])
         original = CodexCoordinatorSession.overrides
-        with patch.object(CodexCoordinatorSession, 'overrides', side_effect=lambda store, topic=None, key='coordinator':
-                          original(store, topic=topic + '-tools' if topic == 'home' else topic, key=key)):
+        with patch.object(CodexCoordinatorSession, 'overrides', side_effect=lambda store, topic=None, key='coordinator', servers=None:
+                          original(store, topic=topic + '-tools' if topic == 'home' else topic, key=key, servers=servers)):
             session = await self.start('home')
             self.assertNotEqual(self.store.get('coordinator_host')['fingerprint'], changed_home[0])
             await session.stop()
@@ -532,6 +651,7 @@ class ParentSelectionTests(unittest.IsolatedAsyncioTestCase):
         for index, topic in enumerate(('third', 'fourth'), 3):
             self.store.db.execute('INSERT INTO topics(id,chat,thread,name,cwd,enabled) VALUES(?,?,?,?,?,1)',
                                   (topic, 1, index, topic, str(self.root)))
+        self.no_other_route()
         home, third = await self.start('home'), await self.start('third')
         self.assertEqual((home.provider, third.provider), ('claude', 'claude'))
         self.pick('other', 'codex', 'test-astra', 'low')
@@ -669,6 +789,40 @@ class ParentSelectionTests(unittest.IsolatedAsyncioTestCase):
         await self.service.feed_once()
         self.assertFalse(session.rejected)
 
+    async def test_loadout_global_swap_expires_with_one_relaunch(self):
+        self.select('claude', 'claude-opus-5-5')
+        owner = self.store.message_save('home', 'owner', 'Use a temporary coordinator model')['id']
+        self.store.message_delivered(owner, 'received')
+        swap = control_api.call(self.store, 'loadout.swap', {
+            'key': 'coordinators.claude.model', 'value': 'claude-sonnet-5',
+            'until': '1h', 'reason': 'Owner asked', 'message': owner}, topic='home', source='mcp')
+        self.assertTrue(swap.ok, swap.text)
+        before = await self.service.start_session('home')
+        self.assertIsNotNone(before)
+        self.parents.append(before)
+        self.assertEqual(before.model, 'claude-sonnet-5')
+        self.assertFalse(parent_state.selection_changed(before), 'An active swap must match its running global pick')
+        self.assertEqual(await before.send(str(uuid.uuid4()), 'ready'), 'received')
+        await until(before.idle)
+        native = before.session_id
+        with patch.object(before, 'relaunch', wraps=before.relaunch) as relaunch:
+            for unused in range(3):
+                await self.service.feed_once()
+            self.assertEqual(relaunch.call_count, 0)
+            rows = self.store.get('loadout.swaps')
+            rows[0]['until'] = time.time() - 1
+            self.store.put('loadout.swaps', rows)
+            await self.service.feed_once()
+            self.assertEqual(relaunch.call_count, 1)
+            await until(lambda: before.closed)
+        after = await self.start()
+        self.assertEqual(after.model, 'claude-opus-5-5')
+        self.assertEqual(after.session_id, native)
+        with patch.object(after, 'relaunch', wraps=after.relaunch) as relaunch:
+            for unused in range(3):
+                await self.service.feed_once()
+            self.assertEqual(relaunch.call_count, 0)
+
     async def test_t3_model_and_thinking_changes_wait_and_resume_same_native_session(self):
         for provider in ('claude', 'codex'):
             with self.subTest(provider=provider):
@@ -683,10 +837,10 @@ class ParentSelectionTests(unittest.IsolatedAsyncioTestCase):
                 self.pick('home', provider, next_model, effort)
                 await self.service.feed_once()
                 self.assertFalse(before.rejected)
-                if provider == 'codex':
-                    self.assertEqual(await before.send(str(uuid.uuid4()), 'done'), 'received')
-                else:
+                if provider == 'claude':
                     (self.root / 'slow.go').touch()
+                elif before.busy:
+                    self.assertEqual(await before.send(str(uuid.uuid4()), 'done'), 'received')
                 with patch('coordinator.host.HostClient.stop', AsyncMock(side_effect=AssertionError('No signal stop'))):
                     await until(lambda: before.idle() or before.closed)
                     await self.service.feed_once()
@@ -768,7 +922,8 @@ class ParentSelectionTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn('owner selected', report)
             before = after
 
-    async def test_t5_picked_chatgpt_waits_even_with_available_claude_and_other_chat_runs(self):
+    async def test_t5_picked_chatgpt_with_no_other_route_waits_and_other_chat_runs(self):
+        self.no_other_route()
         self.pick('other', 'codex', 'test-astra', 'low')
         reset = time.time() + 3600
         self.store.put('codex_account_blocks', {'g': {'reason': 'quota', 'until': reset}})
@@ -782,7 +937,7 @@ class ParentSelectionTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('ChatGPT', notice)
         self.assertEqual(list(self.store.db.execute("SELECT text FROM outbox WHERE topic='other'")), [])
 
-    async def test_t5_picked_claude_falls_back_silently_with_default_codex_effort(self):
+    async def test_t5_picked_claude_moves_to_chatgpt_with_default_codex_effort_and_returns(self):
         self.select('codex', 'test-astra')
         self.pick('other', 'claude', 'claude-sonnet-5', 'low')
         self.store.put('coordinator:other_provider', 'claude')
@@ -792,14 +947,97 @@ class ParentSelectionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((fallback.provider, fallback.model), ('codex', 'test-codex'))
         self.assertIn('model_reasoning_effort="high"', read_jsonl(self.root / 'launches')[-1])
         self.assertFalse(parent_state.selection_changed(fallback))
-        self.assertEqual(list(self.store.db.execute("SELECT text FROM outbox WHERE topic='other'")), [])
+        self.assertEqual(self.chat_notes(), [
+            'Claude is out of usage; this chat runs on ChatGPT test-codex until Claude can run again.'])
         self.store.put('account_status', {alias: {**snapshot, 'usage': {'five_hour': {'utilization': 0}}}
                                         for alias, snapshot in self.store.get('account_status').items()})
         await self.service.feed_once()
         await until(lambda: fallback.closed)
         restored = await self.start('other')
         self.assertEqual((restored.provider, restored.model), ('claude', 'claude-sonnet-5'))
-        self.assertEqual(restored.switch['reason'], 'Claude can take work again')
+        self.assertEqual(self.chat_notes()[1:], ['Claude can take work again; this chat is back on Claude.'])
+
+    async def test_a_chat_with_no_selection_moves_to_chatgpt_and_returns_after_claude_recovers(self):
+        first = await self.start('other')
+        self.assertEqual(first.provider, 'claude')
+        await first.stop()
+        self.limit_claude(time.time() + 3600)
+        moved = await self.start('other')
+        self.assertEqual((moved.provider, moved.model), ('codex', 'test-codex'))
+        self.assertEqual(self.chat_notes(), [
+            'Claude is out of usage; this chat runs on ChatGPT test-codex until Claude can run again.'])
+        await self.service.feed_once()
+        self.assertFalse(moved.closed)
+        self.store.put('account_status', {alias: {**snapshot, 'usage': {'five_hour': {'utilization': 0}}}
+                                        for alias, snapshot in self.store.get('account_status').items()})
+        await self.service.feed_once()
+        await until(lambda: moved.closed)
+        back = await self.start('other')
+        self.assertEqual(back.provider, 'claude')
+        self.assertEqual(self.chat_notes()[1:], ['Claude can take work again; this chat is back on Claude.'])
+
+    async def test_a_chat_that_moves_after_a_failed_start_starts_a_fresh_host(self):
+        from coordinator.host import HostClient
+        from coordinator.native_protocol import NativeProtocol
+        launch = NativeProtocol.start
+        hosts = self.store.directory / 'hosts'
+
+        async def start(protocol, *args, **kwargs):
+            if protocol.provider == 'codex':
+                raise RuntimeError('thread start failed')
+            return await launch(protocol, *args, **kwargs)
+
+        def agents():
+            return {path.parent.name: json.loads(path.read_text())['provider'] for path in hosts.glob('*/spec.json')}
+
+        for topic in ('other', 'home'):
+            with self.subTest(topic=topic):
+                before = set(agents())
+                self.pick(topic, 'codex', 'test-astra', 'low')
+                with patch.object(NativeProtocol, 'start', start):
+                    session = await parent.start(self.store, self.runner, self.root, 'claude-opus-5-5', 'policy',
+                                                 topic=topic)
+                self.parents.append(session)
+                saved = self.store.get(self.service.session_key(topic) + '_host')
+                started = {name: agent for name, agent in agents().items() if name not in before}
+                self.assertEqual((session.provider, saved['provider'], saved['id']), ('claude', 'claude', session.host_id))
+                self.assertEqual(sorted(started.values()), ['claude', 'codex'])
+                self.assertEqual(started[session.host_id], 'claude')
+                failed = next(name for name, agent in started.items() if agent == 'codex')
+                self.assertNotEqual(await HostClient(hosts / failed).recover_state(), 'running')
+                self.assertEqual(await session.send(str(uuid.uuid4()), 'ready'), 'received')
+
+    async def test_a_picked_agent_that_fails_one_start_with_no_other_agent_is_tried_again(self):
+        self.pick('other', 'codex', 'test-astra', 'low')
+        self.limit_claude(time.time() + 3600)
+        with patch.object(parent.CodexCoordinatorSession, 'start', AsyncMock(side_effect=RuntimeError('once'))):
+            with self.assertRaises(RuntimeError):
+                await parent.start(self.store, self.runner, self.root, 'claude-opus-5-5', 'policy', topic='other')
+        self.assertIsNone(self.store.get('coordinator:other_start_failed'))
+        self.assertEqual((await self.start('other')).provider, 'codex')
+
+    async def test_a_moved_chat_stays_while_torii_may_not_switch_to_the_free_chatgpt_account(self):
+        self.pick('other', 'codex', 'test-astra', 'low')
+        profile = self.root / 'second-codex-home'
+        profile.mkdir()
+        with self.store.db:
+            self.store.put('codex_auto_switch', False)
+            self.store.put('codex_accounts', {**self.store.get('codex_accounts'), 'second': {
+                'config_dir': str(profile), 'enabled': True}})
+            self.store.put('codex_account_status', {**self.store.get('codex_account_status'), 'second': {
+                'identity': {'logged_in': True, 'email': 'second@example.test'}}})
+            self.store.put('codex_account_blocks', {
+                alias: {'reason': 'quota', 'until': time.time() + 3600} for alias in ('g', 'second')})
+        moved = await self.start('other')
+        self.assertEqual(moved.provider, 'claude')
+        with self.store.db:
+            self.store.put('codex_account_blocks', {'g': {'reason': 'quota', 'until': time.time() + 3600}})
+        self.assertFalse(parent_state.selection_changed(moved))
+        await self.service.feed_once()
+        self.assertFalse(moved.rejected)
+        with self.store.db:
+            self.store.put('codex_active_account', 'second')
+        self.assertTrue(parent_state.selection_changed(moved))
 
     async def test_t6_global_control_matches_origin_main_replies_refusals_and_values(self):
         for reference in ORIGIN_MAIN_DEFAULTS['controls']:
@@ -864,7 +1102,7 @@ class ParentSelectionTests(unittest.IsolatedAsyncioTestCase):
     def limit_claude(self, reset):
         status = self.store.get('account_status')
         for snapshot in status.values():
-            snapshot['usage']['five_hour'] = {'utilization': 98, 'resets_at': reset}
+            snapshot['usage']['seven_day'] = {'utilization': 99, 'resets_at': reset}
         with self.store.db:
             self.store.put('account_status', status)
 
@@ -882,7 +1120,7 @@ class ParentSelectionTests(unittest.IsolatedAsyncioTestCase):
                           'seven_day': {'utilization': 0, 'resets_at': now + 7200}}}})
             result = control_api.call(self.store, 'account.use', {'alias': 'work'}, topic='Atlas')
         self.assertTrue(result.ok, result.text)
-        self.assertEqual(self.service.accounts.select(), 'work')
+        self.assertEqual(self.service.accounts.select(model='native-default'), 'work')
 
     async def feed_owner(self, session, text, telegram_message):
         completed = asyncio.Event()
@@ -901,7 +1139,7 @@ class ParentSelectionTests(unittest.IsolatedAsyncioTestCase):
     async def assert_documented_overrides_feed_is_quiet(self, accounts):
         self.prepare_selection_scenario()
         override = self.root / 'local-overrides.json'
-        override.write_text(json.dumps({'shared_mcp_servers': []}))
+        override.write_text(json.dumps({'unrelated_setting': []}))
         listed, status = self.store.get('accounts'), self.store.get('account_status')
         for index in range(1, accounts):
             alias = 'extra%d' % index
@@ -944,7 +1182,7 @@ class ParentSelectionTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(all(session.provider == 'codex' for session in before))
         self.select('claude', 'claude-opus-5-5')
         status = self.store.get('account_status')
-        status['personal']['usage']['five_hour']['utilization'] = 0
+        status['personal']['usage']['seven_day']['utilization'] = 0
         with self.store.db:
             self.store.put('account_status', status)
         with patch('coordinator.host.HostClient.stop', AsyncMock(side_effect=AssertionError('No signal stop'))):
@@ -1006,7 +1244,8 @@ class ParentSelectionTests(unittest.IsolatedAsyncioTestCase):
         def consumed():
             for record in read_jsonl(session.process.directory / 'events.jsonl'):
                 event = json.loads(record['data'])
-                if all(event.get(key) == value for key, value in expected.items()):
+                if all((plain(event.get(key)) if isinstance(event.get(key), str) else event.get(key)) == value
+                       for key, value in expected.items()):
                     if self.store.get(session.key + '_host_seq', 0) >= record['seq']:
                         return True
             return False
@@ -1064,7 +1303,7 @@ class ParentSelectionTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(self.service.sessions.get('Atlas'), before)
         self.assertFalse(before.rejected)
         status = self.store.get('account_status')
-        status['personal']['usage']['five_hour']['utilization'] = 0
+        status['personal']['usage']['seven_day']['utilization'] = 0
         with self.store.db:
             self.store.put('account_status', status)
         self.select('claude', 'claude-opus-5-5')
@@ -1096,10 +1335,10 @@ class ParentSelectionTests(unittest.IsolatedAsyncioTestCase):
         before = await self.start()
         self.assertEqual((before.provider, before.account_alias, before.model), ('codex', 'team', 'test-codex'))
         self.assertFalse(before.rejected)
-        self.assertEqual(before.switch['reason'], 'every Claude account is out of usage')
         self.assertIsNone(self.store.get('coordinator_account_retry_at'))
-        notice = self.store.db.execute("SELECT text FROM outbox WHERE topic='Atlas' AND text LIKE 'This chat now runs on%'").fetchone()
-        self.assertIsNone(notice)
+        notices = [row[0] for row in self.store.db.execute(
+            "SELECT text FROM outbox WHERE topic='Atlas' AND text LIKE '%this chat runs on%'")]
+        self.assertEqual(notices, ['Claude is out of usage; this chat runs on ChatGPT test-codex until Claude can run again.'])
         requests = read_jsonl(self.root / 'requests')
         launches = [request['params']['model'] for request in requests if request.get('method') == 'thread/start']
         self.assertEqual(launches, ['test-codex'])
@@ -1120,7 +1359,7 @@ class ParentSelectionTests(unittest.IsolatedAsyncioTestCase):
         await self.wait_for_receipt(before, row)
         self.assertTrue(before.busy)
         status = self.store.get('account_status')
-        status['personal']['usage']['five_hour']['utilization'] = 0
+        status['personal']['usage']['seven_day']['utilization'] = 0
         with self.store.db:
             self.store.put('account_status', status)
         before.protocol.background = [{'task_id': 'settling-work'}]
@@ -1154,10 +1393,10 @@ class ParentSelectionTests(unittest.IsolatedAsyncioTestCase):
         await settle(asyncio.gather(*self.service.feed_tasks.values()))
         await settle(completed.wait())
         await self.wait_for_journal(after, {'type': 'result', 'result':
-            'done:[topic=Atlas name="Atlas" message=%d kind=owner] ' % pending['id'] + REPLY_FIRST + text})
+            'done:[topic=Atlas name="Atlas" message=%d kind=owner] ' % pending['id'] + text})
         events = read_jsonl(self.root / 'claude-inputs')
-        prompts = [event['message']['content'] for event in events if 'kind=owner]' in event['message']['content']]
-        self.assertEqual(prompts, ['[topic=Atlas name="Atlas" message=%d kind=owner] ' % pending['id'] + REPLY_FIRST + text])
+        prompts = [plain(event['message']['content']) for event in events if 'kind=owner]' in event['message']['content']]
+        self.assertEqual(prompts, ['[topic=Atlas name="Atlas" message=%d kind=owner] ' % pending['id'] + text])
         for message in (row, pending):
             await self.wait_for_receipt(after, message)
             self.assertEqual(tuple(self.store.db.execute('SELECT delivered,receipt FROM messages WHERE id=?',
@@ -1192,7 +1431,7 @@ class ParentSelectionTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(before.busy)
         status = self.store.get('account_status')
         for snapshot in status.values():
-            snapshot['usage']['five_hour']['utilization'] = 0
+            snapshot['usage']['seven_day']['utilization'] = 0
         with self.store.db:
             self.store.put('account_status', status)
         before.protocol.background = [{'task_id': 'settling-work'}]
@@ -1235,7 +1474,7 @@ class ParentSelectionTests(unittest.IsolatedAsyncioTestCase):
         self.prepare_owner_pick_scenario()
         self.select('claude', 'claude-opus-5-5')
         status = self.store.get('account_status')
-        status['work']['usage']['five_hour'] = {'utilization': 98, 'resets_at': time.time() + 7200}
+        status['work']['usage']['seven_day'] = {'utilization': 99, 'resets_at': time.time() + 7200}
         with self.store.db:
             self.store.put('account_status', status)
         before = await self.start()
@@ -1244,7 +1483,7 @@ class ParentSelectionTests(unittest.IsolatedAsyncioTestCase):
         before.on_turn = lambda reply: completed.set()
         self.assertEqual(await before.send(str(uuid.uuid4()), 'slow'), 'received')
         await until(lambda: (self.root / 'slow.started').exists())
-        status['work']['usage']['five_hour']['utilization'] = 0
+        status['work']['usage']['seven_day']['utilization'] = 0
         with self.store.db:
             self.store.put('account_status', status)
         before.protocol.background = [{'task_id': 'settling-work'}]
@@ -1275,7 +1514,7 @@ class ParentSelectionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(history.read_bytes(), content)
         await self.wait_for_receipt(after, pending, feed=True)
         await self.wait_for_journal(after, {'type': 'result', 'result':
-            'done:[topic=Atlas name="Atlas" message=%d kind=owner] ' % pending['id'] + REPLY_FIRST + pending['text']})
+            'done:[topic=Atlas name="Atlas" message=%d kind=owner] ' % pending['id'] + pending['text']})
         await self.wait_for_parent(after, after.idle, 'the resumed parent to finish the pending owner turn')
         self.assertEqual(tuple(self.store.db.execute('SELECT delivered,receipt FROM messages WHERE id=?',
                                                    (pending['id'],)).fetchone()), ('received', 'replayed'))
@@ -1300,7 +1539,7 @@ class ParentSelectionTests(unittest.IsolatedAsyncioTestCase):
             await self.service.feed_once()
             self.assertIs(await self.service.start_session('Atlas'), session)
             await self.feed_owner(session, 'paused pick cycle %d' % index, 400 + index)
-            self.assertEqual(self.store.get('claude_account_pick'), 'work')
+            self.assertEqual(self.store.get('claude_account_pick'), {'fable': 'work', 'other': 'work'})
             self.assertFalse(session.movable())
             self.assertEqual((session.host_id, session.session_id, session.process.pid), identity)
         self.assertEqual(len(read_jsonl(self.root / 'launches')), 1)
@@ -1319,7 +1558,8 @@ class ParentSelectionTests(unittest.IsolatedAsyncioTestCase):
             self.store.put('codex_account_status', {**self.store.get('codex_account_status'), 'work': {
                 'identity': {'logged_in': True, 'email': 'work@example.test'}}})
             self.store.put('codex_auto_switch', True)
-            self.store.put('codex_account_blocks', {'team': {'reason': 'quota', 'until': codex_reset}})
+            self.store.put('codex_account_blocks', {alias: {'reason': 'quota', 'until': codex_reset}
+                                                   for alias in ('team', 'work')})
         row = self.store.message_save('Atlas', 'owner', 'saved while both are limited', telegram_message=1)
         self.assertIsNone(await self.service.start_session('Atlas'))
         self.assertEqual(self.store.get('coordinator_account_retry_at'), codex_reset)
@@ -1348,19 +1588,19 @@ class ParentSelectionTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(parent.CoordinatorSession, 'start', side_effect=unavailable_at_launch):
             session = await self.start()
         self.assertEqual((session.provider, session.account_alias, session.model), ('codex', 'team', 'test-codex'))
-        self.assertEqual(session.switch['reason'], 'every Claude account is out of usage')
+        self.assertEqual(session.switch['reason'], 'Claude is out of usage')
         self.assertFalse(session.rejected)
 
-    async def test_codex_selection_does_not_fall_back_to_available_claude(self):
+    async def test_home_codex_selection_falls_back_to_available_claude(self):
         self.prepare_selection_scenario()
         self.select('codex', 'test-astra')
         reset = time.time() + 3600
         with self.store.db:
             self.store.put('codex_account_blocks', {'team': {'reason': 'quota', 'until': reset}})
-        self.assertIsNone(await self.service.start_session('Atlas'))
-        self.assertEqual(self.store.get('coordinator_account_retry_at'), reset)
-        self.assertEqual(self.store.get('coordinator_account_notice')['key'][:2], ['codex', 'team'])
-        self.assertFalse((self.root / 'launches.jsonl').exists())
+        session = await self.service.start_session('Atlas')
+        self.parents.append(session)
+        self.assertEqual(session.provider, 'claude')
+        self.assertIsNone(self.store.get('coordinator_account_retry_at'))
 
     async def assert_quota_handoff(self, provider, failed_close=False, same_provider_first=False):
         claude = self.root / 'claude'
@@ -1432,7 +1672,7 @@ class ParentSelectionTests(unittest.IsolatedAsyncioTestCase):
                 await self.service.feed_once()
                 await settle(asyncio.gather(*self.service.feed_tasks.values()))
             events = read_jsonl(self.root / 'claude-inputs')
-            callbacks = [event['message']['content'] for event in events if 'kind=callback]' in event['message']['content']]
+            callbacks = [plain(event['message']['content']) for event in events if 'kind=callback]' in event['message']['content']]
             self.assertEqual(callbacks, ['[topic=home name="home" message=2 kind=callback] ' +
                                         parent_state.LOST_TURN % 'message=1'])
         after = await self.start()
@@ -1458,12 +1698,12 @@ class ParentSelectionTests(unittest.IsolatedAsyncioTestCase):
         await until(after.idle)
         if after.provider == 'codex':
             requests = read_jsonl(self.root / 'requests')
-            prompts = [request['params']['input'][0]['text'] for request in requests
+            prompts = [plain(request['params']['input'][0]['text']) for request in requests
                        if request.get('method') in ('turn/start', 'turn/steer')]
         else:
             events = read_jsonl(self.root / 'claude-inputs')
-            prompts = [event['message']['content'] for event in events if event['session_id'] == after.session_id]
-        expected = '[topic=home name="home" message=1 kind=owner] ' + REPLY_FIRST + text
+            prompts = [plain(event['message']['content']) for event in events if event['session_id'] == after.session_id]
+        expected = '[topic=home name="home" message=1 kind=owner] ' + text
         self.assertEqual([prompt for prompt in prompts if 'kind=owner]' in prompt], [expected])
         self.assertFalse(any('already in this conversation' in prompt for prompt in prompts), prompts)
         self.assertEqual(tuple(self.store.db.execute('SELECT delivered,receipt FROM messages WHERE id=?',
@@ -1485,7 +1725,7 @@ class ParentSelectionTests(unittest.IsolatedAsyncioTestCase):
     async def test_rejected_same_provider_recovery_then_switch_delivers_the_full_owner_message_once(self):
         await self.assert_quota_handoff('claude', same_provider_first=True)
 
-    async def test_silent_capacity_recovery_then_rotation_delivers_the_owner_message_once(self):
+    async def test_capacity_recovery_then_rotation_delivers_the_owner_message_once(self):
         claude = self.root / 'claude'
         source = claude.read_text().replace("    text=event['message']['content']", """    text=event['message']['content']
     with (root/'claude-inputs').open('a') as log:
@@ -1516,8 +1756,8 @@ class ParentSelectionTests(unittest.IsolatedAsyncioTestCase):
         await first.stop()
         with self.store.db:
             self.store.put('account_blocks', {})
-        with patch.object(self.store, 'enqueue_report', side_effect=AssertionError('Capacity recovery is silent')):
-            await self.service.start_session('home')
+        await self.service.start_session('home')
+        self.assertEqual(self.chat_notes('home')[-1], 'Claude can take work again; this chat is back on Claude.')
         mid = self.service.sessions['home']
         self.parents.append(mid)
         self.assertEqual((mid.provider, mid.account_alias), ('claude', 'c'))
@@ -1551,10 +1791,10 @@ class ParentSelectionTests(unittest.IsolatedAsyncioTestCase):
             await settle(asyncio.gather(*self.service.feed_tasks.values()))
             await until(lambda: rotated.idle() or rotated.closed)
         events = read_jsonl(self.root / 'claude-inputs')
-        prompts = [event['message']['content'] for event in events if event['session_id'] == mid.session_id]
+        prompts = [plain(event['message']['content']) for event in events if event['session_id'] == mid.session_id]
         owners = [prompt for prompt in prompts if 'message=%d kind=owner]' % row['id'] in prompt]
         self.assertEqual(len(owners), 1, 'the resumed conversation received the owner message twice')
-        self.assertEqual(owners, ['[topic=home name="home" message=%d kind=owner] ' % row['id'] + REPLY_FIRST + text])
+        self.assertEqual(owners, ['[topic=home name="home" message=%d kind=owner] ' % row['id'] + text])
         self.assertEqual([prompt for prompt in prompts if 'kind=callback]' in prompt],
                          ['[topic=home name="home" message=%d kind=callback] ' % callback['id'] +
                           parent_state.LOST_TURN % ('message=%d' % row['id'])])

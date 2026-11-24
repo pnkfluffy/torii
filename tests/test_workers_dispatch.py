@@ -6,7 +6,7 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import AsyncMock, patch
 
-from coordinator import control_api, mcp, native_ids
+from coordinator import control_api, extension, mcp, native_ids
 from coordinator.accounts import AccountBroker
 from coordinator.providers import ProviderRunner, RunResult
 from coordinator.service import Service
@@ -57,19 +57,41 @@ class WorkerDispatchTests(unittest.IsolatedAsyncioTestCase):
     def spawn(self, provider, **options):
         return self.call('workers.spawn', task=self.task['id'], provider=provider, prompt='Build it', **options)
 
-    def test_worker_schema_accepts_four_providers_and_parent_kind_is_separate(self):
-        self.assertEqual(control_api.find('workers.spawn').params['provider'], 'worker_provider')
+    async def test_research_without_worktree_uses_scratch(self):
+        self.ready('codex')
+        self.store.task_update(self.task['id'], worktree=None)
+        queued = self.spawn('codex')
+        self.assertTrue(queued.ok, queued.text)
+        runner = SimpleNamespace(run=AsyncMock(return_value=RunResult(
+            '00000000-0000-4000-8000-000000000001', text='done', success=True)))
+        pool = WorkerPool(self.store, runner, AccountBroker(self.store))
+        worker = pool.get(queued.data['worker'])
+        self.assertEqual(worker['cwd'], str(self.store.directory / 'scratch' / ('task-' + str(self.task['id']))))
+        worktree = self.root / 'job-copy'
+        worktree.mkdir()
+        self.store.task_update(self.task['id'], worktree=str(worktree))
+        done = await pool.run(worker, self.store.topic('1:2'))
+        self.assertTrue(json.loads(done['result'])['success'])
+        args, options = runner.run.call_args
+        self.assertEqual(args[2], Path(worker['cwd']))
+        self.assertIn(str(self.root), options['instructions'])
+        self.assertIn('Do not write to it', options['instructions'])
+        self.assertIn('"project": ' + json.dumps(str(worktree)), options['instructions'])
+
+    def test_worker_schema_lists_supported_providers_and_parent_kind_is_separate(self):
+        self.assertEqual(control_api.find('workers.spawn').params['provider'],
+                         'worker_provider?' if extension.available('routing') else 'worker_provider')
         self.assertEqual(control_api.find('topic.bind').params['provider'], 'provider?')
         self.assertEqual(control_api.find('model.parent').params['provider'], 'parent_provider?')
         schema = mcp.input_schema(control_api.find('workers.spawn'))
-        self.assertEqual(schema['properties']['provider']['enum'], ['claude', 'codex', 'opencode', 'muse'])
-        for provider in ('opencode', 'muse'):
-            with self.subTest(provider=provider):
-                self.assertEqual(control_api._coerce(self.store, 'worker_provider', provider), (provider, None))
-                for op in ('topic.bind', 'model.parent'):
-                    result = self.call(op, provider=provider)
-                    self.assertFalse(result.ok)
-                    self.assertEqual(result.state, 'refused')
+        self.assertEqual(schema['properties']['provider']['enum'], ['claude', 'codex', 'opencode']
+                         + (['antigravity'] if extension.available('antigravity_runtime') else []))
+        provider = 'opencode'
+        self.assertEqual(control_api._coerce(self.store, 'worker_provider', provider), (provider, None))
+        for op in ('topic.bind', 'model.parent'):
+            result = self.call(op, provider=provider)
+            self.assertFalse(result.ok)
+            self.assertEqual(result.state, 'refused')
         self.assertFalse(self.spawn('unknown').ok)
 
     def test_spawn_refuses_absent_false_and_non_boolean_switches(self):
@@ -208,7 +230,7 @@ class WorkerDispatchTests(unittest.IsolatedAsyncioTestCase):
         done = service.workers.get(worker_id)
         self.assertTrue(json.loads(done['result'])['success'])
         self.assertEqual((done['provider'], done['account_alias']), ('codex', 'one'))
-        self.assertEqual(runner.run.call_args.kwargs['model'], 'gpt-6.1-sol')
+        self.assertEqual(runner.run.call_args.kwargs['model'], 'gpt-6.2-sol')
 
 
 class NativeIdTests(unittest.TestCase):

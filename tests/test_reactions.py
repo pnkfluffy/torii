@@ -344,7 +344,8 @@ class ReactionTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(created.ok, created.text)
         self.assertIsNone(created.data['origin'])
         for status in ('done', 'dropped', 'open'):
-            self.assertTrue(self.call('tasks.update', {'task': created.data['id'], 'status': status}).ok)
+            self.assertTrue(self.call('tasks.update', {'task': created.data['id'], 'status': status, **({'summary': 'Closed in test.'} if status in ('done', 'dropped') else {}), 'note': 'No longer needed',
+                                                       **({'summary': 'Not needed.'} if status != 'open' else {})}).ok)
 
     def test_status_map_done_dropped_reopened_and_waiting(self):
         message = self.message()
@@ -358,10 +359,10 @@ class ReactionTests(unittest.IsolatedAsyncioTestCase):
 
     def test_worker_work_defaults_to_research_and_is_validated_at_the_boundary(self):
         self.store.put('accounts', {'work': {'config_dir': None, 'enabled': True}})
-        message = self.message()
+        message = self.message(text='Use Claude for this job.')
         task = self.store.task_create(TOPIC, 'Build', origin=message, worktree=self.tmp.name)
         for work in (None, 'dev', 'research'):
-            params = {'task': task['id'], 'provider': 'claude', 'prompt': 'Do it'}
+            params = {'task': task['id'], 'provider': 'claude', 'prompt': 'Do it', 'message': message}
             if work is not None:
                 params['work'] = work
             result = self.call('workers.spawn', params)
@@ -617,6 +618,18 @@ class ReactionTests(unittest.IsolatedAsyncioTestCase):
         protocol.closed = True
         self.assertEqual(await protocol.steer('two', 'Held'), 'closed')
         self.assertEqual(handed, ['one'])
+
+    async def test_telegram_send_accepts_global_job_id_and_prefers_it_on_collision(self):
+        self.store.task_create(OTHER, 'Other channel')
+        first = self.store.task_create(TOPIC, 'First', origin=self.message(telegram=501))
+        second = self.store.task_create(TOPIC, 'Second', origin=self.message(telegram=502))
+        self.assertEqual(first['id'], second['number'])
+        for task, expected in ((first['number'], 501), (first['id'], 501), (second['id'], 502)):
+            result = self.call('telegram.send', {'text': 'Done', 'task': task})
+            self.assertTrue(result.ok, result.text)
+            row = self.store.db.execute('SELECT reply_to FROM outbox WHERE id=?', (result.data['outbox'],)).fetchone()
+            self.assertEqual(row['reply_to'], expected)
+        self.assertFalse(self.call('telegram.send', {'text': 'No job', 'task': 999}).ok)
 
     async def test_telegram_send_task_uses_channel_job_number_and_reply_to_wins(self):
         self.store.task_create(OTHER, 'Make database ID differ from job number')

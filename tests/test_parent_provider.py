@@ -17,7 +17,8 @@ from tests.support import isolate_shared_mcp_home
 
 
 class ParentProviderTests(unittest.IsolatedAsyncioTestCase):
-    async def test_opencode_pick_never_falls_back(self):
+    async def test_opencode_pick_moves_along_its_queue_and_pauses_when_no_other_agent_can_run(self):
+        from coordinator import parent_state
         from coordinator.control_api import Refused
         self.claude()
         key = 'coordinator:other'
@@ -28,8 +29,17 @@ class ParentProviderTests(unittest.IsolatedAsyncioTestCase):
         reset = time.time() + 3600
         self.store.put('opencode_accounts', {'one': {'model': 'test'}})
         self.store.put('opencode_active_account', 'one')
-        with patch('coordinator.session.CoordinatorSession.start', AsyncMock(side_effect=AssertionError('Claude fallback'))), \
-                patch('coordinator.codex_session.CodexCoordinatorSession.start', AsyncMock(side_effect=AssertionError('Codex fallback'))):
+        order = parent_state.providers(self.store, key)
+        self.assertEqual((order[0], sorted(order[1:])), ('opencode', ['claude', 'codex']))
+        account = {'claude': 'team', 'codex': 'personal'}
+
+        def others(out):
+            later = time.time() + 7200
+            self.store.put('account_blocks', {'team': {'until': later, 'reason': 'quota'}} if out else {})
+            self.store.put('codex_account_blocks', {alias: {'until': later, 'reason': 'quota'}
+                                                   for alias in ('personal', 'work')} if out else {})
+        with patch('coordinator.session.CoordinatorSession.start', AsyncMock(side_effect=AssertionError('Claude start'))), \
+                patch('coordinator.codex_session.CodexCoordinatorSession.start', AsyncMock(side_effect=AssertionError('Codex start'))):
             for case in ('off', 'no-account', 'blocked', 'key', 'version', 'go'):
                 with self.subTest(case=case):
                     self.store.put('opencode_enabled', case != 'off')
@@ -39,6 +49,12 @@ class ParentProviderTests(unittest.IsolatedAsyncioTestCase):
                                                        if case == 'go' else {'model': 'test'}})
                     with patch('coordinator.opencode_accounts._check_binary', side_effect=Refused('version') if case == 'version' else None), \
                             patch('coordinator.opencode_accounts.check_key', side_effect=Refused('key') if case == 'key' else None):
+                        others(out=False)
+                        self.assertTrue(parent.available(self.store, self.accounts, self.codex, self.runner, key))
+                        self.assertEqual(
+                            await parent.choose_parent(self.store, self.accounts, self.codex, key, self.runner),
+                            (order[1], account[order[1]]))
+                        others(out=True)
                         self.assertFalse(parent.available(self.store, self.accounts, self.codex, self.runner, key))
                         unavailable = parent.unavailable(self.store, self.accounts, self.codex, key)
                         self.assertEqual(unavailable.provider, 'opencode')
@@ -50,9 +66,11 @@ class ParentProviderTests(unittest.IsolatedAsyncioTestCase):
             self.store.put('opencode_accounts', {'one': {'model': 'test'}})
             self.store.put('opencode_account_blocks', {})
             with patch('coordinator.opencode_accounts.check_ready'):
+                others(out=False)
                 self.assertEqual(await parent.choose_parent(self.store, self.accounts, self.codex, key, self.runner),
                                  ('opencode', 'one'))
                 self.assertTrue(parent.available(self.store, self.accounts, self.codex, self.runner, key))
+                others(out=True)
                 with patch('coordinator.opencode_parent.OpenCodeParentSession.start',
                            AsyncMock(side_effect=AccountsUnavailable(reset, provider='opencode', alias='one'))):
                     with self.assertRaises(AccountsUnavailable) as caught:
@@ -71,7 +89,8 @@ class ParentProviderTests(unittest.IsolatedAsyncioTestCase):
                                    if pick else None)
                     self.assertEqual((await self.choose())[0], expected)
             self.store.put('account_blocks', {'team': {'until': time.time() + 3600, 'reason': 'quota'}})
-            self.store.put('codex_account_blocks', {'personal': {'until': time.time() + 3600, 'reason': 'quota'}})
+            self.store.put('codex_account_blocks', {alias: {'until': time.time() + 3600, 'reason': 'quota'}
+                                                   for alias in ('personal', 'work')})
             with self.assertRaises(AccountsUnavailable) as caught:
                 await self.choose()
             self.assertNotEqual(caught.exception.provider, 'opencode')
@@ -116,6 +135,73 @@ class ParentProviderTests(unittest.IsolatedAsyncioTestCase):
     async def choose(self):
         return await parent.choose_parent(self.store, self.accounts, self.codex, runner=self.runner)
 
+    async def test_home_chatgpt_pick_runs_on_claude_while_the_codex_cli_is_missing(self):
+        from coordinator import parent_state
+        self.claude()
+        self.store.put('coordinator_selection', {'provider': 'codex', 'model': None, 'effort': None, 'revision': 1})
+        self.assertEqual(await self.choose(), ('codex', 'personal'))
+        self.binary.unlink()
+        self.assertEqual(await self.choose(), ('claude', 'team'))
+        self.assertTrue(parent_state.provider_out(self.store, 'coordinator', 'codex'))
+        self.assertEqual(parent.switch_reason(self.store, 'codex', 'claude', self.accounts, self.codex),
+                         'the codex CLI is missing')
+        self.binary.touch()
+        self.binary.chmod(0o700)
+        self.assertFalse(parent_state.provider_out(self.store, 'coordinator', 'codex'))
+        self.assertEqual(await self.choose(), ('codex', 'personal'))
+
+    async def test_a_chat_pick_runs_on_claude_while_the_codex_cli_is_missing_and_waits_when_claude_is_out(self):
+        self.claude()
+        self.store.db.execute("INSERT INTO topics(id,chat,thread,name,cwd,enabled) VALUES ('other',1,2,'Other',?,1)",
+                              (str(self.root),))
+        key = 'coordinator:other'
+        self.store.put(key + '_selection', {'provider': 'codex', 'model': None, 'effort': None, 'revision': 1})
+        self.binary.unlink()
+        self.assertEqual(await parent.choose_parent(self.store, self.accounts, self.codex, key, self.runner),
+                         ('claude', 'team'))
+        self.store.put('account_blocks', {'team': {'until': time.time() + 1000, 'reason': 'quota'}})
+        with self.assertRaises(AccountsUnavailable):
+            await parent.choose_parent(self.store, self.accounts, self.codex, key, self.runner)
+
+    async def test_a_start_that_keeps_failing_backs_off(self):
+        from coordinator import parent_state
+        now = time.time()
+        waits = []
+        for _ in range(8):
+            with patch('coordinator.parent_state.time.time', return_value=now):
+                parent_state.failed_start(self.store, 'coordinator', 'codex')
+            waits.append(round(self.store.get('coordinator_start_failed')['until'] - now))
+        self.assertEqual(waits, [900, 1800, 3600, 7200, 14400, 28800, 57600, 86400])
+        parent_state.failed_start(self.store, 'coordinator', 'antigravity')
+        self.assertEqual(self.store.get('coordinator_start_failed')['count'], 1)
+
+    def fail_for_a_day(self):
+        from coordinator import parent_state
+        for _ in range(8):
+            parent_state.failed_start(self.store, 'coordinator', 'codex')
+
+    async def test_setting_the_same_home_pick_again_retries_it(self):
+        from coordinator.control_api import Context
+        from coordinator.controls import op_model_parent
+        self.claude()
+        op_model_parent(self.store, Context(), provider='codex', model='gpt-6-luna', topic='Atlas')
+        self.assertEqual(await self.choose(), ('codex', 'personal'))
+        self.fail_for_a_day()
+        self.assertEqual(await self.choose(), ('claude', 'team'))
+        op_model_parent(self.store, Context(), provider='codex', model='gpt-6-luna', topic='Atlas')
+        self.assertEqual(await self.choose(), ('codex', 'personal'))
+
+    async def test_a_new_global_parent_pick_retries_the_home_chat(self):
+        from coordinator.control_api import Context
+        from coordinator.controls import op_model_parent
+        self.claude()
+        op_model_parent(self.store, Context(), provider='codex', model='gpt-6-luna')
+        self.assertEqual(await self.choose(), ('codex', 'personal'))
+        self.fail_for_a_day()
+        self.assertEqual(await self.choose(), ('claude', 'team'))
+        op_model_parent(self.store, Context(), provider='codex', model='gpt-6-luna')
+        self.assertEqual(await self.choose(), ('codex', 'personal'))
+
     async def test_claude_precedes_chatgpt_without_activating_an_account(self):
         self.claude()
         with patch.object(self.accounts, 'activate', side_effect=AssertionError('Selection must not activate')):
@@ -127,10 +213,10 @@ class ParentProviderTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self.choose(), ('codex', 'personal'))
         self.assertEqual(self.store.get('codex_active_account'), 'personal')
         self.store.put('codex_account_blocks', {'personal': {'reason': 'quota', 'until': time.time() + 3600}})
-        self.assertFalse(parent.available(self.store, self.accounts, self.codex, self.runner))
-        with self.assertRaises(AccountsUnavailable) as caught:
-            await self.choose()
-        self.assertEqual(caught.exception.provider, 'codex')
+        self.store.put('codex_auto_switch', False)
+        self.assertTrue(parent.available(self.store, self.accounts, self.codex, self.runner))
+        self.assertEqual(await self.choose(), ('claude', 'team'))
+        self.assertEqual(self.store.get('codex_active_account'), 'personal')
 
     async def test_explicit_claude_parent_uses_codex_fallback(self):
         self.claude(limited=True)
@@ -144,15 +230,16 @@ class ParentProviderTests(unittest.IsolatedAsyncioTestCase):
             self.assertIs(await parent.start(self.store, self.runner, self.root, 'model', 'policy'), fallback)
             codex_start.assert_awaited_once()
 
-    async def test_chatgpt_parent_ignores_automatic_worker_rotation_and_95_percent_holds(self):
+    async def test_chatgpt_parent_uses_the_same_automatic_selection_as_workers(self):
         self.store.put('codex_account_blocks', {'personal': {'reason': 'threshold', 'until': time.time() + 3600}})
         self.store.put('codex_account_status', {**self.store.get('codex_account_status'), 'personal': {
             'identity': {'email': 'personal@example.test', 'logged_in': True},
-            'usage': {'five_hour': {'utilization': 96, 'resets_at': time.time() + 3600}}}})
-        self.assertEqual(await self.choose(), ('codex', 'personal'))
+            'usage': {'five_hour': {'utilization': 99, 'resets_at': time.time() + 3600}}}})
+        self.assertEqual(await self.choose(), ('codex', 'work'))
         self.assertEqual(self.codex.select(), 'work')
 
     async def test_exhausted_active_chatgpt_account_pauses_even_when_another_has_room(self):
+        self.store.put('codex_auto_switch', False)
         reset = time.time() + 3600
         self.store.put('codex_account_blocks', {'personal': {'reason': 'quota', 'until': reset}})
         with self.assertRaises(AccountsUnavailable) as caught:

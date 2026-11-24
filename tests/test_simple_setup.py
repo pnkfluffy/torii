@@ -94,7 +94,7 @@ class SimpleSetupTests(unittest.IsolatedAsyncioTestCase):
 
     def test_group_link_prints_exact_screens_and_rights(self):
         with patch('builtins.input', return_value=''), patch('subprocess.run') as run, \
-                patch.dict(self.globals, link=INSTALLER['link']), patch('sys.platform', 'darwin'), \
+                patch.dict(self.globals, link=INSTALLER['link']), patch('coordinator.host_os.SYSTEM', 'darwin'), \
                 patch.dict(os.environ, {}, clear=True), redirect_stdout(io.StringIO()) as out:
             INSTALLER['open_group_link']('test_bot', 'abc_def-123')
         url = 'https://t.me/test_bot?startgroup=abc_def-123&admin=manage_topics+delete_messages+pin_messages'
@@ -126,18 +126,17 @@ class SimpleSetupTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(rights['can_promote_members'])
 
     def test_default_and_pair_only_installer_arguments(self):
-        with patch('coordinator.host_os.linux', return_value=False), patch('sys.platform', 'darwin'), redirect_stdout(io.StringIO()):
+        with patch('coordinator.host_os.SYSTEM', 'darwin'), redirect_stdout(io.StringIO()):
             SERVICE_INSTALLER['install'](write_only=True)
         target = self.root / 'Library/LaunchAgents/local.telegram-agent-coordinator.plist'
         self.assertNotIn('--pair-only', plistlib.loads(target.read_bytes())['ProgramArguments'])
-        with patch('coordinator.host_os.linux', return_value=False), patch('sys.platform', 'darwin'), redirect_stdout(io.StringIO()):
+        with patch('coordinator.host_os.SYSTEM', 'darwin'), redirect_stdout(io.StringIO()):
             SERVICE_INSTALLER['install'](write_only=True, pair_only=True)
         self.assertIn('--pair-only', plistlib.loads(target.read_bytes())['ProgramArguments'])
 
     def test_linux_default_and_explicit_pair_only_unit(self):
         for pair_only in (False, True):
-            args = SimpleNamespace(pair_only=pair_only, coordinator_model='fake-model', write_only=True)
-            with patch('os.getuid', return_value=1000), redirect_stdout(io.StringIO()):
-                SERVICE_INSTALLER['install_linux'](args)
+            with patch('coordinator.host_os.SYSTEM', 'linux'), patch('os.getuid', return_value=1000), redirect_stdout(io.StringIO()):
+                SERVICE_INSTALLER['install']('fake-model', write_only=True, pair_only=pair_only)
             unit = (self.root / '.config/systemd/user/local.telegram-agent-coordinator.service').read_text()
             self.assertEqual('--pair-only' in unit, pair_only)

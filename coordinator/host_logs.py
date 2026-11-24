@@ -1,21 +1,19 @@
 """Event-driven reclamation of completed host journals."""
 
 import asyncio
-from collections import Counter
 import errno
+from collections import Counter
 from itertools import chain
 import json
 import logging
 import os
 from pathlib import Path
 import re
-import select
 import stat
 import sys
-from time import time
 import uuid
 
-from . import problems, process_ownership as ownership
+from . import host_os, problems, process_ownership as ownership, sweeps
 from .host import _reap_launchers, _write, alive, host_state
 from .worker_storage import DeleteFailed, _directory, delete
 
@@ -25,7 +23,7 @@ REQUEST = '_cleanup.host_logs'
 ACTIVE = ('queued', 'running', 'waiting_for_secret', 'waiting_for_quota')
 WORKER = re.compile(r'worker-([1-9][0-9]*)(?:\.[0-9]+)*(?:-resume-[0-9]+(?:\.[0-9]+)*)?\Z')
 MARKER_LINK_LIMIT = 4096
-RETRY_LIMIT = 24
+SWEEP = 'log-delete'
 
 
 def _marker_record(path):
@@ -80,11 +78,10 @@ class HostLogs:
         self.queue = None
         self.pending = []
         self.queued = set()
-        self.retry = store.get('host_log_delete_retries', {})
-        self.retry_dirty = False
         self.watches = {}
         self.watch_hosts = {}
         self.exited = {}
+        self.failing = {row[0] for row in store.db.execute('SELECT item FROM sweep_failures WHERE sweep=?', (SWEEP,))}
 
     def request(self, target=None):
         target = dict(target or {})
@@ -105,10 +102,10 @@ class HostLogs:
             self.pending.clear()
         try:
             while True:
-                delay = min((entry['due'] for entry in self.retry.values()), default=None)
+                delay = sweeps.next_retry(self.store, SWEEP)
                 queued = True
                 try:
-                    target = await asyncio.wait_for(self.queue.get(), max(0, delay - time())) if delay is not None else await self.queue.get()
+                    target = await asyncio.wait_for(self.queue.get(), delay) if delay is not None else await self.queue.get()
                 except asyncio.TimeoutError:
                     target, queued = {'retry': True}, False
                 if queued:
@@ -148,10 +145,7 @@ class HostLogs:
             loop, descriptor, queue = current
             if not loop.is_closed():
                 loop.remove_reader(descriptor)
-            if queue is not None:
-                queue.close()
-            else:
-                os.close(descriptor)
+            host_os.close_process_exit_watch(descriptor, queue)
 
     def _process_exited(self, key, notify=True):
         self._close_watch(key)
@@ -171,10 +165,8 @@ class HostLogs:
         if current is None:
             return
         try:
-            if current[2] is not None:
-                events = current[2].control(None, 1, 0)
-                if not any(event.fflags & select.KQ_NOTE_EXIT for event in events):
-                    return
+            if not host_os.process_exit_event_ready(current[2]):
+                return
             self._process_exited(key)
         except OSError as error:
             self._close_watch(key)
@@ -190,41 +182,20 @@ class HostLogs:
         queue = None
         descriptor = None
         try:
-            if sys.platform == 'darwin':
-                queue = select.kqueue()
-                descriptor = queue.fileno()
-                event = select.kevent(pid, filter=select.KQ_FILTER_PROC,
-                                      flags=select.KQ_EV_ADD | select.KQ_EV_ONESHOT,
-                                      fflags=select.KQ_NOTE_EXIT)
-                queue.control([event], 0, 0)
-            elif hasattr(os, 'pidfd_open'):
-                descriptor = os.pidfd_open(pid, 0)
-            else:
-                raise OSError(errno.ENOSYS, 'Native process exit notifications are unavailable')
+            descriptor, queue = host_os.open_process_exit_watch(pid)
             loop = asyncio.get_running_loop()
             self.watches[key] = (loop, descriptor, queue)
             self.watch_hosts.setdefault(key[0], set()).add(key)
             loop.add_reader(descriptor, self._exit_ready, key)
-            if sys.platform == 'darwin':
-                value = ownership.Bsd()
-                ownership.C.set_errno(0)
-                size = ownership.C.sizeof(value)
-                length = ownership.backend.load().proc_pidinfo(pid, 13, 1, ownership.C.byref(value), size)
-                if length != size:
-                    raise OSError(ownership.C.get_errno(), 'Cannot verify watched process status')
-                if value.pid != pid:
-                    raise OSError('Watched process identity changed')
-                if value.status == 5:
-                    self._process_exited(key, notify=False)
-                    return False
+            if host_os.watched_process_ended(pid, ownership.backend):
+                self._process_exited(key, notify=False)
+                return False
             return True
         except OSError as error:
             if key in self.watches:
                 self._close_watch(key)
-            elif queue is not None:
-                queue.close()
-            elif descriptor is not None:
-                os.close(descriptor)
+            else:
+                host_os.close_process_exit_watch(descriptor, queue)
             if error.errno == errno.ESRCH:
                 self._process_exited(key, notify=False)
                 return False
@@ -345,13 +316,6 @@ class HostLogs:
             return row, 'receipts'
         return row, None
 
-    def _job_closed(self, worker):
-        job = self.store.task_get(worker['task'])
-        return (job is not None and job['status'] in ('done', 'dropped') and
-                not self.store.db.execute(
-                    "SELECT 1 FROM workers WHERE task=? AND status IN (?,?,?,?)",
-                    (job['id'], *ACTIVE)).fetchone())
-
     def _temp_pending(self, directory, worker):
         if worker is None:
             return False
@@ -374,7 +338,7 @@ class HostLogs:
             worker, reason = self._worker(int(match[1]))
             if reason:
                 return worker, False, reason
-            return worker, self.store.get('close_clears_space', False) is True or self._job_closed(worker), None
+            return worker, True, None
         elif directory.name.startswith('coordinator-'):
             for row in self.store.db.execute("SELECT value FROM settings WHERE substr(key,-5)='_host'"):
                 value = json.loads(row[0])
@@ -451,42 +415,41 @@ class HostLogs:
             return str(relative)
         raise ValueError('Invalid host cleanup retry path')
 
-    def _save_retries(self):
-        self.retry_dirty = True
+    def _clear_key(self, key):
+        if key in self.failing:
+            self.failing.discard(key)
+            sweeps.succeeded(self.store, SWEEP, key)
 
     def _clear_retry(self, path):
-        if self.retry.pop(self._key(path), None) is not None:
-            self._save_retries()
+        self._clear_key(self._key(path))
 
     def _failed(self, path, error):
         key = self._key(path)
         destination = self._key(error.path) if isinstance(error, DeleteFailed) else key
-        attempt = self.retry.pop(key, {}).get('attempt', 0) + 1
-        if attempt < RETRY_LIMIT:
-            self.retry[destination] = {'attempt': attempt, 'due': time() + min(3600, 60 * 2 ** min(attempt - 1, 6))}
-        else:
-            problems.record(self.store, 'hosts', 'log-delete-failed', '%s: %s' % (destination, error),
-                            level=logging.ERROR, every=86400)
-        self._save_retries()
+        if destination != key:
+            self._clear_key(key)
+        sweeps.failed(self.store, SWEEP, destination, error, 'hosts', {})
+        self.failing.add(destination)
+
+    def _waiting(self, path):
+        key = self._key(path)
+        return key in self.failing and sweeps.waiting(self.store, SWEEP, key)
 
     async def _remove(self, path, counts, kept):
         key = self._key(path)
-        if self.retry.get(key, {}).get('due', 0) > time():
+        if self._waiting(path):
             kept['retry_backoff'] += 1
             return
         try:
-            if self.store.get('close_clears_space', False) is True:
-                from .workspaces import _repository_lock
-                async with _repository_lock(self.store.directory, 'closed-copy-deletion'):
-                    await delete(path, self.quarantine, counts, paced=True)
-            else:
-                await delete(path, self.quarantine, counts)
+            from .workspaces import _repository_lock
+            async with _repository_lock(self.store.directory, 'closed-copy-deletion'):
+                await delete(path, self.quarantine, counts, paced=True)
         except OSError as error:
             self._failed(path, error)
             kept['delete_failed'] += 1
             return
-        if (path.parent == self.hosts or path.parent == self.quarantine) and self.retry.pop(key, None) is not None:
-            self._save_retries()
+        if path.parent == self.hosts or path.parent == self.quarantine:
+            self._clear_key(key)
 
     def _remember(self, directories):
         names = []
@@ -645,8 +608,7 @@ class HostLogs:
         if not any((directory / name).exists() or (directory / name).is_symlink()
                    for name in ('events.jsonl', 'writes.jsonl')):
             self._forget_processes(directory)
-            if self.retry.pop(directory.name, None) is not None:
-                self._save_retries()
+            self._clear_key(directory.name)
         kept['worker_temp_pending' if temp_pending else 'stderr_and_resume'] += 1
 
     def _candidates(self, target):
@@ -688,28 +650,29 @@ class HostLogs:
                         if not Path(entry.path).exists() and not Path(entry.path).is_symlink():
                             counts['interrupted'] += 1
             if target and target.get('retry'):
-                for key, entry in list(self.retry.items()):
-                    if entry['due'] <= time():
-                        path = self.hosts / key
-                        try:
-                            if path.parent == self.quarantine:
-                                await self._remove(path, counts, kept)
-                            elif path.exists() or path.is_symlink():
-                                await self._folder(path, counts, kept)
-                            else:
-                                self.retry.pop(key, None)
-                                self._save_retries()
-                        except OSError as error:
-                            self._failed(path, error)
-                            kept['delete_failed'] += 1
-                        except (ValueError, KeyError, TypeError):
+                for (key,) in self.store.db.execute('SELECT item FROM sweep_failures WHERE sweep=? ORDER BY item',
+                                                    (SWEEP,)).fetchall():
+                    path = self.hosts / key
+                    if self._waiting(path):
+                        continue
+                    try:
+                        if path.parent == self.quarantine:
+                            await self._remove(path, counts, kept)
+                        elif path.exists() or path.is_symlink():
+                            await self._folder(path, counts, kept)
+                        else:
                             self._clear_retry(path)
-                            kept['invalid_record'] += 1
-                        await asyncio.sleep(0)
+                    except OSError as error:
+                        self._failed(path, error)
+                        kept['delete_failed'] += 1
+                    except (ValueError, KeyError, TypeError):
+                        self._clear_retry(path)
+                        kept['invalid_record'] += 1
+                    await asyncio.sleep(0)
                 return
             for directory in self._candidates(target or {}):
                 try:
-                    if self.retry.get(self._key(directory), {}).get('due', 0) > time():
+                    if self._waiting(directory):
                         kept['retry_backoff'] += 1
                         await asyncio.sleep(0)
                         continue
@@ -743,10 +706,6 @@ class HostLogs:
         finally:
             if pending:
                 self._remember(pending)
-            if self.retry_dirty:
-                with self.store.db:
-                    self.store.put('host_log_delete_retries', self.retry)
-                self.retry_dirty = False
             logger.info('host logs cleanup folders=%d logs=%d bytes=%d interrupted=%d kept=%s',
                         counts['folders'], counts['logs'], counts['bytes'], counts['interrupted'],
                         json.dumps(kept, sort_keys=True))

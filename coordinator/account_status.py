@@ -3,23 +3,27 @@
 import asyncio
 from datetime import datetime
 import json
+import logging
 import math
 from pathlib import Path
-import subprocess
 import sys
 import time
 
 from . import problems
-from .accounts import AccountBroker, account_label, identity_email, switch_threshold
+from .accounts import PICK_GROUPS, AccountBroker, account_picks, identity_email, switch_threshold
 from . import extension
 
 
+logger = logging.getLogger(__name__)
 REFRESH_SECONDS = 300
 ACTIVE_REFRESH_SECONDS = 60
 REFRESH_RETRY_SECONDS = 30
 REFRESH_RETRY_MAX_SECONDS = 300
 SAME_WINDOW_SECONDS = 300
 USAGE_CACHE_SECONDS = 3600
+SETTLE_SECONDS = 2
+DETACHED_SECONDS = 300
+_detached = {}
 
 
 def identity_label(value):
@@ -30,7 +34,7 @@ def normalize_usage(limits):
     """Native usage percentages are 0–100, not the stream event's 0–1."""
     if not isinstance(limits, dict):
         return {}
-    candidates = {key: limits.get(key) for key in ('five_hour', 'seven_day')}
+    candidates = {key: limits.get(key) for key in ('seven_day',)}
     scoped = limits.get('model_scoped')
     if isinstance(scoped, list):
         for window in scoped:
@@ -55,20 +59,66 @@ def normalize_usage(limits):
     return result
 
 
-async def _stop(process):
+def _role(command):
+    return 'auth-status' if list(command[1:3]) == ['auth', 'status'] else 'print'
+
+
+def detach(process, role, profile=None):
+    """Stop waiting for a native Claude process without a signal: it may be saving a renewed login.
+    It runs on, with its output drained, for at most DETACHED_SECONDS, and only then is it stopped."""
+    logger.info('native process detached pid=%s role=%s cap=%s', process.pid, role, DETACHED_SECONDS)
+    task = asyncio.get_running_loop().create_task(_finish(process, role, time.monotonic()))
+    _detached[task] = profile
+    task.add_done_callback(lambda done: _detached.pop(done, None))
+    return task
+
+
+def detached_profile(profile):
+    return profile is not None and profile in _detached.values()
+
+
+async def _finish(process, role, started):
+    try:
+        await asyncio.wait_for(process.communicate(), DETACHED_SECONDS)
+        logger.info('native process finished after detach pid=%s role=%s exit=%s seconds=%.3f',
+                    process.pid, role, process.returncode, time.monotonic() - started)
+        return
+    except asyncio.TimeoutError:
+        pass
+    await _terminate(process)
+    logger.warning('native process stopped at cap pid=%s role=%s exit=%s seconds=%.3f',
+                   process.pid, role, process.returncode, time.monotonic() - started)
+
+
+async def _terminate(process):
     if process.returncode is None:
         try:
             process.terminate()
         except ProcessLookupError:
             pass
         try:
-            await asyncio.wait_for(process.wait(), 2)
+            await asyncio.wait_for(process.wait(), SETTLE_SECONDS)
         except asyncio.TimeoutError:
             try:
                 process.kill()
             except ProcessLookupError:
                 pass
             await process.wait()
+
+
+async def _stop(process, role, profile=None):
+    """Close the input so the process ends by itself. A process that is still running is detached."""
+    if process.returncode is not None:
+        return
+    if process.stdin is not None:
+        process.stdin.close()
+    try:
+        await asyncio.wait_for(process.wait(), SETTLE_SECONDS)
+    except asyncio.TimeoutError:
+        pass
+    finally:
+        if process.returncode is None:
+            detach(process, role, profile)
 
 
 async def _native(command, env, timeout, request=None, input_data=None):
@@ -101,7 +151,7 @@ async def _native(command, env, timeout, request=None, input_data=None):
                     return response['response']
         return await asyncio.wait_for(read_response(), timeout)
     finally:
-        await _stop(process)
+        await _stop(process, _role(command), AccountBroker.working_directory(env))
 
 
 async def collect_status(account, binary='claude', timeout=20):
@@ -162,13 +212,24 @@ def keep_highest(usage, previous, observed_at=None):
 
 
 def hold_blocked(store, alias, snapshot, previous):
-    """Allow real work to test a low native reading once, remembering a refused reading on the block."""
+    """Allow real work to test a low native reading once, remembering a refused reading on the block.
+    An all-model quota block narrows to Fable when a fresh reading shows only the Fable meter full."""
     broker = AccountBroker(store)
     broker.blocks()
     blocks = dict(store.get('account_blocks', {}))
     block = blocks.get(alias)
     usage = snapshot['usage']
-    before = previous.get('usage') or {}
+    usage = {key: value for key, value in usage.items() if key in ('seven_day', 'seven_day_fable')}
+    before = {key: value for key, value in (previous.get('usage') or {}).items()
+              if key in ('seven_day', 'seven_day_fable')}
+    if block and block.get('reason') == 'quota' and not block.get('released') and not block.get('window'):
+        read = keep_highest(usage, before, previous.get('observed_at'))
+        full = broker.full_windows(alias, {'usage': read})
+        weekly = read.get('seven_day')
+        if ('error' not in snapshot and set(full) == {'seven_day_fable'} and isinstance(weekly, dict)
+                and type(weekly.get('utilization')) in (int, float)):
+            block = blocks[alias] = dict(block, window='seven_day_fable')
+            store.put('account_blocks', blocks)
     if block and block.get('reason') == 'quota' and not block.get('released'):
         if block.get('window'):
             usage = keep_highest(usage, {key: value for key, value in before.items() if key != block['window']},
@@ -177,8 +238,9 @@ def hold_blocked(store, alias, snapshot, previous):
                 if isinstance(window, dict) and type(window.get('utilization')) in (int, float)} | set(usage)
         under_limit = bool(usage) and all(
             isinstance(usage.get(key), dict) and type(usage[key].get('utilization')) in (int, float)
-            and 0 <= usage[key]['utilization'] < switch_threshold(store, alias) * 100 for key in keys)
-        guard = block.get('retry_usage')
+            and 0 <= usage[key]['utilization'] < switch_threshold(store, alias, key) * 100 for key in keys)
+        guard = {key: value for key, value in (block.get('retry_usage') or {}).items()
+                 if key in ('seven_day', 'seven_day_fable')}
         changed = not guard or any(
             key in usage and (usage[key].get('utilization') != window.get('utilization')
                               or (isinstance(usage[key].get('resets_at'), (int, float))
@@ -200,7 +262,9 @@ def hold_blocked(store, alias, snapshot, previous):
     usage = keep_highest(usage, before, previous.get('observed_at'))
     if not block or block.get('released'):
         return usage
-    for key in ('five_hour', 'seven_day', 'seven_day_fable'):
+    for key in ('seven_day', 'seven_day_fable'):
+        if block.get('window') and key != block['window']:
+            continue
         until = block.get('until')
         old = before.get(key) if isinstance(before.get(key), dict) else {}
         window = dict(usage.get(key) or {})
@@ -222,6 +286,9 @@ async def refresh_accounts(store, collect=collect_status, aliases=None):
             continue
         if aliases is not None and alias not in aliases:
             continue
+        if detached_profile(str(account.get('config_dir'))):
+            logger.info('native probe skipped alias=%s: an earlier process still runs', alias)
+            continue
         pick_request = store.get('claude_pick_refresh')
         snapshot = await collect(account)
         if (account.get('awaiting_login') and (snapshot.get('identity') or {}).get('logged_in') is True
@@ -235,9 +302,11 @@ async def refresh_accounts(store, collect=collect_status, aliases=None):
                 snapshot['identity'] = {'logged_in': False}
             snapshots = store.get('account_status', {})
             previous = snapshots.get(alias, {})
+            saved = previous
             trusted_pick = (isinstance(pick_request, dict) and pick_request.get('alias') == alias
                             and store.get('claude_pick_refresh') == pick_request
-                            and store.get('claude_account_pick') == alias
+                            and all(account_picks(store)[group] == alias
+                                    for group in pick_request.get('models') or PICK_GROUPS)
                             and bool(snapshot.get('usage')) and 'error' not in snapshot)
             identity = snapshot.get('identity') or {}
             previous_identity = previous.get('identity') or {}
@@ -250,10 +319,12 @@ async def refresh_accounts(store, collect=collect_status, aliases=None):
                 previous = {}
             if 'usage' in snapshot and not trusted_pick:
                 snapshot['usage'] = hold_blocked(store, alias, snapshot, previous)
-            if 'error' in snapshot and snapshot['error'] != previous.get('error'):
-                problems.record(store, 'accounts', 'status-' + snapshot['error'].replace('_', '-'),
-                                'account=' + account_label(store, alias))
+            pending = problems.account_status(store, 'status-', alias, snapshot, previous, saved)
             snapshots[alias] = {**previous, **snapshot}
+            if pending:
+                snapshots[alias]['login_recovery_pending'] = True
+            else:
+                snapshots[alias].pop('login_recovery_pending', None)
             if 'error' not in snapshot:
                 snapshots[alias].pop('error', None)
             store.put('account_status', snapshots)
@@ -264,7 +335,7 @@ async def refresh_accounts(store, collect=collect_status, aliases=None):
                     blocks.pop(alias, None)
                     store.put('account_blocks', blocks)
                 store.put('claude_pick_refresh', None)
-                router.pick_feedback(pick_request.get('topic'))
+                router.pick_feedback(pick_request)
             router.log_crossings(alias, previous, snapshots[alias])
             if account.get('awaiting_login'):
                 identity = snapshots[alias].get('identity') or {}

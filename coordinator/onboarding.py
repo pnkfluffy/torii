@@ -6,6 +6,7 @@ import logging
 import re
 import subprocess
 
+from . import problems
 from .host_os import move_to_trash, trash_directory
 from .workspaces import ensure_project_commit
 
@@ -16,6 +17,7 @@ COMMAND_MENU = [
         ('accounts', 'Usage, sign-ins, resets, models'),
         ('projects', "Projects, new projects, this topic's folder"),
         ('tldr', 'Catch up on this topic'), ('health', 'Running agents and system load'),
+        ('waiting', 'What is waiting on you'),
         ('secrets', 'Stored keys: rotate, revoke, ask again'),
         ('ping', 'Check that Torii is listening'), ('help', 'All commands'),
     )
@@ -23,11 +25,8 @@ COMMAND_MENU = [
 
 
 def command_menu(store):
-    commands = list(COMMAND_MENU)
-    if store.get('waits_enabled', False) is True:
-        commands.insert(4, {'command': 'waiting', 'description': 'What is waiting on you'})
-    return commands + ([{'command': 'update', 'description': 'Update Torii and agent CLIs'}]
-                       if store.get('telegram_updates_enabled', False) is True else [])
+    return COMMAND_MENU + ([{'command': 'update', 'description': 'Update Torii and agent CLIs'}]
+                           if store.get('telegram_updates_enabled', False) is True else [])
 
 
 PROJECT_STOP_WORDS = frozenset(('a', 'an', 'and', 'are', 'be', 'build', 'can', 'could', 'create', 'do', 'for',
@@ -253,8 +252,7 @@ def _create_folder(store, name, on_created=None):
         stderr = getattr(error, 'stderr', '') or ''
         if isinstance(stderr, bytes):
             stderr = stderr.decode('utf-8', errors='replace')
-        logging.getLogger(__name__).error('project Git setup failed path=%s stderr=%s error=%s',
-                                         path, stderr, error)
+        problems.record(store, 'projects', 'git-setup-failed', stderr or type(error).__name__, level=logging.ERROR, every=3600)
         detail = (stderr.strip() or str(error)).splitlines()[0][:300]
         cleanup = f'The project folder was left at {path}. Check its contents before retrying.'
         try:
@@ -266,8 +264,8 @@ def _create_folder(store, name, on_created=None):
                     and (not entries or (entries == [git_dir] and git_dir.is_dir() and not git_dir.is_symlink()))):
                 move_to_trash(path, trash_directory())
                 cleanup = 'The new folder was moved to Trash. Retry with the same project name.'
-        except OSError:
-            logging.getLogger(__name__).exception('project Git failure cleanup failed path=%s', path)
+        except OSError as error:
+            problems.record(store, 'projects', 'git-cleanup-failed', type(error).__name__, level=logging.ERROR, every=3600)
         return f'Git setup failed: {detail}\n{cleanup}'
     if not store.get('projects_root'):
         store.put('projects_root', str(root))

@@ -1,271 +1,37 @@
 """Run-scoped Darwin coalitions and identity-checked process cleanup."""
 
-import asyncio
-import ctypes as C
 from dataclasses import dataclass, replace
 import errno
 import json
 import os
 from pathlib import Path
 import plistlib
-import select as polling
 import signal
-import subprocess
-import sys
-import time
+
+from . import host_os
+from .host_os import DarwinBackend
 
 
 LABEL_PREFIX = 'local.torii-host.'
 FREEZE_ROUNDS = 16
 STOP_TIMEOUT = 5
-GROUP_MEMBER_LIMIT = 4096
-PROCESS_SCAN_LIMIT = 65536
-PROCESS_SCAN_CHUNK = 64
 
 
 class OwnershipUnavailable(RuntimeError):
     pass
 
 
-class Unique(C.Structure):
-    _fields_ = [('uuid', C.c_ubyte * 16), ('unique', C.c_uint64),
-                ('parent_unique', C.c_uint64), ('version', C.c_int32),
-                ('parent_version', C.c_int32), ('reserved', C.c_uint64 * 2)]
-
-
-class Coalition(C.Structure):
-    _fields_ = [('ids', C.c_uint64 * 2), ('reserved', C.c_uint64 * 3)]
-
-
-class Bsd(C.Structure):
-    _fields_ = [('pid', C.c_uint32), ('ppid', C.c_uint32), ('pgid', C.c_uint32),
-                ('status', C.c_uint32), ('comm', C.c_char * 16), ('flags', C.c_uint32),
-                ('uid', C.c_uint32), ('gid', C.c_uint32), ('ruid', C.c_uint32),
-                ('rgid', C.c_uint32), ('svuid', C.c_uint32), ('svgid', C.c_uint32),
-                ('reserved', C.c_uint32)]
-
-
-@dataclass(frozen=True)
-class Process:
-    pid: int
-    unique: int
-    version: int
-    resource: int
-    jetsam: int
-    uid: int
-    gid: int = 0
-
-
-class DarwinBackend:
-    def __init__(self):
-        self._lib = None
-
-    def load(self):
-        if sys.platform != 'darwin':
-            raise OSError('Darwin process ownership is unavailable')
-        if self._lib is None:
-            lib = C.CDLL(None, use_errno=True)
-            lib.proc_pidinfo.argtypes = [C.c_int, C.c_int, C.c_uint64, C.c_void_p, C.c_int]
-            lib.proc_pidinfo.restype = C.c_int
-            lib.proc_listpids.argtypes = [C.c_uint32, C.c_uint32, C.c_void_p, C.c_int]
-            lib.proc_listpids.restype = C.c_int
-            lib.proc_signal_with_audittoken.argtypes = [C.c_void_p, C.c_int]
-            lib.proc_signal_with_audittoken.restype = C.c_int
-            lib.sysctlbyname.argtypes = [C.c_char_p, C.c_void_p, C.POINTER(C.c_size_t),
-                                         C.c_void_p, C.c_size_t]
-            lib.sysctlbyname.restype = C.c_int
-            self._lib = lib
-        return self._lib
-
-    def uid(self):
-        return os.getuid()
-
-    def pid(self):
-        return os.getpid()
-
-    def boot(self):
-        value = C.create_string_buffer(128)
-        size = C.c_size_t(len(value))
-        if self.load().sysctlbyname(b'kern.bootsessionuuid', value, C.byref(size), None, 0):
-            raise OSError(C.get_errno(), 'Cannot read boot identity')
-        result = value.value.decode('ascii')
-        if not result:
-            raise OSError('Empty boot identity')
-        return result
-
-    def metadata(self, pid):
-        lib = self.load()
-        unique, coalition, bsd, again = Unique(), Coalition(), Bsd(), Unique()
-        for flavor, value in ((17, unique), (20, coalition), (13, bsd), (17, again)):
-            C.set_errno(0)
-            length = lib.proc_pidinfo(pid, flavor, 0, C.byref(value), C.sizeof(value))
-            if length != C.sizeof(value):
-                code = C.get_errno()
-                if code == errno.ESRCH:
-                    return None
-                raise OSError(code, 'Cannot read process identity')
-        if (unique.unique, unique.version) != (again.unique, again.version):
-            raise OSError('Process identity changed during scan')
-        return Process(pid, unique.unique, unique.version, coalition.ids[0], coalition.ids[1],
-                       bsd.uid, bsd.gid)
-
-    def processes(self):
-        lib = self.load()
-        capacity = 4096
-        while capacity <= 1048576:
-            buf = (C.c_int * capacity)()
-            length = lib.proc_listpids(4, self.uid(), buf, C.sizeof(buf))
-            if length <= 0:
-                raise OSError(C.get_errno(), 'Cannot enumerate processes')
-            if length < C.sizeof(buf):
-                return [info for pid in buf[:length // C.sizeof(C.c_int)] if pid > 0
-                        for info in [self.metadata(pid)] if info is not None]
-            capacity *= 2
-        raise OSError('Process enumeration exceeded its bound')
-
-    def signal(self, process, number):
-        token = (C.c_uint32 * 8)(process.uid, process.uid, process.gid, process.uid,
-                                process.gid, process.pid, 0, process.version)
-        return self.load().proc_signal_with_audittoken(C.byref(token), number)
-
-    def clock(self):
-        return time.monotonic()
-
-    def sleep(self, duration):
-        time.sleep(duration)
-
-    def _launchctl(self, *args):
-        return subprocess.run(['/bin/launchctl', *args], env={'PATH': '/usr/bin:/bin:/usr/sbin:/sbin'},
-                              stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                              stderr=subprocess.PIPE, timeout=15, text=True)
-
-    def bootstrap(self, path):
-        try:
-            result = self._launchctl('bootstrap', 'gui/' + str(self.uid()), str(path))
-        except subprocess.TimeoutExpired as error:
-            raise OSError('Worker host launchd bootstrap timed out') from error
-        if result.returncode:
-            raise OSError('Worker host launchd bootstrap failed (%s)' % result.returncode)
-
-    def job_state(self, label):
-        try:
-            result = self._launchctl('print', 'gui/%s/%s' % (self.uid(), label))
-        except subprocess.TimeoutExpired:
-            return 'missing'
-        if result.returncode:
-            return 'missing'
-        lines = [line.strip() for line in result.stdout.splitlines()]
-        if any(line.startswith('pid = ') for line in lines):
-            return 'running'
-        if any(line.startswith('last terminating signal = ') or
-               (line.startswith('last exit code = ') and line != 'last exit code = (never exited)')
-               for line in lines):
-            return 'exited'
-        return 'pending'
-
-    def bootout(self, label):
-        try:
-            result = self._launchctl('bootout', 'gui/%s/%s' % (self.uid(), label))
-            if result.returncode and not self._launchctl('print', 'gui/%s/%s' % (self.uid(), label)).returncode:
-                raise OSError('Worker host launchd bootout failed (%s)' % result.returncode)
-        except subprocess.TimeoutExpired as error:
-            raise OSError('Worker host launchd bootout timed out') from error
-
-
 backend = DarwinBackend()
-
-
-def _proc_stat(pid):
-    value = (Path('/proc') / str(pid) / 'stat').read_text()
-    prefix, separator, fields = value.rpartition(')')
-    fields = fields.split()
-    if not separator or int(prefix.split('(', 1)[0]) != pid or len(fields) < 20:
-        raise OSError('Invalid process group metadata')
-    return fields[0], int(fields[2]), int(fields[19])
-
-
-def _linux_group_member(pid, pgid):
-    try:
-        state, group, started = _proc_stat(pid)
-    except (FileNotFoundError, ProcessLookupError):
-        return None
-    if group != pgid:
-        return None
-    ended = False
-    if state in ('Z', 'X', 'x'):
-        if not hasattr(os, 'pidfd_open'):
-            raise OSError(errno.ENOSYS, 'Process termination proof is unavailable')
-        descriptor = os.pidfd_open(pid, 0)
-        try:
-            ended = bool(polling.select((descriptor,), (), (), 0)[0])
-            again = _proc_stat(pid)
-            if again[1:] != (group, started):
-                raise OSError('Process group identity changed during scan')
-            ended = ended and again[0] in ('Z', 'X', 'x')
-        finally:
-            os.close(descriptor)
-    return (pid, ('linux', started)), ended
-
-
-async def _group_snapshot(pgid):
-    result = {}
-    if sys.platform == 'darwin':
-        lib = backend.load()
-        buf = (C.c_int * (GROUP_MEMBER_LIMIT + 1))()
-        C.set_errno(0)
-        length = lib.proc_listpids(2, pgid, buf, C.sizeof(buf))
-        if length < 0 or (not length and C.get_errno()) or length % C.sizeof(C.c_int):
-            raise OSError(C.get_errno(), 'Cannot enumerate process group')
-        if length >= C.sizeof(buf):
-            raise OSError('Process group enumeration exceeded its bound')
-        for index, pid in enumerate(buf[:length // C.sizeof(C.c_int)]):
-            if index % PROCESS_SCAN_CHUNK == 0:
-                await asyncio.sleep(0)
-            if pid <= 0:
-                continue
-            before, value, after = Unique(), Bsd(), Unique()
-            for flavor, item in ((17, before), (13, value), (17, after)):
-                C.set_errno(0)
-                size = C.sizeof(item)
-                if lib.proc_pidinfo(pid, flavor, 1, C.byref(item), size) != size:
-                    code = C.get_errno()
-                    if code == errno.ESRCH:
-                        raise OSError(errno.EAGAIN, 'Process disappeared during group scan')
-                    raise OSError(code, 'Cannot read process group identity')
-            if (before.unique, before.version) != (after.unique, after.version) or value.pid != pid:
-                raise OSError('Process group identity changed during scan')
-            if value.pgid == pgid:
-                result[(pid, ('darwin', before.unique, before.version))] = value.status == 5
-    elif sys.platform.startswith('linux'):
-        with os.scandir('/proc') as entries:
-            for index, entry in enumerate(entries):
-                if index >= PROCESS_SCAN_LIMIT:
-                    raise OSError('Process enumeration exceeded its bound')
-                if index % PROCESS_SCAN_CHUNK == 0:
-                    await asyncio.sleep(0)
-                if not entry.name.isdecimal():
-                    continue
-                try:
-                    member = _linux_group_member(int(entry.name), pgid)
-                except (FileNotFoundError, ProcessLookupError) as error:
-                    raise OSError(errno.EAGAIN, 'Process disappeared during group scan') from error
-                if member is not None:
-                    result[member[0]] = member[1]
-                    if len(result) > GROUP_MEMBER_LIMIT:
-                        raise OSError('Process group enumeration exceeded its bound')
-    else:
-        raise OSError(errno.ENOSYS, 'Process group enumeration is unavailable')
-    return result
 
 
 async def group_members(pgid):
     if not isinstance(pgid, int) or isinstance(pgid, bool) or pgid <= 1:
         raise OSError('Invalid process group identity')
     try:
-        before = await _group_snapshot(pgid)
-        after = await _group_snapshot(pgid)
+        before = await host_os.group_snapshot(pgid, backend)
+        after = await host_os.group_snapshot(pgid, backend)
         if not any(not ended for ended in after.values()) and not all(before.values()):
-            before, after = after, await _group_snapshot(pgid)
+            before, after = after, await host_os.group_snapshot(pgid, backend)
     except (ValueError, IndexError) as error:
         raise OSError('Invalid process group metadata') from error
     members = tuple(sorted(key for key, ended in after.items() if not ended))
@@ -276,13 +42,7 @@ async def group_members(pgid):
 
 
 def supported():
-    if sys.platform != 'darwin':
-        return False
-    try:
-        backend.load()
-        return True
-    except (OSError, AttributeError):
-        return False
+    return host_os.coalitions_available(backend)
 
 
 def write(path, value):

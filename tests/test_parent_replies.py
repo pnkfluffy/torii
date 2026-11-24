@@ -6,7 +6,7 @@ import sqlite3
 import unittest
 from unittest.mock import AsyncMock
 
-from coordinator import control_api, control_ui, reactions
+from coordinator import control_api, control_ui, mcp, reactions
 from coordinator.formatting import markdown_to_html
 from coordinator.providers import ProviderRunner
 from coordinator.reactions import deliver_reaction, set_desired
@@ -46,8 +46,19 @@ class ParentCase:
 
     def row(self, text='Owner asks', kind='owner'):
         number = self.store.db.execute('SELECT COALESCE(MAX(id),0)+1 FROM messages').fetchone()[0]
+        if kind == 'worker_result':
+            text = json.dumps({'worker': 1, 'text': text})
         return self.store.message_save(self.topic, kind, text,
                                        telegram_message=100 + number if kind == 'owner' else None)
+
+    def coordinator_send(self, text, reply_to=None, store=None):
+        arguments = {'topic': self.topic, 'text': text}
+        if reply_to is not None:
+            arguments['reply_to'] = reply_to
+        result = mcp.dispatch(store or self.store, {'method': 'tools/call', 'params': {
+            'name': 'telegram_send', 'arguments': arguments}}, topic=self.topic)
+        if result['isError']:
+            raise AssertionError(result)
 
     def output(self):
         return [dict(row) for row in self.store.db.execute(
@@ -91,7 +102,7 @@ class ParentCase:
 
 class ParentReplyTests(unittest.IsolatedAsyncioTestCase):
     @asynccontextmanager
-    async def case(self, provider, tools=False, codex_hold_started=False):
+    async def case(self, provider, tools=False, codex_hold_started=False, claude_steer=False):
         classes = {'opencode': test_opencode_parent.OpenCodeParentTests,
                    'claude': test_parent_turns.ParentTurnTests,
                    'codex': test_codex_parent.CodexParentTests}
@@ -133,6 +144,8 @@ class ParentReplyTests(unittest.IsolatedAsyncioTestCase):
                     "    emit({'type':'result','subtype':'error' if answer.get('error') else 'success','is_error':answer.get('error',False),'result':answer['text']})"])
                 binary.write_text(test_parent_turns.FAKE.replace(old, new).replace(
                     "if text=='bg-work':", "if 'bg-work' in text:"))
+                if claude_steer:
+                    binary.write_text(binary.read_text().replace(new, "    if 'Background hold' in text:\n        continue\n" + new))
             else:
                 source = test_codex_parent.APP_SERVER.replace('    global turn\n', "\n".join([
                     '    global turn',
@@ -140,6 +153,7 @@ class ParentReplyTests(unittest.IsolatedAsyncioTestCase):
                     "        time.sleep(.01)",
                     "    answer=json.loads((root/'forward-response.json').read_text())", '']))
                 source = source.replace("'text':'done'", "'text':answer['text']", 1)
+                source = source.replace("if text.endswith('hold') and not", "if (text.endswith('hold') or 'Background hold' in text) and not", 1)
                 source = source.replace("'status':'completed'", "'status':'failed' if answer.get('error') else 'completed'", 1)
                 if codex_hold_started:
                     marker = "\n            emit({'method':'turn/started','params':{'threadId':thread,'turn':{'id':turn}}})"
@@ -255,7 +269,6 @@ class ParentReplyTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(kind=kind, card=card):
                 async with self.case('codex') as case:
                     with case.store.db:
-                        case.store.put('waits_enabled', True)
                         case.store.db.execute("INSERT INTO topics(id,chat,thread,name,cwd,enabled) "
                                               "VALUES ('other',1,9,'Other',?,1)", (str(case.fixture.root),))
                     await case.send(case.row('Background hold', kind))
@@ -284,8 +297,7 @@ class ParentReplyTests(unittest.IsolatedAsyncioTestCase):
                     await case.send(owner)
                     await until(lambda: case.store.db.execute(
                         'SELECT turn_started FROM messages WHERE id=?', (owner['id'],)).fetchone()[0] is not None)
-                    with case.store.db:
-                        control_api.op_telegram_send(case.store, None, case.topic, 'Sent with tool', reply_to=owner['id'])
+                    case.coordinator_send('Sent with tool', reply_to=owner['id'])
                     await case.finish('Do not duplicate this')
                     self.assertEqual([(row['text'], row['reply_to']) for row in case.output()],
                                      [('Sent with tool', owner['telegram_message'])])
@@ -294,6 +306,31 @@ class ParentReplyTests(unittest.IsolatedAsyncioTestCase):
                     await case.send(next_owner)
                     await case.finish()
                     self.assertEqual([row['text'] for row in case.output()], ['Sent with tool', 'Final answer'])
+
+    async def test_report_from_another_sender_during_owner_turn_does_not_suppress_reply(self):
+        for provider in PROVIDERS:
+            for sender in ('cli', 'other chat'):
+                with self.subTest(provider=provider, sender=sender):
+                    async with self.case(provider) as case:
+                        with case.store.db:
+                            case.store.db.execute("INSERT OR IGNORE INTO topics(id,chat,thread,name,cwd,enabled) "
+                                                  "VALUES ('other',1,9,'Other',?,1)", (str(case.fixture.root),))
+                        owner = case.row()
+                        await case.send(owner)
+                        await until(lambda: case.store.db.execute(
+                            'SELECT turn_started FROM messages WHERE id=?', (owner['id'],)).fetchone()[0] is not None)
+                        if sender == 'cli':
+                            result = control_api.call(case.store, 'telegram.send', {'topic': case.topic, 'text': 'CI alert'})
+                            self.assertTrue(result.ok, result.text)
+                        else:
+                            result = mcp.dispatch(case.store, {'method': 'tools/call', 'params': {
+                                'name': 'telegram_send', 'arguments': {'topic': case.topic, 'text': 'CI alert'}}},
+                                topic='other')
+                            self.assertFalse(result['isError'], result)
+                        await case.finish('Final answer')
+                        self.assertEqual([(row['text'], row['kind'], row['reply_to']) for row in case.output()],
+                                         [('CI alert', 'report', None),
+                                          ('Final answer', 'parent-reply', owner['telegram_message'])])
 
     async def test_restart_before_completion_then_replay_after_commit_forwards_once(self):
         for provider in PROVIDERS:
@@ -451,8 +488,7 @@ class ParentReplyTests(unittest.IsolatedAsyncioTestCase):
             await case.finish('')
             await case.next_turn()
             await case.send(case.row('Worker finished X', 'worker_result'))
-            with case.store.db:
-                control_api.op_telegram_send(case.store, None, case.topic, 'X is built.')
+            case.coordinator_send('X is built.')
             case.store.task_update(task['id'], status='done')
             await case.finish('Reported.')
             while await case.service.deliver_once():
@@ -495,9 +531,7 @@ class ParentReplyTests(unittest.IsolatedAsyncioTestCase):
             (case.fixture.root / 'started-go').touch()
             other = Store(case.store.directory)
             try:
-                with other.db:
-                    control_api.op_telegram_send(other, None, case.topic, 'Parent reply via telegram_send',
-                                                 reply_to=owner['id'])
+                case.coordinator_send('Parent reply via telegram_send', reply_to=owner['id'], store=other)
             finally:
                 other.close()
             case.store.messages_uncertain()
@@ -547,19 +581,59 @@ class ParentReplyTests(unittest.IsolatedAsyncioTestCase):
             states = case.store.db.execute("SELECT reaction_desired FROM messages WHERE kind='owner' ORDER BY id").fetchall()
             self.assertEqual([row[0] for row in states], ['👌', '👌'])
 
-    async def test_codex_send_before_owner_steers_into_the_turn_suppresses_forward(self):
-        async with self.case('codex') as case:
-            owner = case.row()
-            await case.send(owner)
-            await case.finish()
-            await self.assert_forward(case, owner)
-            await case.next_turn()
-            await case.send(case.row('Background hold', 'event'))
-            with case.store.db:
-                control_api.op_telegram_send(case.store, None, case.topic, 'Already sent during this turn')
-            await case.send(case.row('Owner joins the running turn'))
-            await case.finish('Do not forward')
-            self.assertEqual([row['text'] for row in case.output()], ['Final answer', 'Already sent during this turn'])
+    async def test_owner_joins_event_turn_and_receives_final_answer(self):
+        for provider in ('claude', 'codex'):
+            with self.subTest(provider=provider):
+                async with self.case(provider, claude_steer=True) as case:
+                    await case.send(case.row('Background hold', 'event'))
+                    owner = case.row('Owner joins the running turn')
+                    await case.send(owner)
+                    await case.finish()
+                    await self.assert_forward(case, owner)
+
+    async def test_owner_joins_after_earlier_send_receives_final_answer(self):
+        for provider in ('claude', 'codex'):
+            with self.subTest(provider=provider):
+                async with self.case(provider, claude_steer=True) as case:
+                    await case.send(case.row('Background hold', 'event'))
+                    case.coordinator_send('Earlier update')
+                    owner = case.row('Owner joins after the update')
+                    await case.send(owner)
+                    await case.finish('Answer to owner')
+                    self.assertEqual([(row['text'], row['reply_to']) for row in case.output()],
+                                     [('Earlier update', None), ('Answer to owner', owner['telegram_message'])])
+
+    async def test_event_turn_does_not_forward_after_owner_and_explicit_send(self):
+        for provider in ('claude', 'codex'):
+            with self.subTest(provider=provider):
+                async with self.case(provider, claude_steer=True) as case:
+                    await case.send(case.row('Background hold', 'event'))
+                    owner = case.row('Owner joins')
+                    await case.send(owner)
+                    case.coordinator_send('Update')
+                    await case.finish('Final answer')
+                    self.assertEqual([(row['text'], row['reply_to']) for row in case.output()],
+                                     [('Update', None)])
+
+    async def test_event_turn_initial_settings_clear_after_error_or_stop(self):
+        for provider in ('claude', 'codex'):
+            for action in ('error', 'stop'):
+                with self.subTest(provider=provider, action=action):
+                    async with self.case(provider, claude_steer=True) as case:
+                        await case.send(case.row('Background hold', 'event'))
+                        keys = lambda: case.store.db.execute("SELECT key FROM settings WHERE key LIKE 'parent_reply_initial:%'").fetchall()
+                        await until(lambda: bool(keys()))
+                        await case.send(case.row('Owner joins'))
+                        if action == 'stop':
+                            await case.session.stop()
+                        elif provider == 'claude':
+                            case.response.write_text(json.dumps({'text': 'Failed', 'chunks': [], 'error': True}))
+                            case.release.touch()
+                            await until(lambda: not keys())
+                        else:
+                            turn = next(iter(case.session._turn_messages), None) or case.session.protocol.turn_id
+                            case.session._apply_event({'type': 'turn.failed', 'turn_id': turn, 'error': {}})
+                        self.assertEqual(keys(), [])
 
     async def test_group_migration_preserves_forward_delivery_and_reactions(self):
         async with self.case('opencode') as case:

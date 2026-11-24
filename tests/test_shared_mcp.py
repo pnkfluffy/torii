@@ -9,7 +9,17 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import AsyncMock, patch
 
-from coordinator.shared_mcp import read_entries, write_config
+from coordinator.shared_mcp import read_entries as _read_entries, write_config as _write_config
+
+
+def read_entries(store, *args, **kwargs):
+    kwargs.setdefault('topic', '1:2')
+    return _read_entries(store, *args, **kwargs)
+
+
+def write_config(store, *args, **kwargs):
+    kwargs.setdefault('topic', '1:2')
+    return _write_config(store, *args, **kwargs)
 from coordinator.providers import ProviderRunner
 from coordinator.store import Store
 from tests.support import stop_test_hosts
@@ -25,18 +35,17 @@ class SharedMcpConfigTests(unittest.TestCase):
         self.environment = patch.dict(os.environ, {'HOME': str(self.home)})
         self.environment.start()
         self.addCleanup(self.environment.stop)
-        self.overrides = self.root / 'local-overrides.json'
-        self.overrides.write_text(json.dumps({'shared_mcp_servers': ['example-mcp', 'other-mcp']}))
-        selection = patch('coordinator.accounts.LOCAL_OVERRIDES_PATH', self.overrides)
-        selection.start()
-        self.addCleanup(selection.stop)
         self.store = Store(self.root / 'state')
+        self.select(['example-mcp', 'other-mcp'])
         self.addCleanup(self.store.close)
         self.value = 'FAKE-SHARED-MCP-HEADER-VALUE'
         self.work = {'type': 'http', 'url': 'http://127.0.0.1:1/work',
                      'headers': {'Authorization': self.value}}
         self.personal = {'type': 'http', 'url': 'http://127.0.0.1:1/personal',
                          'headers': {'Authorization': self.value}}
+
+    def select(self, names):
+        self.store.put('chat_config:1:2', {'mcp_servers': names})
 
     def source(self, servers):
         (self.home / '.claude.json').write_text(json.dumps({'mcpServers': servers}))
@@ -71,8 +80,7 @@ class SharedMcpConfigTests(unittest.TestCase):
         self.assertEqual(self.problems(), [])
 
     def test_reserved_names_are_skipped_once_before_entry_validation(self):
-        self.overrides.write_text(json.dumps({
-            'shared_mcp_servers': ['torii', 'example-mcp', 'torii', 'other-mcp']}))
+        self.select(['torii', 'example-mcp', 'torii', 'other-mcp'])
         self.source({'torii': {'type': 'stdio'},
                      'example-mcp': self.work, 'other-mcp': self.personal})
         self.assertEqual(read_entries(self.store, reserved_names=('torii',)),
@@ -81,8 +89,7 @@ class SharedMcpConfigTests(unittest.TestCase):
                          [('shared-mcp', 'entry-reserved', 'entry=torii')])
 
     def test_reserved_names_match_case_sensitively(self):
-        self.overrides.write_text(json.dumps({
-            'shared_mcp_servers': ['torii', 'Torii', 'TORII']}))
+        self.select(['torii', 'Torii', 'TORII'])
         self.source({'torii': self.work, 'Torii': self.personal, 'TORII': self.work})
         self.assertEqual(read_entries(self.store, reserved_names=('torii',)),
                          {'Torii': self.personal, 'TORII': self.work})
@@ -90,37 +97,36 @@ class SharedMcpConfigTests(unittest.TestCase):
                          [('shared-mcp', 'entry-reserved', 'entry=torii')])
 
     def test_default_selection_and_config_keep_torii(self):
-        self.overrides.write_text(json.dumps({
-            'shared_mcp_servers': ['torii', 'example-mcp']}))
+        self.select(['torii', 'example-mcp'])
         self.source({'torii': self.personal, 'example-mcp': self.work})
-        self.assertEqual(read_entries(self.store),
+        self.assertEqual(read_entries(self.store, reserved_names=()),
                          {'torii': self.personal, 'example-mcp': self.work})
         path = write_config(self.store)
-        self.assertEqual(json.loads(path.read_text()),
-                         {'mcpServers': {'torii': self.personal, 'example-mcp': self.work}})
-        self.assertEqual(self.problems(), [])
+        self.assertEqual(json.loads(path.read_text()), {'mcpServers': {'example-mcp': self.work}})
+        self.assertEqual(self.problems(), [('shared-mcp', 'entry-reserved', 'entry=torii')])
 
     def test_default_none_does_not_read_source_or_record_problems(self):
-        self.overrides.write_text('{}')
+        self.select([])
         with patch('coordinator.shared_mcp.Path.home', side_effect=AssertionError('source read')):
             self.assertIsNone(write_config(self.store))
-        self.overrides.rename(self.root / 'saved-overrides.json')
         self.assertIsNone(write_config(self.store))
         self.assertEqual(self.problems(), [])
 
     def test_empty_and_invalid_selection(self):
         for names in (None, 'example-mcp', [3], ['']):
-            self.overrides.write_text(json.dumps({'shared_mcp_servers': names}))
+            self.select(names)
             self.assertIsNone(write_config(self.store))
         self.assertEqual([row[:2] for row in self.problems()],
                          [('shared-mcp', 'selection-invalid')] * 4)
-        self.overrides.write_text(json.dumps({'shared_mcp_servers': []}))
+        self.select([])
         self.assertIsNone(write_config(self.store))
 
     def test_concurrent_writes_use_unique_temporary_files(self):
         self.source({'example-mcp': self.work, 'other-mcp': self.personal})
-        with ThreadPoolExecutor(max_workers=8) as pool:
-            paths = list(pool.map(lambda _: write_config(self.store), range(16)))
+        entries = read_entries(self.store)
+        with patch('coordinator.shared_mcp.read_entries', return_value=entries):
+            with ThreadPoolExecutor(max_workers=8) as pool:
+                paths = list(pool.map(lambda _: write_config(self.store), range(16)))
         self.assertEqual(set(paths), {paths[0]})
         self.assertEqual(json.loads(paths[0].read_text()),
                          {'mcpServers': {'example-mcp': self.work, 'other-mcp': self.personal}})
@@ -195,12 +201,8 @@ class SharedMcpLaunchRaceTests(unittest.IsolatedAsyncioTestCase):
         environment = patch.dict(os.environ, {'HOME': str(self.home)})
         environment.start()
         self.addCleanup(environment.stop)
-        overrides = self.root / 'local-overrides.json'
-        overrides.write_text(json.dumps({'shared_mcp_servers': ['example-mcp', 'other-mcp']}))
-        selection = patch('coordinator.accounts.LOCAL_OVERRIDES_PATH', overrides)
-        selection.start()
-        self.addCleanup(selection.stop)
         self.store = Store(self.root / 'state')
+        self.store.put('chat_config:1:2', {'mcp_servers': ['example-mcp', 'other-mcp']})
         self.addCleanup(self.store.close)
         self.binary = self.root / 'fake-claude'
         self.binary.write_text('''#!/usr/bin/env python3
@@ -251,12 +253,12 @@ print(json.dumps({'type':'result','subtype':'success','session_id':sid,
                     runner._environment = lambda *args: {'PATH': os.environ['PATH'], 'HOME': str(self.home)}
                 first_runner.launch_secrets = delayed
                 first = asyncio.create_task(first_runner.run(
-                    'claude', 'hello', self.root, None, fresh=True, host_id='first-' + label))
+                    'claude', 'hello', self.root, None, fresh=True, host_id='first-' + label, topic='1:2'))
                 try:
                     await asyncio.wait_for(ready.wait(), 5)
                     source.write_text(json.dumps({'mcpServers': second_entries}))
                     second = await second_runner.run(
-                        'claude', 'hello', self.root, None, fresh=True, host_id='second-' + label)
+                        'claude', 'hello', self.root, None, fresh=True, host_id='second-' + label, topic='1:2')
                     release.set()
                     result = await first
                     self.assertTrue(second.success, second.error)

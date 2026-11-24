@@ -13,6 +13,25 @@ from .native_protocol import RunControl, steer_wire
 INITIALIZE = {'protocolVersion': 1,
               'clientCapabilities': {'fs': {'readTextFile': False, 'writeTextFile': False}, 'terminal': False},
               'clientInfo': {'name': 'torii', 'version': '1'}}
+CONTINUATIONS = 3
+REDACTED = '[redacted]'
+
+
+def journal_form(event):
+    """The event as the host journal keeps it: MCP server header values and URLs are redacted."""
+    params = event.get('params')
+    servers = params.get('mcpServers') if isinstance(params, dict) else None
+    if not isinstance(servers, list) or not any(isinstance(server, dict) and 'url' in server for server in servers):
+        return event
+    redacted = []
+    for server in servers:
+        if isinstance(server, dict) and 'url' in server:
+            server = dict(server, url=REDACTED)
+            if isinstance(server.get('headers'), list):
+                server['headers'] = [dict(header, value=REDACTED) if isinstance(header, dict) else header
+                                     for header in server['headers']]
+        redacted.append(server)
+    return {**event, 'params': {**params, 'mcpServers': redacted}}
 
 
 def tool_name(update):
@@ -52,6 +71,14 @@ class AcpAdapter:
     latest value. The adapter maps session cost to the current run's estimate.
     queued_receipt opts into queued receipts and journaled delivery ids.
     The default keeps uncertain receipts for adapters that do not opt in.
+    resume_method names the request that reopens a saved session.
+    session_ready(protocol, response, model, options) runs after the session exists and
+    before the first prompt. It can send requests or call protocol.complete.
+    steer_prompt writes a steer as a new prompt at once. The agent ends the running
+    prompt early; its result adds usage and does not end the run. A stopped prompt's
+    result also adds usage.
+    continue_prompt(session_id) runs when a turn ends with nothing queued. It returns the
+    text of one more prompt, or None to end the run. A run sends at most CONTINUATIONS of them.
     """
 
     argv: Callable[..., list]
@@ -66,6 +93,10 @@ class AcpAdapter:
     queued_receipt: str = 'uncertain'
     allow_version_change_on_reattach: bool = False
     before_prompt: Optional[Callable[[str], None]] = None
+    resume_method: str = 'session/load'
+    session_ready: Optional[Callable[['AcpProtocol', dict, Optional[str], dict], Awaitable[None]]] = None
+    steer_prompt: bool = False
+    continue_prompt: Optional[Callable[[str], Optional[str]]] = None
 
 
 class AcpState(Enum):
@@ -87,7 +118,7 @@ class AcpRequestError(Exception):
 class AcpProtocol:
     def __init__(self, adapter, process, control: RunControl, session_id, observe_session,
                  reattaching=False, text_limit=200000, cancel_grace=1, mcp_servers=(), persistent=False,
-                 on_prompt=None, separate_prompt=None):
+                 on_prompt=None, separate_prompt=None, session_meta=None):
         if text_limit is not None and text_limit < 1:
             raise ValueError('ACP text limit must be positive')
         self.adapter = adapter
@@ -98,6 +129,7 @@ class AcpProtocol:
         self.text_limit = text_limit
         self.cancel_grace = cancel_grace
         self.mcp_servers = list(mcp_servers)
+        self.session_meta = session_meta
         self.persistent = persistent
         self.on_prompt = on_prompt
         self.separate_prompt = separate_prompt
@@ -112,7 +144,6 @@ class AcpProtocol:
         self.queued = []
         self._queued_ready = asyncio.Event()
         self._prompt_written = asyncio.Event()
-        self.prompt_sent = False
         self._prompt_messages = ()
         self._completed_prompts = set()
         self.write_lock = asyncio.Lock()
@@ -126,7 +157,8 @@ class AcpProtocol:
                     self._replay.append(event)
         self._starting = True
         self._new_id = next((event['id'] for event in self._replay if event['method'] == 'session/new'), None)
-        self._load_id = next((event['id'] for event in self._replay if event['method'] == 'session/load'), None)
+        self._load_id = next((event['id'] for event in self._replay
+                              if event['method'] == adapter.resume_method), None)
         self._loading = self._load_id is not None
         self._usage_update = None
         self._prompt_future = None
@@ -136,6 +168,7 @@ class AcpProtocol:
         self._stop_task = None
         self._tasks = set()
         self._answering = set()
+        self._steer_ready = asyncio.Event()
         self.input_closed = asyncio.create_task(self.wait_input_closed())
 
     @property
@@ -152,6 +185,11 @@ class AcpProtocol:
         async with self.write_lock:
             if self.closed:
                 raise BrokenPipeError()
+            journal = journal_form(event)
+            if journal is not event:
+                await self.process.stdin.redacted(json.dumps({**event, 'jsonrpc': '2.0'}),
+                                                  json.dumps({**journal, 'jsonrpc': '2.0'}))
+                return
             self.process.stdin.write((json.dumps({**event, 'jsonrpc': '2.0'}) + '\n').encode())
             await self.process.stdin.drain()
 
@@ -165,18 +203,17 @@ class AcpProtocol:
             request_id = prior['id']
         event = {'jsonrpc': '2.0', 'id': request_id, 'method': method, 'params': params}
         old = self.process.past_request(request_id)
-        if (prior is not None and old != prior) or (old is not None and old != event):
+        if (prior is not None and old != prior) or (old is not None and old != journal_form(event)):
             raise RuntimeError('Provider host has a different prior request')
         if method == 'session/prompt':
             self._starting = False
             self._prompt_messages = tuple(message_id for message_id, text in steers)
-        if method == 'session/load':
+        if method == self.adapter.resume_method:
             self._load_id = request_id
         if method == 'session/new':
             self._new_id = request_id
         if old is not None:
             if method == 'session/prompt':
-                self.prompt_sent = True
                 if not self._started.done():
                     self._started.set_result(None)
             response = self.process.past_response(request_id)
@@ -199,7 +236,6 @@ class AcpProtocol:
                             self.adapter.before_prompt(self.session_id)
                     await self.write(event)
                 if method == 'session/prompt':
-                    self.prompt_sent = True
                     self._prompt_written.set()
                     if not self._started.done():
                         self._started.set_result(None)
@@ -211,7 +247,7 @@ class AcpProtocol:
             if method == 'session/prompt':
                 return await exchange()
             timeout = max(10, self.control.receipt_timeout)
-            if method in ('initialize', 'session/new', 'session/load'):
+            if method in ('initialize', 'session/new', self.adapter.resume_method):
                 timeout *= 10
             else:
                 timeout = self.control.receipt_timeout
@@ -236,12 +272,12 @@ class AcpProtocol:
         """Return after the session exists, or the worker's first prompt is written."""
         if self.persistent and (prompt != '' or developer_instructions is not None):
             raise ValueError('Persistent ACP start requires an empty prompt and no developer instructions')
-        task = self.track(self.run(prompt, cwd, fresh, developer_instructions))
+        task = self.track(self.run(prompt, cwd, fresh, developer_instructions, model, thread_options or {}))
         await asyncio.wait((task, self._started), return_when=asyncio.FIRST_COMPLETED)
         if task.done() and not task.cancelled():
             task.result()
 
-    async def run(self, prompt, cwd, fresh, developer_instructions):
+    async def run(self, prompt, cwd, fresh, developer_instructions, model=None, options=None):
         try:
             replayed_initialize = any(event['method'] == 'initialize'
                 and self.process.past_response(event['id']) is not None for event in self._replay)
@@ -258,6 +294,8 @@ class AcpProtocol:
             if self.state in (AcpState.STOPPING, AcpState.TERMINAL):
                 return
             params = {'cwd': str(cwd), 'mcpServers': self.mcp_servers}
+            if self.session_meta is not None:
+                params['_meta'] = self.session_meta
             if fresh:
                 response = await self.request('session/new', params)
                 session_id = response.get('sessionId')
@@ -268,7 +306,7 @@ class AcpProtocol:
                     return
                 self.state = AcpState.LOADING
                 self._loading = True
-                await self.request('session/load', {'sessionId': session_id, **params})
+                response = await self.request(self.adapter.resume_method, {'sessionId': session_id, **params})
                 self._loading = False
             if self.state in (AcpState.STOPPING, AcpState.TERMINAL):
                 return
@@ -276,6 +314,10 @@ class AcpProtocol:
                 self.complete('failed', 'invalid_session_id')
                 return
             self.session_id = self.observe_session(session_id)
+            if self.adapter.session_ready is not None:
+                await self.adapter.session_ready(self, response, model, options or {})
+                if self.state in (AcpState.STOPPING, AcpState.TERMINAL):
+                    return
             self.state = AcpState.PROMPTING
             self.control.bind(self.steer)
             text = '\n\n'.join(part for part in (developer_instructions, prompt) if part)
@@ -286,6 +328,7 @@ class AcpProtocol:
                 params = None
             prior = None
             steers = ()
+            continued = 0
             while not self.terminal:
                 if params is None:
                     steers = ()
@@ -304,6 +347,8 @@ class AcpProtocol:
                                     count += 1
                         steers = tuple(self.queued[:count])
                         del self.queued[:count]
+                        if not self.queued:
+                            self._steer_ready.clear()
                         params = {'sessionId': self.session_id,
                                   'prompt': [{'type': 'text', 'text': '\n\n'.join(text for message_id, text in steers)}]}
                         if self.adapter.queued_receipt == 'queued':
@@ -315,10 +360,18 @@ class AcpProtocol:
                             return
                         continue
                     else:
-                        self.complete('succeeded')
-                        return
-                result = await self.request('session/prompt', params, prior=prior, steers=steers)
-                if not self.persistent:
+                        more = (self.adapter.continue_prompt(self.session_id)
+                                if self.adapter.continue_prompt is not None and continued < CONTINUATIONS else None)
+                        if not more:
+                            self.complete('succeeded')
+                            return
+                        continued += 1
+                        params = {'sessionId': self.session_id, 'prompt': [{'type': 'text', 'text': more}]}
+                result = await self.prompt(params, prior, steers)
+                if result is None:
+                    params = None
+                    continue
+                if not self.persistent and not self.adapter.steer_prompt:
                     self.prompt_usage(result)
                 reason = result.get('stopReason')
                 if self._stop_requested:
@@ -339,6 +392,25 @@ class AcpProtocol:
             else:
                 self.complete('failed', 'disconnected')
 
+    async def prompt(self, params, prior, steers):
+        """Return the prompt result, or None when a steer must go out before it ends."""
+        if not self.adapter.steer_prompt:
+            return await self.request('session/prompt', params, prior=prior, steers=steers)
+        request = asyncio.ensure_future(self.request('session/prompt', params, prior=prior, steers=steers))
+        request.add_done_callback(self.prompt_done)
+        steer = asyncio.ensure_future(self._steer_ready.wait())
+        try:
+            await asyncio.wait((request, steer), return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            steer.cancel()
+        return request.result() if request.done() else None
+
+    def prompt_done(self, request):
+        """Count each answered prompt once, also when a steer or a stop ended it."""
+        if not request.cancelled() and request.exception() is None:
+            self.prompt_usage(request.result())
+        self.finish_input()
+
     async def steer(self, message_id, text):
         async with self.steer_lock:
             if self.state != AcpState.PROMPTING or self.closed:
@@ -357,6 +429,8 @@ class AcpProtocol:
             native = self.adapter.native_steer
             if native is None:
                 self.queued.append((message_id, text))
+                if self.adapter.steer_prompt:
+                    self._steer_ready.set()
                 return self.adapter.queued_receipt
             wire = steer_wire(message_id)
             future = asyncio.get_running_loop().create_future()

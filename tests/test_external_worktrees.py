@@ -271,12 +271,12 @@ class ExternalWorktreeTests(unittest.TestCase):
 
         async def slow_first(*args):
             if args[3]['worktree'] == str(self.target):
-                await asyncio.sleep(2)
+                await asyncio.Future()
             return await original(*args)
 
         with patch.object(sweep, '_candidate', side_effect=slow_first):
             report = asyncio.run(sweep.sweep(self.store.db, self.store.directory, [self.project],
-                                            sweep.Policy((self.scratch,), root_seconds=0.5), now=self.now))
+                                            sweep.Policy((self.scratch,), root_seconds=3), now=self.now))
         self.assertEqual(len(report['roots']), 2)
         self.assertEqual(report['roots'][0]['reason'], 'time limit exceeded')
         self.assertEqual(report['roots'][1]['reason'], 'worktree is too recent')
@@ -307,3 +307,15 @@ class ExternalWorktreeTests(unittest.TestCase):
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertEqual(json.loads(report.read_text())['roots'], [])
         self.assertTrue(self.target.is_dir())
+
+
+class ProcessPathTests(unittest.TestCase):
+    @unittest.skipUnless(Path('/proc/self/cwd').exists(), 'requires /proc')
+    def test_linux_process_paths_use_proc_without_lsof(self):
+        with tempfile.TemporaryDirectory(prefix='process-paths-') as folder, \
+                subprocess.Popen(['/bin/sleep', '60'], cwd=folder) as process, \
+                patch.object(sweep.workspaces, '_command', new=AsyncMock(side_effect=FileNotFoundError('lsof'))):
+            try:
+                self.assertIn(Path(folder).resolve(), asyncio.run(sweep._process_paths()))
+            finally:
+                process.terminate()

@@ -15,6 +15,7 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
+from coordinator import host_os
 from coordinator import process_ownership as ownership
 
 
@@ -185,12 +186,12 @@ class DarwinGroup:
             if index >= len(buf):
                 return size
             buf[index] = pid
-        return len(self.current) * ownership.C.sizeof(ownership.C.c_int)
+        return len(self.current) * host_os.C.sizeof(host_os.C.c_int)
 
     def proc_pidinfo(self, pid, flavor, argument, pointer, size):
         item = self.current[pid]
         if item.get('missing') or (item.get('require_zombie_arg') and argument != 1):
-            ownership.C.set_errno(errno.ESRCH)
+            host_os.C.set_errno(errno.ESRCH)
             return 0
         value = pointer._obj
         if flavor == 13:
@@ -212,13 +213,13 @@ class GroupMembersTests(unittest.IsolatedAsyncioTestCase):
 
     def linux(self, entries, metadata, ready=False):
         stack = ExitStack()
-        stack.enter_context(patch.object(ownership.sys, 'platform', 'linux'))
+        stack.enter_context(patch.object(host_os, 'SYSTEM', 'linux'))
         stack.enter_context(patch.object(ownership.os, 'scandir',
                                         side_effect=lambda directory: ProcEntries(entries)))
-        stack.enter_context(patch.object(ownership, '_proc_stat', side_effect=metadata))
+        stack.enter_context(patch.object(host_os, '_proc_stat', side_effect=metadata))
         stack.enter_context(patch.object(ownership.os, 'pidfd_open', return_value=900, create=True))
         stack.enter_context(patch.object(ownership.os, 'close'))
-        stack.enter_context(patch.object(ownership.polling, 'select',
+        stack.enter_context(patch.object(host_os.select, 'select',
                                         return_value=([900] if ready else [], [], [])))
         self.addCleanup(stack.close)
         return stack
@@ -277,7 +278,7 @@ class GroupMembersTests(unittest.IsolatedAsyncioTestCase):
 
         self.linux([41, 42], metadata, ready=True)
         self.assertEqual(await ownership.group_members(30), ((), True))
-        with patch.object(ownership.polling, 'select', return_value=([], [], [])):
+        with patch.object(host_os.select, 'select', return_value=([], [], [])):
             self.assertEqual(await ownership.group_members(30), (((41, ('linux', 141)),), False))
 
     async def test_vanishing_zombie_during_identity_check_cannot_prove_terminal_group(self):
@@ -301,10 +302,10 @@ class GroupMembersTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_entry_and_group_caps_refuse_incomplete_proof(self):
         self.linux([41, 42, 43], lambda pid: ('S', 30, pid + 100))
-        with patch.object(ownership, 'PROCESS_SCAN_LIMIT', 2):
+        with patch.object(host_os, '_PROCESS_SCAN_LIMIT', 2):
             with self.assertRaisesRegex(OSError, 'Process enumeration exceeded'):
                 await ownership.group_members(30)
-        with patch.object(ownership, 'GROUP_MEMBER_LIMIT', 1):
+        with patch.object(host_os, '_GROUP_MEMBER_LIMIT', 1):
             with self.assertRaisesRegex(OSError, 'Process group enumeration exceeded'):
                 await ownership.group_members(30)
 
@@ -328,8 +329,8 @@ class GroupMembersTests(unittest.IsolatedAsyncioTestCase):
     async def test_proc_stat_handles_parentheses_and_rejects_bad_identity(self):
         values = 'S 1 30 30 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 141'
         with patch.object(Path, 'read_text', return_value='41 (a ) tricky ( name) ' + values):
-            self.assertEqual(ownership._proc_stat(41), ('S', 30, 141))
-        with patch.object(ownership.sys, 'platform', 'linux'), \
+            self.assertEqual(host_os._proc_stat(41), ('S', 30, 141))
+        with patch.object(host_os, 'SYSTEM', 'linux'), \
                 patch.object(ownership.os, 'scandir', return_value=ProcEntries([41])), \
                 patch.object(Path, 'read_text', return_value='42 (wrong) ' + values):
             with self.assertRaisesRegex(OSError, 'Invalid process group metadata'):
@@ -343,7 +344,7 @@ class GroupMembersTests(unittest.IsolatedAsyncioTestCase):
     async def test_darwin_group_scan_uses_group_filter_and_stable_identity(self):
         rows = {41: {'status': 5}, 42: {'status': 2}}
         fake = DarwinGroup([rows, rows])
-        with patch.object(ownership.sys, 'platform', 'darwin'), \
+        with patch.object(host_os, 'SYSTEM', 'darwin'), \
                 patch.object(ownership.backend, 'load', return_value=fake):
             self.assertEqual(await ownership.group_members(30),
                              (((42, ('darwin', 1042, 7)),), False))
@@ -351,10 +352,10 @@ class GroupMembersTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_darwin_terminal_roster_proves_termination_but_identity_race_does_not(self):
         rows = {41: {'status': 5}}
-        with patch.object(ownership.sys, 'platform', 'darwin'), \
+        with patch.object(host_os, 'SYSTEM', 'darwin'), \
                 patch.object(ownership.backend, 'load', return_value=DarwinGroup([rows, rows])):
             self.assertEqual(await ownership.group_members(30), ((), True))
-        with patch.object(ownership.sys, 'platform', 'darwin'), \
+        with patch.object(host_os, 'SYSTEM', 'darwin'), \
                 patch.object(ownership.backend, 'load',
                              return_value=DarwinGroup([{41: {'status': 5, 'race': True}}])):
             with self.assertRaisesRegex(OSError, 'identity changed'):
@@ -362,7 +363,7 @@ class GroupMembersTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_darwin_already_zombie_records_still_prove_termination(self):
         rows = {41: {'status': 5, 'require_zombie_arg': True}}
-        with patch.object(ownership.sys, 'platform', 'darwin'), \
+        with patch.object(host_os, 'SYSTEM', 'darwin'), \
                 patch.object(ownership.backend, 'load', return_value=DarwinGroup([rows, rows])):
             try:
                 result = await ownership.group_members(30)
@@ -372,15 +373,15 @@ class GroupMembersTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_darwin_member_cap_refuses_truncated_roster(self):
         fake = DarwinGroup([{41: {}, 42: {}}])
-        with patch.object(ownership.sys, 'platform', 'darwin'), \
-                patch.object(ownership, 'GROUP_MEMBER_LIMIT', 1), \
+        with patch.object(host_os, 'SYSTEM', 'darwin'), \
+                patch.object(host_os, '_GROUP_MEMBER_LIMIT', 1), \
                 patch.object(ownership.backend, 'load', return_value=fake):
             with self.assertRaisesRegex(OSError, 'exceeded its bound'):
                 await ownership.group_members(30)
 
     async def test_vanishing_darwin_member_cannot_prove_terminal_group(self):
         rows = {41: {'status': 5}, 42: {'missing': True}}
-        with patch.object(ownership.sys, 'platform', 'darwin'), \
+        with patch.object(host_os, 'SYSTEM', 'darwin'), \
                 patch.object(ownership.backend, 'load', return_value=DarwinGroup([rows])):
             with self.assertRaises(OSError) as caught:
                 await ownership.group_members(30)
@@ -390,13 +391,13 @@ class GroupMembersTests(unittest.IsolatedAsyncioTestCase):
         for pgid in (0, 1, -1, True, '30'):
             with self.subTest(pgid=pgid), self.assertRaisesRegex(OSError, 'Invalid'):
                 await ownership.group_members(pgid)
-        with patch.object(ownership.sys, 'platform', 'unsupported'):
+        with patch.object(host_os, 'SYSTEM', 'unsupported'):
             with self.assertRaises(OSError) as caught:
                 await ownership.group_members(30)
         self.assertEqual(caught.exception.errno, errno.ENOSYS)
 
     async def test_real_process_group_is_reported_while_its_process_runs(self):
-        if sys.platform != 'darwin' and not sys.platform.startswith('linux'):
+        if not host_os.macos() and not host_os.linux():
             with self.assertRaises(OSError):
                 await ownership.group_members(30)
             return
@@ -407,7 +408,7 @@ class GroupMembersTests(unittest.IsolatedAsyncioTestCase):
             members, ended = await ownership.group_members(process.pid)
             self.assertFalse(ended)
             self.assertEqual([pid for pid, identity in members], [process.pid])
-            self.assertEqual(members[0][1][0], sys.platform)
+            self.assertEqual(members[0][1][0], host_os.SYSTEM)
         finally:
             process.terminate()
             process.wait(timeout=5)

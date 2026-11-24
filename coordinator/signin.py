@@ -12,9 +12,6 @@ home ~/.codex-accounts/.torii-HEX and posts the link and one-time code. The owne
 the code on the ChatGPT page, so nothing comes back through Telegram. Codex writes the
 login into that home only.
 
-Muse uses a device code through transient MSP pipes in a new private home. Its card
-body stays in memory until delivery, and only a confirmed account login is registered.
-
 Torii keeps the profile key and folder as internal identifiers, and displays the login
 email. One sign-in runs at a time.
 """
@@ -28,21 +25,22 @@ import secrets
 import signal
 import string
 import subprocess
-import sys
 import time
 from urllib.parse import parse_qs, unquote, urlsplit
 
-from . import codex_accounts, host_os, msp_protocol, muse_accounts, problems
-from .account_status import _native, _stop, identity_label
-from .accounts import AccountBroker, account_label, authenticated
+from . import codex_accounts, host_os, problems
+from .account_status import _native, _terminate, identity_label
+from .accounts import AccountBroker, account_label, account_picks, authenticated
 from .control_api import Refused, Result
+from .extension import optional
 
 
 KEY = 'account_signin'
 RETRY_KEY = 'account_signin_retry'
 _ACCOUNT_SETTINGS = {'claude': ('accounts', 'account_status', 'account_blocks'),
-                     'codex': ('codex_accounts', 'codex_account_status', 'codex_account_blocks'),
-                     'muse': ('muse_accounts', 'muse_account_status', 'muse_account_blocks')}
+                     'codex': ('codex_accounts', 'codex_account_status', 'codex_account_blocks')}
+if optional('antigravity_signin') is not None:
+    _ACCOUNT_SETTINGS['antigravity'] = ('antigravity_accounts', 'antigravity_account_status', 'antigravity_account_blocks')
 RETRY_DATA = 'signin:retry'
 CODEX_RETRY_DATA = 'signin:retry:codex'
 CANCEL_SIGNIN_DATA = 'signin:cancel:'
@@ -57,7 +55,6 @@ _HOSTS = ('claude.ai', 'claude.com', 'anthropic.com')
 _CODE_SHAPE = re.compile(r'[A-Za-z0-9._~-]{8,2048}#[A-Za-z0-9._~-]{8,2048}\Z'
                          r'|(?=[^#]*[0-9])(?=[^#]*[a-z])(?=[^#]*[A-Z])[A-Za-z0-9_-]{48,4096}\Z')
 _DEVICE_URL = re.compile(r'https://(?:[a-z0-9-]+\.)*(?:openai|chatgpt)\.com(?:/[A-Za-z0-9._~/%?=&-]*)?\Z')
-_MUSE_DEVICE_URL = re.compile(r'https://auth\.meta\.com/oauth/device/[A-Za-z0-9._~/%?=&-]*\Z')
 _USER_CODE = re.compile(r'[A-Z0-9]{3,8}(-[A-Z0-9]{3,8}){0,3}\Z')
 _SECRET_PREFIXES = ('sk-ant-', 'sk-', 'ghp_', 'gho_', 'github_pat_', 'xoxb-', 'xoxp-', 'AKIA')
 _FORWARDED = ('forward_origin', 'forward_from', 'forward_from_chat', 'forward_sender_name', 'forward_date')
@@ -69,8 +66,9 @@ def accounts_root():
 
 
 def pending(store):
+    """Ignore records for providers Torii can no longer sign in to."""
     record = store.get(KEY)
-    return record if isinstance(record, dict) else None
+    return record if isinstance(record, dict) and record.get('provider', 'claude') in _ACCOUNT_SETTINGS else None
 
 
 def cancel_data(record):
@@ -106,7 +104,7 @@ def taken_aliases(store):
     """All providers share one alias namespace."""
     return (set(store.get('accounts', {}) or {}) | set(store.get('codex_accounts', {}) or {})
             | set(store.get('opencode_accounts', {}) or {})
-            | set(store.get('muse_accounts', {}) or {})
+            | set(store.get('antigravity_accounts', {}) or {})
             | {codex_accounts.DEFAULT_ALIAS})
 
 
@@ -135,7 +133,7 @@ def register_claude_account(store, directory, identity):
 
 
 def provider_name(record):
-    return {'codex': 'Codex', 'muse': 'Muse'}.get((record or {}).get('provider'), 'Claude')
+    return {'codex': 'Codex', 'antigravity': 'Antigravity'}.get((record or {}).get('provider'), 'Claude')
 
 
 def registered_provider(store, alias):
@@ -146,18 +144,37 @@ def registered_provider(store, alias):
 
 
 def account_authenticated(store, alias, provider):
-    if provider == 'muse':
-        return muse_accounts.MuseBroker(store).authenticated(alias)
+    if provider == 'antigravity':
+        return optional('antigravity_accounts').AntigravityBroker(store).signed_in(alias)
     if provider == 'codex':
         return codex_accounts.CodexBroker(store).authenticated(alias)
     return authenticated(store, alias, (store.get('accounts', {}) or {}).get(alias))
 
 
 def signin_label(store, alias, provider):
-    if provider == 'muse':
-        return muse_accounts.MuseBroker(store).label(alias)
+    if provider == 'antigravity':
+        return optional('antigravity_accounts').AntigravityBroker(store).label(alias)
     return (codex_accounts.CodexBroker(store).label(alias) if provider == 'codex'
             else account_label(store, alias))
+
+
+def starting(store, topic, provider):
+    """Post the Starting message at once. The first sign-in card replaces it."""
+    return store.enqueue_report(topic, 'Starting the %s sign-in…' % provider_name({'provider': provider}),
+                                kind='envelope')
+
+
+def take_starting(store, record):
+    """The Starting message for the first card to edit, once. A message not yet sent is dropped instead."""
+    from .envelopes import card_message
+    outbox = record.get('starting')
+    if outbox is None:
+        return None
+    store.db.execute('UPDATE outbox SET retired=1 WHERE id=? AND delivered=0', (outbox,))
+    current = pending(store)
+    if current and current.get('starting') == outbox:
+        store.put(KEY, dict(current, starting=None))
+    return card_message(store, outbox)
 
 
 def op_account_add(store, ctx, topic=None, provider=None, alias=None):
@@ -166,8 +183,8 @@ def op_account_add(store, ctx, topic=None, provider=None, alias=None):
         raise Refused('A %s sign-in is still open. Finish it or tap Cancel on its card first.' % provider_name(record))
     if alias:
         provider = registered_provider(store, alias)
-    if provider == 'muse':
-        muse_signin_ready(store, alias)
+    if provider == 'antigravity':
+        return optional('antigravity_signin').op_add(store, ctx, topic, alias, taken_aliases(store))
     if alias:
         if account_authenticated(store, alias, provider):
             raise Refused('%s is already signed in.' % signin_label(store, alias, provider))
@@ -177,11 +194,12 @@ def op_account_add(store, ctx, topic=None, provider=None, alias=None):
     if not store.get('bot_username'):
         raise Refused('The service has not confirmed the bot identity yet. Try again in a minute.')
     codex = provider == 'codex'
-    root = muse_accounts.accounts_root() if provider == 'muse' else codex_accounts.accounts_root() if codex else accounts_root()
+    root = codex_accounts.accounts_root() if codex else accounts_root()
     directory = root / ('.torii-' + secrets.token_hex(4))
     store.put(KEY, {'topic': topic, 'config_dir': str(directory), 'state': 'starting', 'attempt': 0,
                     'created': False, 'pid': None, 'envelope': None, 'requested': time.time(), 'target': alias,
-                    **({'provider': provider} if codex or provider == 'muse' else {})})
+                    'starting': starting(store, topic, provider),
+                    **({'provider': provider} if codex else {})})
     store.put(RETRY_KEY, None)
     name = provider_name({'provider': provider})
     logger.info('account signin requested provider=%s', provider or 'claude')
@@ -189,16 +207,64 @@ def op_account_add(store, ctx, topic=None, provider=None, alias=None):
                   state='queued')
 
 
+_LOGIN_NAMES = {'claude': 'Claude', 'codex': 'ChatGPT', 'antigravity': 'Antigravity'}
+_LOGIN_WORDS = {'claude': 'claude', 'chatgpt': 'codex', 'codex': 'codex', 'antigravity': 'antigravity'}
+
+
+def login_command(store, args):
+    """The account.add call that signs a listed account in again for /login [PROVIDER] EMAIL, else the reply."""
+    from .health import _plain
+    providers = [provider for provider in _LOGIN_NAMES if provider in _ACCOUNT_SETTINGS]
+    rows = [(provider, alias, signin_label(store, alias, provider)) for provider in providers
+            for alias, profile in sorted((store.get(_ACCOUNT_SETTINGS[provider][0], {}) or {}).items())
+            if isinstance(profile, dict)]
+
+    def listed(found, named=True):
+        return ', '.join((_LOGIN_NAMES[provider] + ' ' if named else '') + _plain(label)
+                         for provider, _, label in found) or 'none'
+
+    words = ', '.join(word for word, provider in _LOGIN_WORDS.items() if provider in providers and word != 'codex')
+    if not args or len(args) > 2:
+        out = [row for row in rows if not account_authenticated(store, row[1], row[0])]
+        return ('Usage: /login PROVIDER EMAIL (%s), or /login EMAIL.\nSigned out: %s.' % (words, listed(out)))
+    provider = _LOGIN_WORDS.get(args[0].casefold()) if len(args) == 2 else None
+    if len(args) == 2 and provider not in providers:
+        return 'Unknown provider %s. Use %s.' % (_plain(args[0]), words)
+    email = args[-1]
+    scope = [row for row in rows if provider in (None, row[0])]
+    found = [row for row in scope if row[2].casefold() == email.casefold()]
+    if not found:
+        return 'No %s account is %s. %s accounts: %s.' % (
+            _LOGIN_NAMES[provider] if provider else 'listed', _plain(email),
+            _LOGIN_NAMES[provider] if provider else 'Listed', listed(scope, provider is None))
+    out = [row for row in found if not account_authenticated(store, row[1], row[0])]
+    found = out if len(found) > 1 and len(out) == 1 else found
+    named = list(dict.fromkeys(_LOGIN_NAMES[row[0]] for row in found))
+    if len(named) > 1:
+        return '%s is on %s. Send /login PROVIDER %s.' % (_plain(email), ' and '.join(named), _plain(email))
+    if len(found) > 1:
+        return '%s matches more than one %s account. Use its Sign in button in /accounts.' % (_plain(email), named[0])
+    return 'account.add', {'alias': found[0][1]}, 'menu'
+
+
 def op_account_remove(store, ctx, alias):
     provider = registered_provider(store, alias)
     display = signin_label(store, alias, provider)
-    if account_authenticated(store, alias, provider):
-        raise Refused('%s is signed in. Only signed-out accounts can be removed.' % display)
+    if store.db.execute("SELECT 1 FROM workers WHERE account_alias=? AND status='running'", (alias,)).fetchone():
+        raise Refused('A worker is running on %s. Remove it after that worker ends.' % display)
     if (pending(store) or {}).get('target') == alias:
         raise Refused('A sign-in for this account is open. Finish or cancel it first.')
     key, status_key, blocks_key = _ACCOUNT_SETTINGS[provider]
     profiles = dict(store.get(key, {}) or {})
     profile = profiles.pop(alias)
+    if provider == 'antigravity':
+        home = optional('antigravity_accounts').accounts_root() / alias
+        if home.is_dir() and not home.is_symlink():
+            try:
+                host_os.move_to_trash(home)
+            except OSError:
+                raise Refused('Torii could not move the profile folder of %s to the Trash. Nothing changed.'
+                              % display) from None
     directories = [str(Path(directory).resolve()) for directory in store.get('account_dirs_removed', []) or []]
     directories.extend(str(Path(directory).resolve()) for directory in
                        [profile.get('config_dir')] + profile.get('previous_config_dirs', []) if directory)
@@ -208,43 +274,17 @@ def op_account_remove(store, ctx, alias):
         values = dict(store.get(setting, {}) or {})
         values.pop(alias, None)
         store.put(setting, values)
-    if provider == 'claude' and store.get('claude_account_pick') == alias:
+    if provider == 'claude':
         from .controls import op_accounts_claude_auto
-        op_accounts_claude_auto(store, ctx)
+        for group, pick in account_picks(store).items():
+            if pick == alias:
+                op_accounts_claude_auto(store, ctx, models=group)
     if provider == 'codex' and store.get('codex_active_account') == alias:
         store.put('codex_active_account', None)
-    if provider == 'muse' and store.get('muse_active_account') == alias:
-        store.put('muse_active_account', None)
+    if provider == 'antigravity' and store.get('antigravity_active_account') == alias:
+        store.put('antigravity_active_account', None)
     logger.info('account removed provider=%s', provider)
     return Result(True, 'Removed %s.' % display)
-
-
-def muse_signin_ready(store, alias=None):
-    if store.get('muse_enabled', False) is not True:
-        raise Refused('Muse workers are off.')
-    muse_accounts.check_binary(muse_accounts.binary(store))
-    if sys.platform != 'darwin':
-        raise Refused('Muse sign-in requires macOS.')
-    broker = muse_accounts.MuseBroker(store)
-    accounts = broker.accounts()
-    if accounts and (set(accounts) != {alias} or broker.authenticated(alias)):
-        raise Refused('Torii supports one Muse account. Sign in to its signed-out alias again or remove it first.')
-
-
-def muse_device(login):
-    url, code = login.get('verificationUrl'), login.get('userCode')
-    if (not isinstance(url, str) or len(url) > 2048 or not _MUSE_DEVICE_URL.fullmatch(url)
-            or not isinstance(code, str) or not re.fullmatch(r'[A-Z-]{6,16}', code)
-            or not any('A' <= character <= 'Z' for character in code)):
-        return False
-    try:
-        parsed = urlsplit(url)
-        return (parsed.scheme == 'https' and parsed.netloc == 'auth.meta.com'
-                and parsed.hostname == 'auth.meta.com' and parsed.username is None and parsed.password is None
-                and parsed.port is None and parsed.path.startswith('/oauth/device/')
-                and '..' not in unquote(parsed.path).split('/'))
-    except ValueError:
-        return False
 
 
 def op_account_signin_cancel(store, ctx):
@@ -267,6 +307,8 @@ def looks_like_code(text):
 def intercept_topic_code(store, topic, message):
     """Delete code-like values before routing, and hand only this sign-in's own plain text code to Claude."""
     record = pending(store)
+    if record and record.get('provider') == 'antigravity':
+        return optional('antigravity_signin').intercept(store, topic, message)
     text = message.get('text') or message.get('caption')
     state = (record or {}).get('state')
     if not record or state not in ('code', 'checking') or not isinstance(text, str):
@@ -316,7 +358,7 @@ def intercept_topic_code(store, topic, message):
 def topic_code_pointer(store, topic, message):
     """Offer the sign-in pointer only after normal routing finds no enabled agent."""
     record = pending(store)
-    if not record or record.get('state') not in ('code', 'checking'):
+    if not record or record.get('state') not in ('code', 'checking') or record.get('provider') == 'antigravity':
         return False
     from .envelopes import _row
     envelope = _row(store, record['envelope']) if record.get('envelope') else None
@@ -381,7 +423,11 @@ class _Stop(Exception):
 CANCELLED = 'Claude sign-in cancelled. No account was added.'
 REJECTED = 'Claude rejected that code. It may be wrong or expired. Try again with the new sign-in card below.'
 CODEX_CANCELLED = 'Codex sign-in cancelled. No account was added.'
-MUSE_CANCELLED = 'Muse sign-in cancelled. No account was added.'
+
+
+def cancelled_text(record):
+    return {'codex': CODEX_CANCELLED,
+            'antigravity': 'Antigravity sign-in cancelled. No account was added.'}.get(record.get('provider'), CANCELLED)
 
 
 class SignIns:
@@ -389,12 +435,10 @@ class SignIns:
 
     def __init__(self, store, binary='claude', attempts=ATTEMPTS, link_seconds=LINK_SECONDS,
                  code_seconds=CODE_SECONDS, exit_seconds=EXIT_SECONDS, poll=0.1, codex_binary='codex',
-                 device_seconds=DEVICE_SECONDS, muse_binary=None):
+                 device_seconds=DEVICE_SECONDS):
         self.store = store
         self.binary = binary
         self.codex_binary = codex_binary
-        self.muse_binary = muse_binary or (lambda: muse_accounts.binary(store))
-        self.muse_cards = {}
         self.device_seconds = device_seconds
         self.attempts = attempts
         self.link_seconds = link_seconds
@@ -431,7 +475,8 @@ class SignIns:
         if envelope:
             update_card(self.store, envelope, text, markup)
         else:
-            self.store.enqueue_report(record['topic'], text, kind='envelope', reply_markup=markup)
+            self.store.enqueue_report(record['topic'], text, kind='envelope', reply_markup=markup,
+                                      edit=take_starting(self.store, pending(self.store) or record))
 
     def settle(self, record, state):
         if not record.get('envelope'):
@@ -445,19 +490,18 @@ class SignIns:
 
     def remove_folder(self, record):
         directory = Path(record['config_dir'])
-        if record.get('provider') == 'muse':
-            if (not record.get('created') or directory.parent != muse_accounts.accounts_root()
-                    or directory.is_symlink()):
+        if record.get('provider') == 'antigravity':
+            antigravity = optional('antigravity_accounts')
+            if record.get('target') or record.get('alias') in antigravity.accounts(self.store):
                 return True
-            if any(profile.get('config_dir') == str(directory)
-                   for profile in muse_accounts.MuseBroker(self.store).accounts().values()):
-                return False
             try:
+                if directory.parent != antigravity.accounts_root() or directory.is_symlink():
+                    return True
                 host_os.move_to_trash(directory)
             except FileNotFoundError:
                 pass
-            except OSError:
-                logger.info('Muse sign-in home could not be moved to the Trash; folder kept')
+            except (OSError, Refused):
+                logger.info('Antigravity sign-in home could not be moved to the Trash; folder kept')
                 return False
             return True
         codex = record.get('provider') == 'codex'
@@ -484,18 +528,14 @@ class SignIns:
         self.code = None
         self.waiting = None
         self.remove_folder(record)
-        if record.get('provider') == 'muse':
-            self.clear_muse_card(record)
-            stop.retry = False
         with self.store.db:
             self.settle(record, stop.state)
             self.store.put(KEY, None)
             self.store.put(RETRY_KEY, {'provider': record.get('provider', 'claude'),
                                       'target': record.get('target')} if stop.retry else None)
             self.card(record, stop.text, stop.retry)
-            if stop.text not in (CANCELLED, CODEX_CANCELLED, MUSE_CANCELLED):
-                code = 'signin_failed' if record.get('provider') == 'muse' and stop.state == 'failed' else 'signin-' + stop.state
-                problems.record(self.store, 'accounts', code, stop.text)
+            if stop.text != cancelled_text(record):
+                problems.record(self.store, 'accounts', 'signin-' + stop.state, stop.text)
         logger.info('account signin ended state=%s', stop.state)
 
     def recover(self):
@@ -504,19 +544,20 @@ class SignIns:
             return
         pid = record.get('pid')
         codex = record.get('provider') == 'codex'
-        muse = record.get('provider') == 'muse'
-        marker = ' serve --provider meta' if muse else ' app-server' if codex else ' auth login'
+        native = codex or record.get('provider') == 'antigravity'
+        marker = (' app-server' if codex else
+                  ' acp' if record.get('provider') == 'antigravity' else ' auth login')
         if (type(pid) is int and pid > 1 and _leftover(pid, marker)
-                and (not (codex or muse) or (record.get('started') and record['started'] == _started(pid)))):
+                and (not native or (record.get('started') and record['started'] == _started(pid)))):
             try:
                 os.killpg(pid, signal.SIGTERM)
             except (ProcessLookupError, PermissionError):
                 pass
         if record.get('state') == 'cancelled':
-            self.finish(record, _Stop(MUSE_CANCELLED if muse else CODEX_CANCELLED if codex else CANCELLED, retry=False))
+            self.finish(record, _Stop(cancelled_text(record), retry=False))
         else:
             self.finish(record, _Stop('The %s sign-in stopped because Torii restarted. No account was added.'
-                                      % provider_name(record)))
+                                      % provider_name(record), retry=record.get('provider') != 'antigravity'))
 
     async def run(self):
         self.recover()
@@ -525,9 +566,7 @@ class SignIns:
             if record and record.get('state') == 'starting':
                 await self.drive(record)
             elif record and record.get('state') == 'cancelled':
-                self.finish(record, _Stop(MUSE_CANCELLED if record.get('provider') == 'muse' else
-                                          CODEX_CANCELLED if record.get('provider') == 'codex' else CANCELLED,
-                                          retry=False))
+                self.finish(record, _Stop(cancelled_text(record), retry=False))
             await asyncio.sleep(self.poll)
 
     def watch(self, process, deadline):
@@ -541,8 +580,8 @@ class SignIns:
         return None
 
     async def drive(self, record):
-        if record.get('provider') == 'muse':
-            await self.drive_muse(record)
+        if record.get('provider') == 'antigravity':
+            await optional('antigravity_signin').drive(self, record)
             return
         if record.get('provider') == 'codex':
             await self.drive_codex(record)
@@ -613,7 +652,7 @@ class SignIns:
             return None
         finally:
             output.clear()
-            await _stop(process)
+            await _terminate(process)
             reader.cancel()
             await asyncio.gather(reader, return_exceptions=True)
 
@@ -645,8 +684,9 @@ class SignIns:
         try:
             with self.store.db:
                 record = pending(self.store)
-                envelope = ask(self.store, record['topic'], HANDOFF, reason, 'claude auth login', source='signin')
-                self.store.put(KEY, dict(record, state='code', envelope=envelope))
+                envelope = ask(self.store, record['topic'], HANDOFF, reason, 'claude auth login', source='signin',
+                               edit=take_starting(self.store, record))
+                self.store.put(KEY, dict(record, state='code', envelope=envelope, starting=None))
         except Refused as refusal:
             raise _Stop('Torii could not post the sign-in card. ' + str(refusal) + ' No account was added.') from None
         self.waiting = envelope
@@ -711,7 +751,10 @@ class SignIns:
             profile.pop('awaiting_login', None)
             profiles[alias] = profile
             snapshots = dict(self.store.get(status_key, {}) or {})
+            before = snapshots.get(alias) if isinstance(snapshots.get(alias), dict) else {}
             snapshots[alias] = {'identity': {'email': email, 'logged_in': True, **({'type': kind} if kind else {})}}
+            if before.get('login_recovery_pending') or before.get('error') == 'login_required':
+                snapshots[alias]['login_recovery_pending'] = True
             self.store.put(key, profiles)
             self.store.put(status_key, snapshots)
             self.store.put(status_key + '_refresh_requested', time.time())
@@ -763,151 +806,6 @@ class SignIns:
                                '%s is still signed out.' % (email, target_display, email, target_display))
                       if target else message)
         logger.info('account signin added account=%s', email or alias + ' · not signed in')
-
-    def muse_card(self, row):
-        text = self.muse_cards.get(row['id'])
-        return dict(row, text=text) if text is not None else row
-
-    def clear_muse_card(self, record):
-        card = record.get('card_outbox')
-        self.muse_cards.pop(card, None)
-        if card is not None:
-            with self.store.db:
-                self.store.db.execute('UPDATE outbox SET retired=1,reply_markup=NULL WHERE id=? AND delivered=0',
-                                      (card,))
-
-    async def drive_muse(self, record):
-        try:
-            muse_signin_ready(self.store, record.get('target'))
-            directory = Path(record['config_dir'])
-            if directory.parent != muse_accounts.accounts_root():
-                raise Refused('Muse sign-in needs a private account home.')
-            directory.mkdir(mode=0o700)
-            self.update(created=True)
-            muse_accounts.account_home(directory)
-            identity = await self.muse_login(record)
-            if (pending(self.store) or {}).get('state') == 'cancelled':
-                raise _Stop(MUSE_CANCELLED, retry=False)
-            self.succeed_muse(pending(self.store), identity)
-        except asyncio.CancelledError:
-            self.finish(pending(self.store) or record, _Stop(MUSE_CANCELLED, retry=False))
-            raise
-        except _Stop as stop:
-            self.finish(pending(self.store) or record, stop)
-        except Exception:
-            self.finish(pending(self.store) or record,
-                        _Stop('Muse could not start sign-in. No account was added.', state='failed'))
-
-    async def muse_wait(self, operation, seconds):
-        task = asyncio.ensure_future(operation)
-        deadline = time.monotonic() + seconds
-        try:
-            while True:
-                record = pending(self.store)
-                if not record or record.get('state') == 'cancelled':
-                    raise _Stop(MUSE_CANCELLED, retry=False)
-                if task.done():
-                    return task.result()
-                if time.monotonic() >= deadline:
-                    raise asyncio.TimeoutError()
-                await asyncio.wait((task,), timeout=min(self.poll, max(0, deadline - time.monotonic())))
-        finally:
-            if not task.done():
-                task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
-
-    async def cancel_muse(self, client):
-        try:
-            result = await asyncio.wait_for(client.request('account/loginCancel'), 5)
-            if result.get('cancelled') is not True:
-                logger.info('Muse sign-in cancel was not acknowledged')
-        except (asyncio.TimeoutError, msp_protocol.MspRequestError, OSError, ValueError):
-            pass
-
-    async def muse_login(self, job):
-        directory = Path(job['config_dir']).resolve()
-        client = muse_accounts.MuseClient(self.muse_binary(), directory)
-        started = False
-        confirmed = False
-        try:
-            await asyncio.wait_for(client.start(), self.link_seconds)
-            self.update(state='connecting', pid=client.process.pid, started=_started(client.process.pid))
-            result = await self.muse_wait(client.request('initialize', {
-                'clientInfo': {'name': 'torii', 'version': '1'},
-                'capabilities': {'experimentalApi': True, 'userInputDialogs': False,
-                                 'requestedCapabilities': ['sessionMcp']}}), self.link_seconds)
-            if not msp_protocol.initialized(result, directory):
-                raise _Stop('Muse returned an incompatible protocol. No account was added.', state='failed')
-            await client.send('initialized')
-            started = True
-            login = await self.muse_wait(client.request('account/loginStart', {'type': 'deviceCode'}), self.link_seconds)
-            if not muse_device(login):
-                raise _Stop('Muse returned an unexpected sign-in link or code. No account was added.', state='failed')
-            self.post_muse_card(login)
-            try:
-                completion = await self.muse_wait(client.notification('account/loginCompleted'), self.device_seconds)
-            except asyncio.TimeoutError:
-                raise _Stop('The Muse sign-in code expired. No account was added.', state='expired') from None
-            if completion.get('outcome') != 'granted':
-                raise _Stop('Muse did not grant the sign-in. No account was added.', state='failed')
-            account = await self.muse_wait(client.request('account/read'), self.exit_seconds)
-            if account.get('state') != 'accountLogin':
-                raise _Stop('Muse did not confirm an account login. No account was added.', state='failed')
-            await self.muse_wait(client.request('usage/read'), self.exit_seconds)
-            label = identity_label(account.get('label'))
-            if login['userCode'] in label:
-                label = ''
-            confirmed = True
-            return {'label': label}
-        except (asyncio.TimeoutError, msp_protocol.MspRequestError, OSError, ValueError):
-            raise _Stop('Muse did not finish sign-in. No account was added.', state='failed') from None
-        finally:
-            try:
-                if started and not confirmed:
-                    await self.cancel_muse(client)
-            finally:
-                await client.stop()
-
-    def post_muse_card(self, login):
-        record = pending(self.store)
-        text = ('Add a Muse Code account\n1. Open this link and sign in to the Muse account to add:\n' +
-                login['verificationUrl'] + '\n2. Enter this one-time code: ' + login['userCode'] +
-                '\nTorii waits up to 16 minutes and adds the account when Muse Code confirms the sign-in.'
-                '\nUse a private browser window if another Muse account is signed in there. Enter only a code '
-                'that Torii sent for your own request.')
-        markup = {'inline_keyboard': [[{'text': 'Cancel sign-in', 'callback_data': cancel_data(record)}]]}
-        with self.store.db:
-            card = self.store.enqueue_report(record['topic'], 'This Muse Code sign-in card is no longer available. '
-                                              'Start Add Muse again.', kind='envelope', reply_markup=markup)
-            self.muse_cards[card] = text
-            self.update(state='approve', card_outbox=card)
-        logger.info('account signin device card posted provider=muse')
-
-    def succeed_muse(self, record, identity):
-        broker = muse_accounts.MuseBroker(self.store)
-        accounts = broker.accounts()
-        target = record.get('target')
-        if accounts and (set(accounts) != {target} or broker.authenticated(target)):
-            raise _Stop('Torii already has one Muse account. No account was added.', state='failed')
-        label = identity['label']
-        alias = target or account_name(label, taken_aliases(self.store), prefix='muse-')
-        created = time.time()
-        previous = accounts.get(alias, {})
-        profile = {'config_dir': record['config_dir'], 'label': label, 'created': created}
-        directories = list(previous.get('previous_config_dirs', []))
-        if previous.get('config_dir'):
-            directories.append(previous['config_dir'])
-        if directories:
-            profile['previous_config_dirs'] = list(dict.fromkeys(directories))
-        with self.store.db:
-            self.store.put('muse_accounts', {alias: profile})
-            self.store.put('muse_active_account', alias)
-            self.store.put('muse_account_status', {alias: {'identity': {'logged_in': True},
-                                                        'observed': None, 'checked_at': created}})
-            self.store.put(KEY, None)
-            self.clear_muse_card(record)
-            self.card(record, 'Muse Code account %s is signed in.' % (label or alias))
-        logger.info('account signin added provider=muse')
 
     async def drive_codex(self, record):
         directory = Path(record['config_dir'])
@@ -979,7 +877,8 @@ class SignIns:
                 'that Torii sent for your own request.')
         markup = {'inline_keyboard': [[{'text': 'Cancel sign-in', 'callback_data': cancel_data(record)}]]}
         with self.store.db:
-            self.store.enqueue_report(record['topic'], text, kind='envelope', reply_markup=markup)
+            self.store.enqueue_report(record['topic'], text, kind='envelope', reply_markup=markup,
+                                      edit=take_starting(self.store, record))
         logger.info('account signin device card posted provider=codex')
 
     async def wait_device(self, server, login_id):

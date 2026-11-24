@@ -11,8 +11,8 @@ import uuid
 
 from . import problems, parent_state
 from .parent_state import (LOST_TURN, _active_clients, RESTART_MESSAGES, RESTART_MESSAGE_CHARS, RESTART_MESSAGE_HEAD)
-from .accounts import AccountBroker, DEFAULT_ACCOUNTS, account_label
-from .claude_settings import claude_md_excludes
+from .accounts import AccountBroker, DEFAULT_ACCOUNTS, account_label, account_pick
+from .claude_settings import claude_md_excludes, plugin_switches
 from .failures import internal_detail
 from .shared_mcp import write_config as write_shared_mcp_config
 from .native_protocol import NativeProtocol, RunControl
@@ -22,7 +22,7 @@ from .scrub import Scrubber
 
 
 logger = logging.getLogger(__name__)
-PARENT_FLAGS = ('--system-prompt-snapshot', 'off')
+PARENT_FLAGS = ('--system-prompt-snapshot', 'off', '--disallowedTools', 'SendUserFile')
 
 
 def message_uuid(row_id):
@@ -36,6 +36,8 @@ def message_row_groups(store, rows):
 def message_tag(topic, row):
     """The one prefix for every message steered into the coordinator: topic id, name, message id, and kind."""
     sender = ' from=' + json.dumps(row['from_name'], ensure_ascii=False) if row.get('from_name') is not None else ''
+    if row.get('event_worker') is not None:
+        sender += ' worker=%d job=%d' % (row['event_worker'], row['event_task'])
     if row['kind'] == 'owner' and row.get('waiting'):
         sender += ' waiting=' + json.dumps(row['waiting'], ensure_ascii=False)
     return '[topic=%s name=%s message=%d kind=%s%s] ' % (
@@ -107,6 +109,8 @@ class CoordinatorSession:
     def __init__(self, store, runner, session_id, on_turn, receipt_timeout, key='coordinator'):
         self.store = store
         self.key = key
+        from .loadout import topic_for_key
+        self.topic = topic_for_key(store, key)
         self.runner = runner
         self.session_id = session_id
         self.on_turn = on_turn
@@ -160,6 +164,7 @@ class CoordinatorSession:
         if reattach_only and not store.get(key + '_host'):
             return None
         session = cls(store, runner, None, on_turn, receipt_timeout, key)
+        session.topic = topic or main
         runner.account_broker = session.router
         client_registered = False
         past = []
@@ -212,16 +217,16 @@ class CoordinatorSession:
                     raise RuntimeError('Session is already owned by an external native process')
                 accounts = store.get('accounts', DEFAULT_ACCOUNTS)
                 previous = store.get('coordinator_rotation_from')
-                alias = session.router.activate(accounts)
+                alias = session.router.activate(accounts, model=inputs.model)
                 if alias is None:
-                    raise AccountsUnavailable(session.router.earliest_reset(accounts))
+                    raise AccountsUnavailable(session.router.earliest_reset(accounts, model=inputs.model))
                 config_dir = accounts[alias].get('config_dir')
                 resume_path = session.router.transcript(saved) if saved and not fresh else None
                 if resume_path and config_dir:
                     resume_path = session.router.resume_transcript(alias, saved, resume_path)
                 if saved and not fresh and config_dir and not resume_path:
                     problems.record(store, 'coordinator', 'resume-lost', 'key=%s session=%s' % (key, saved),
-                                    level=logging.ERROR, topic=topic)
+                                    level=logging.ERROR, topic=topic, every=3600)
                     session.resume_failed = True
                     fresh = True
                     session.session_id = str(uuid.uuid4())
@@ -238,7 +243,7 @@ class CoordinatorSession:
                            '--append-system-prompt', inputs.prompt] + list(PARENT_FLAGS)
                 if inputs.configs:
                     command += ['--mcp-config'] + [str(config) for config in inputs.configs]
-                env = runner._environment('claude', alias)
+                env = runner._environment('claude', alias, inputs.model)
                 private = await runner.launch_secrets(env)
                 inputs.scrub.extend(Scrubber(private).forms)
                 spec = {'argv': command, 'cwd': str(cwd), 'env': env,
@@ -292,27 +297,33 @@ class CoordinatorSession:
                 session.process.detach()
             raise
 
-    def _event_consumed(self, seq):
-        with self.store.db:
-            self.store.put(self.key + '_host_seq', seq)
-
     @classmethod
     def _launch_inputs(cls, store, model, instructions, mcp_config, extra=None, binary=None, topic=None, key='coordinator'):
         agent = parent_state.effective_agent(store, key, 'claude', model)
         model = agent['model']
-        memory_directory = store.directory / 'coordinator-memory'
+        from . import memory
+        memory_directory = memory.directory(store, topic)
+        (store.directory / 'chats').mkdir(exist_ok=True, mode=0o700)
+        memory_directory.parent.mkdir(exist_ok=True, mode=0o700)
         memory_directory.mkdir(parents=True, exist_ok=True, mode=0o700)
-        settings = json.dumps({'ultracode': False, 'autoMemoryDirectory': str(memory_directory.resolve()),
-                               'claudeMdExcludes': claude_md_excludes(Path.home())})
+        settings = {'ultracode': False, 'autoMemoryDirectory': str(memory_directory.resolve()),
+                    'claudeMdExcludes': claude_md_excludes(Path.home())}
+        plugins = plugin_switches(store, topic)
+        if plugins:
+            settings['enabledPlugins'] = plugins
+        settings = json.dumps(settings)
         policy = chat_policy(store, key)
+        memory.check(store, topic)
+        instructions += ('\nKeep your memory index at or below 40 lines. If it exceeds 40 lines, '
+                         'trim the index without deleting memory notes.\n')
         config = Path(mcp_config) if mcp_config is not None else cls.write_mcp_config(store, topic)
         scrub = Scrubber({})
-        shared_mcp_config = write_shared_mcp_config(store, scrub)
+        shared_mcp_config = write_shared_mcp_config(store, scrub, topic=topic)
         configs = tuple(path for path in (config, shared_mcp_config) if path is not None)
         effort = agent['effort']
         from .mcp import tools_hash
         from .cli_identity import identity, PACKAGES
-        content = {'tools': tools_hash(), 'model': model, 'effort': effort, 'settings': settings, 'instructions': instructions,
+        content = {'tools': tools_hash(store), 'model': model, 'effort': effort, 'settings': settings, 'instructions': instructions,
                    'flags': PARENT_FLAGS, 'cli': identity(binary, PACKAGES['claude']),
                    'mcp_configs': [hashlib.sha256(path.read_bytes()).hexdigest() for path in configs]}
         content.update(extra or {})
@@ -385,7 +396,7 @@ class CoordinatorSession:
                 message = event.get('message')
                 parent_tools(self.store, self._turn_rows,
                              message.get('content') if isinstance(message, dict) else None)
-        if (self.launch_state == 'native' and event.get('type') == 'system'
+        if (self.launch_state in ('native', 'managed') and event.get('type') == 'system'
                 and event.get('subtype') == 'background_tasks_changed' and self.protocol.background_completion):
             self.turn_open = True
         if event.get('type') == 'assistant' or (event.get('type') == 'system' and
@@ -461,7 +472,7 @@ class CoordinatorSession:
                             if self.launch_state != 'managed':
                                 self.router.record_rate_limit(self.account_alias, info,
                                                               info.get('status') == 'rejected')
-                            self.router.activate()
+                            self.router.activate(model=self.model)
                         if info.get('status') == 'rejected':
                             self.relaunch(self._turn_rows | self._unreplayed)
                     self.process.ack()
@@ -470,6 +481,8 @@ class CoordinatorSession:
                     if self.rejected:
                         self.process.ack()
                         continue
+                    from . import memory
+                    memory.check(self.store, self.topic)
                     if event.get('is_error') and (self.protocol.failure or self.launch_state == 'detached'):
                         self.stale = True
                         self._lost |= self._turn_rows - self._unreplayed
@@ -491,6 +504,10 @@ class CoordinatorSession:
                             turn = self.store.get(self.key + '_reply_turn') or {}
                             identity = turn['turn'] if turn.get('host') == self.host_id else self.process.event_sequence
                             completed(self, identity, self._turn_rows - self._unreplayed, event.get('result') or '')
+                        else:
+                            from .parent_replies import abandoned
+                            turn = self.store.get(self.key + '_reply_turn') or {}
+                            abandoned(self, turn.get('turn') if turn.get('host') == self.host_id else self.process.event_sequence)
                         self.store.put(self.key + '_reply_turn', None)
                         finish_turn(self.store, self._turn_rows)
                     self._track(set())
@@ -499,7 +516,7 @@ class CoordinatorSession:
                 self.process.ack()
         except Exception as exc:
             self._failure = internal_detail(exc)
-            problems.record(self.store, 'coordinator', 'reader-failed', self._failure, level=logging.ERROR)
+            problems.record(self.store, 'coordinator', 'reader-failed', self._failure, level=logging.ERROR, every=3600)
             if self.process.state == 'running':
                 asyncio.create_task(self.process.stop())
 
@@ -518,7 +535,7 @@ class CoordinatorSession:
                     if turn.get('host') != self.host_id:
                         turn = {'host': self.host_id, 'turn': str(uuid.uuid4())}
                         self.store.put(self.key + '_reply_turn', turn)
-                    started(self, turn['turn'], set())
+                    started(self, turn['turn'], set(), initial=rows)
 
     async def send(self, message_id, text, row_id=None):
         if self.closed or self._stopping or self.rejected or self.process.returncode is not None:
@@ -526,6 +543,10 @@ class CoordinatorSession:
         if self.movable() and (self.idle() or self.launch_state == 'detached'):
             self.relaunch(self._turn_rows | self._unreplayed, refresh=self._account_move() is not None)
             return 'closed'
+        from . import memory
+        notice = memory.claim_notice(self.store, self.topic)
+        if notice:
+            text += '\nYour memory index exceeds 40 lines. Trim the index without deleting memory notes.'
         message_id = str(message_id)
         rows = self.store.message_batch_rows(row_id) if row_id is not None else set()
         if rows:
@@ -536,12 +557,15 @@ class CoordinatorSession:
             self._sent_ids.add(message_id)
             self.busy = True
         self._sending += 1
+        receipt = None
         try:
             receipt = await self.control.steer(message_id, text)
             if receipt == 'received' and self.closed and rows & self._unreplayed:
                 return 'uncertain'
             return receipt
         finally:
+            if notice and receipt != 'received':
+                memory.release_notice(self.store, self.topic)
             self._sending -= 1
 
     def idle(self, *, ignore_recovery=False):
@@ -561,15 +585,17 @@ class CoordinatorSession:
 
     def _account_move(self):
         """Return to an available owner pick, or move off an ineligible account."""
-        if self.launch_state != 'native' or not self.account_alias:
+        if self.launch_state not in ('native', 'managed') or not self.account_alias:
             return None
         accounts = self.store.get('accounts', DEFAULT_ACCOUNTS)
-        pick = self.store.get('claude_account_pick')
-        if pick and pick != self.account_alias and self.router.available(accounts, pick):
+        pick = account_pick(self.store, self.model)
+        if pick and pick != self.account_alias and self.router.available(accounts, pick, model=self.model):
             return pick
-        if self.router.available(accounts, self.account_alias):
+        if self.launch_state == 'managed':
             return None
-        return self.router.select(accounts)
+        if self.router.available(accounts, self.account_alias, model=self.model):
+            return None
+        return self.router.select(accounts, model=self.model)
 
     _track = parent_state.track
 
@@ -590,7 +616,7 @@ class CoordinatorSession:
                 accounts = self.store.get('accounts', DEFAULT_ACCOUNTS)
                 logger.info('coordinator account move session=%s from=%s to=%s %s',
                             self.session_id, self.account_alias, self._account_move(),
-                            self.router.selection_reason(accounts, self.account_alias))
+                            self.router.selection_reason(accounts, self.account_alias, model=self.model))
                 self.store.put('account_status_refresh_requested', time.time())
             if self.launch_state == 'native' and self.protocol.background:
                 self.store.put(self.key + '_background_lost', self.protocol.background)
@@ -625,13 +651,21 @@ class CoordinatorSession:
 
     async def _stop(self):
         self._stopping = True
+        from .parent_replies import abandoned
+        with self.store.db:
+            abandoned(self)
         self.control.close()
         if not self.closed:
             await self.process.stop()
         await self._monitor_task
+        with self.store.db:
+            abandoned(self)
 
     async def detach(self):
         self._stopping = True
+        from .parent_replies import abandoned
+        with self.store.db:
+            abandoned(self)
         self.control.close()
         self._monitor_task.cancel()
         self.tasks[0].cancel()

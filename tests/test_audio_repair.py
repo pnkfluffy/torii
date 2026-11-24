@@ -20,7 +20,6 @@ class AudioRepairTests(unittest.IsolatedAsyncioTestCase):
         with self.store.db:
             self.store.put('owner', 7)
             self.store.put('group', -10042)
-            self.store.put('transcription_model', 'whisper')
             self.store.db.execute('INSERT INTO topics(id,chat,thread,name,cwd,enabled) VALUES (?,?,?,?,?,1)',
                                   ('-10042:4', -10042, 4, 'Chat', str(self.root)))
         self.api = ImageTelegram()
@@ -45,7 +44,7 @@ else:
     print('Fixture transcript')
 ''')
         python.chmod(0o700)
-        backend = 'macos' if transcribe.uses_mlx() else 'linux'
+        backend = 'macos' if transcribe.host_os.apple_silicon() else 'linux'
         revision = hashlib.sha256(Path(transcription.__file__).with_name(
             'transcription-' + backend + '.lock').read_bytes() + Path(transcribe.__file__).read_bytes()).hexdigest()
         (self.directory / 'ready').write_text(revision)
@@ -53,6 +52,9 @@ else:
             'HOME': str(self.root), 'PATH': '/usr/bin:/bin'})
         self.environment.start()
         self.addCleanup(self.environment.stop)
+        self.backend = patch.object(media, 'default_backend', return_value='whisper')
+        self.backend.start()
+        self.addCleanup(self.backend.stop)
 
     async def asyncTearDown(self):
         self.store.close()
@@ -108,7 +110,7 @@ else:
                 self.assertEqual(rows[0].get('transcript'), 'Fixture transcript')
                 self.assertEqual(deadline.call_args.args[1], expected)
 
-    async def test_selected_parakeet_repairs_only_its_files_for_parallel_notes(self):
+    async def test_parakeet_repairs_only_its_files_for_parallel_notes(self):
         parakeet = self.directory / 'parakeet'
         python = parakeet / 'venv/bin/python'
         python.parent.mkdir(parents=True)
@@ -118,15 +120,14 @@ else:
             'transcription-parakeet.lock').read_bytes() + Path(transcribe.__file__).read_bytes()).hexdigest()
         (parakeet / 'ready').write_text(revision)
         (self.directory / 'complete').write_text('inactive whisper fixture')
-        with self.store.db:
-            self.store.put('transcription_model', 'parakeet')
+        media.default_backend.return_value = 'parakeet'
         async def setup(state, on_repair=None, backend='parakeet'):
             env = {'HOME': str(self.root), 'PATH': '/usr/bin:/bin'}
             python = await asyncio.to_thread(transcription.prepare_environment, state, env, backend=backend)
             return python, env
-        with patch.object(transcription.platform, 'system', return_value='Darwin'), \
-                patch.object(transcription.platform, 'machine', return_value='arm64'), \
-                patch.object(transcription.platform, 'mac_ver', return_value=('27.0', (), 'arm64')), \
+        with patch.object(transcription.host_os.platform, 'system', return_value='Darwin'), \
+                patch.object(transcription.host_os.platform, 'machine', return_value='arm64'), \
+                patch.object(transcription.host_os.platform, 'mac_ver', return_value=('27.0', (), 'arm64')), \
                 patch.object(transcription.shutil, 'which', return_value='/fake/ffmpeg'), \
                 patch.object(media, 'setup_transcription', side_effect=setup):
             rows = await self.notes()
@@ -151,7 +152,7 @@ class SnapshotCompletenessTests(unittest.TestCase):
             hub = Mock()
             hub.snapshot_download.side_effect = fetch
             with patch.dict('sys.modules', {'huggingface_hub': hub}), \
-                    patch.object(transcribe, 'uses_mlx', return_value=True), \
+                    patch.object(transcribe.host_os, 'apple_silicon', return_value=True), \
                     patch.object(transcribe.sys, 'argv', ['transcribe.py', '--backend', 'whisper', '--repair']):
                 transcribe.main()
             self.assertEqual((directory / 'weights.safetensors').read_bytes(), b'complete fixture')
@@ -165,7 +166,7 @@ class SnapshotCompletenessTests(unittest.TestCase):
             with patch.dict('sys.modules', {'huggingface_hub': hub}):
                 for mlx, names in ((True, ('config.json', 'weights.safetensors')),
                                    (False, ('config.json', 'model.bin', 'tokenizer.json', 'vocabulary.json'))):
-                    with self.subTest(mlx=mlx), patch.object(transcribe, 'uses_mlx', return_value=mlx):
+                    with self.subTest(mlx=mlx), patch.object(transcribe.host_os, 'apple_silicon', return_value=mlx):
                         for name in names:
                             if name == names[1]:
                                 continue

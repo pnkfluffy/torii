@@ -12,12 +12,15 @@ import time
 import uuid
 
 from . import problems, parent_state
-from .codex_accounts import CodexBroker, codex_environment, codex_skills_pointer
+from .claude_settings import plugin_switches
+from .codex_accounts import PSTACK, CodexBroker, codex_environment, codex_skills_pointer
 from .failures import internal_detail
 from .native_protocol import NativeProtocol, RequestRejected, RunControl
 from .policy import chat_policy
 from .providers import ProviderRunner, codex_reasoning_effort
 from .session import AccountsUnavailable, message_row_groups, message_uuid
+from .shared_mcp import read_entries, codex_launch, codex_inherited, codex_selected
+from .scrub import Scrubber
 
 
 logger = logging.getLogger(__name__)
@@ -118,7 +121,7 @@ class CodexCoordinatorSession:
         if not binary:
             raise AccountsUnavailable(None, provider='codex', alias=session.router.active())
         selected_model = store.get('codex_model') or (
-            runner.codex_model() if callable(runner.codex_model) else runner.codex_model) or 'gpt-6.1-sol'
+            runner.codex_model() if callable(runner.codex_model) else runner.codex_model) or 'gpt-6.2-sol'
         agent = parent_state.effective_agent(store, key, 'codex', selected_model)
         selected_model = agent['model']
         saved_host = store.get(key + '_host')
@@ -129,17 +132,37 @@ class CodexCoordinatorSession:
             if account_home:
                 env = codex_environment(account_home)
         policy = chat_policy(store, key)
+        skill_text = ''
         prompt = instructions + '\nCurrent usage policy:\n' + policy
         if env is not None:
-            prompt += '\n## Codex skills\n\n' + codex_skills_pointer(env)
-        overrides = cls.overrides(store, topic=topic or main, key=key)
+            pstack = plugin_switches(store, topic or main).get(PSTACK) is not False
+            skill_text = '\n## Codex skills\n\n' + codex_skills_pointer(env, pstack)
+            prompt += skill_text
+        scrub = Scrubber({})
+        entries = read_entries(store, scrub, topic=topic or main)
+        mcp_servers, mcp_private = codex_launch(entries)
+        probe_error = None
+        if env is not None:
+            try:
+                inherited = await codex_inherited(binary, env, cwd, coordinator=True)
+            except RuntimeError as error:
+                if not saved_host:
+                    raise
+                probe_error = error
+                inherited = set()
+            mcp_servers = codex_selected(store, mcp_servers, inherited, topic=topic or main)
+        overrides = cls.overrides(store, topic=topic or main, key=key, servers=mcp_servers)
         from .mcp import tools_hash
         from .cli_identity import identity, PACKAGES
-        fingerprint = hashlib.sha256(json.dumps({'tools': tools_hash(), 'model': selected_model,
+        fingerprint_content = {'tools': tools_hash(store), 'model': selected_model,
             'effort': codex_reasoning_effort(agent['effort']),
-            'instructions': prompt, 'overrides': overrides,
-            'binary': binary, 'cli': identity(binary, PACKAGES['codex'])},
-            sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+            'instructions': instructions + skill_text, 'overrides': overrides,
+            'binary': binary, 'cli': identity(binary, PACKAGES['codex'])}
+        if entries:
+            fingerprint_content['mcp_digest'] = hashlib.sha256(json.dumps(entries, sort_keys=True).encode()).hexdigest()
+        if probe_error:
+            fingerprint_content['mcp_probe_failed'] = True
+        fingerprint = hashlib.sha256(json.dumps(fingerprint_content, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
         session.usage_policy = policy
         session.session_id = store.get(key + '_session')
         if session.session_id and str(uuid.UUID(session.session_id)) != session.session_id:
@@ -147,6 +170,7 @@ class CodexCoordinatorSession:
         try:
             attached = await parent_state.attach(session, saved_host, fingerprint)
             if attached:
+                session.usage_policy = None
                 session._home = (session.router.accounts().get(session.account_alias) or {}).get('config_dir')
                 session._turn_rows = set(store.get(key + '_turn') or [])
                 scope = None if key == 'coordinator' else topic
@@ -158,6 +182,8 @@ class CodexCoordinatorSession:
             else:
                 if reattach_only:
                     return None
+                if probe_error:
+                    raise probe_error
                 if alias is None:
                     raise AccountsUnavailable(session.router.account_state(session.router.active(), parent=True).get('until'),
                                               provider='codex', alias=session.router.active())
@@ -167,8 +193,11 @@ class CodexCoordinatorSession:
                 session._home = session.router.accounts()[alias]['config_dir']
                 command = [binary, *overrides, 'app-server', '--listen', 'stdio://']
                 locks = ['coordinator-' + key] + (['codex-' + session.session_id] if session.session_id else [])
+                if set(mcp_private) & set(env):
+                    raise ValueError('MCP header environment names conflict with the coordinator environment.')
                 if not await parent_state.launch(session, {'argv': command, 'cwd': str(cwd), 'env': env,
-                                                'provider': 'codex', 'fresh': not session.session_id, 'locks': locks}, fingerprint):
+                                                'provider': 'codex', 'fresh': not session.session_id, 'locks': locks}, fingerprint,
+                                                private={'env': mcp_private, 'scrub': scrub.forms}):
                     return None
             session.log_path = str(session.process.directory / 'events.jsonl')
             parent_state._active_clients.add(client_key)
@@ -187,7 +216,7 @@ class CodexCoordinatorSession:
                     if not session.session_id:
                         raise
                     problems.record(store, 'coordinator', 'resume-lost', 'key=%s session=%s' %
-                                    (key, session.session_id), level=logging.ERROR, topic=topic)
+                                    (key, session.session_id), level=logging.ERROR, topic=topic, every=3600)
                     session.resume_failed = True
                     session.session_id = session.protocol.session_id = None
                     with store.db:
@@ -220,7 +249,7 @@ class CodexCoordinatorSession:
             raise
 
     @staticmethod
-    def overrides(store, topic=None, key='coordinator'):
+    def overrides(store, topic=None, key='coordinator', servers=None):
         root = str(Path(__file__).resolve().parents[1])
         values = {'model_reasoning_effort': codex_reasoning_effort(parent_state.effective_agent(store, key, 'codex')['effort']),
                   'mcp_servers.torii.command': sys.executable,
@@ -230,7 +259,11 @@ class CodexCoordinatorSession:
                   'mcp_servers.torii.startup_timeout_sec': 30,
                   'mcp_servers.torii.default_tools_approval_mode': 'approve',
                   'mcp_servers.torii.omit_tools_from': ['deferred', 'code_mode']}
+        if servers:
+            values = {'mcp_servers': dict(servers), **values}
         values['skills.include_instructions'] = False
+        for name, enabled in plugin_switches(store, topic).items():
+            values['plugins.' + name + '.enabled'] = enabled
         return [part for key, value in values.items() for part in ('-c', key + '=' + toml(value))]
 
     def _observe_session(self, sid):
@@ -248,10 +281,6 @@ class CodexCoordinatorSession:
         thread = self.protocol.thread or {}
         path = thread.get('path') or thread.get('rolloutPath')
         self.transcript_path = path or transcript_path(self._home, self.session_id)
-
-    def _event_consumed(self, seq):
-        with self.store.db:
-            self.store.put(self.key + '_host_seq', seq)
 
     def _restore_state(self, past):
         requests = {}
@@ -305,11 +334,7 @@ class CodexCoordinatorSession:
     def _reply_started(self, turn, outbox=None, rows=()):
         from .parent_replies import started
         with self.store.transaction():
-            started(self, turn, set(), outbox)
-            if self.store.get('coordinator_intake_batching', False) is not True and not any(
-                    row['batch_id'] is not None for message in rows for row in
-                    self.store.db.execute('SELECT batch_id FROM messages WHERE id=?', (message,))):
-                return
+            started(self, turn, set(), outbox, initial=rows)
             saved = self.store.db.execute('SELECT * FROM parent_reply_turns WHERE host=? AND turn=?',
                                           (self.host_id, str(turn))).fetchone()
             if saved['checked']:
@@ -331,6 +356,7 @@ class CodexCoordinatorSession:
         topic = (self.key.split(':', 1)[1] if self.key != 'coordinator' else
                  self.store.get('coordinator_session_topic') or self.store.get('coordinator_home_topic'))
         with self.store.transaction():
+            self.router.notify_credit_use(self.account_alias)
             self.store.put(self.key + '_reply_start:' + str(request),
                            {'host': self.host_id, 'outbox': outbox_cursor(self.store, topic)})
 
@@ -366,6 +392,10 @@ class CodexCoordinatorSession:
                 self._turn_rows -= rows
                 self._rows = {wire: members for wire, members in self._rows.items() if members.isdisjoint(rows)}
                 return
+            if kind == 'turn.failed':
+                from .parent_replies import abandoned
+                with self.store.db:
+                    abandoned(self, turn_id)
             if kind == 'turn.failed' and event['error'].get('codex_error_info') == 'usage_limit_exceeded':
                 with self.store.db:
                     self.router.record_rate_limit(self.account_alias, self._limits, rejected=True, parent=True)
@@ -429,7 +459,7 @@ class CodexCoordinatorSession:
                 self.process.ack()
         except Exception as error:
             self._failure = internal_detail(error)
-            problems.record(self.store, 'coordinator', 'reader-failed', self._failure, level=logging.ERROR)
+            problems.record(self.store, 'coordinator', 'reader-failed', self._failure, level=logging.ERROR, every=3600)
             if self.process.state == 'running':
                 asyncio.create_task(self.process.stop())
 
@@ -469,7 +499,7 @@ class CodexCoordinatorSession:
 
     def movable(self):
         return (parent_state.selection_changed(self) or self.stale or self.outdated or
-                self._rate_limited or self.account_alias != self.router.active())
+                self._rate_limited or self.account_alias != (self.router.parent_account() or self.router.active()))
 
     def relaunch(self, rows=()):
         if not parent_state.topic_enabled(self.store, self.key):
@@ -500,19 +530,29 @@ class CodexCoordinatorSession:
 
     async def _stop(self):
         self._stopping = True
+        from .parent_replies import abandoned
+        with self.store.db:
+            abandoned(self)
         self.control.close()
         if not self.closed:
             await self.process.stop()
         await self._monitor_task
+        with self.store.db:
+            abandoned(self)
 
     async def detach(self):
         self._stopping = True
+        from .parent_replies import abandoned
+        with self.store.db:
+            abandoned(self)
         self.control.close()
         self._monitor_task.cancel()
         for task in self.tasks:
             task.cancel()
         await asyncio.gather(self._monitor_task, *self.tasks, return_exceptions=True)
         self.process.detach()
+        with self.store.db:
+            abandoned(self)
         parent_state._active_clients.discard((str((self.runner.state_dir / 'hosts').resolve()), self.key))
 
     async def wait_closed(self):

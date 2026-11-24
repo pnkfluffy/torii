@@ -6,7 +6,6 @@ import hashlib
 import io
 import os
 from pathlib import Path
-import platform
 import shutil
 import signal
 import subprocess
@@ -15,6 +14,11 @@ import tarfile
 import tempfile
 import time
 import urllib.request
+
+if __package__:
+    from . import host_os
+else:
+    import host_os
 
 SETUP_TIMEOUT = 3600
 REPAIR_RETRY = 60
@@ -37,14 +41,11 @@ class ModelUnavailable(RuntimeError):
 
 def check_voice_support(backend='parakeet', env=None):
     if backend == 'parakeet':
-        if (platform.system() != 'Darwin' or platform.machine() != 'arm64' or
-                int(platform.mac_ver()[0].split('.')[0] or 0) < 26):
-            raise UnsupportedVoice('Parakeet voice transcription requires Apple silicon and macOS 26 or newer. '
-                                   'Select Whisper on this platform.')
+        if not host_os.apple_silicon_at_least(26):
+            raise UnsupportedVoice('Parakeet voice transcription requires Apple silicon and macOS 26 or newer.')
         if not shutil.which('ffmpeg', path=(env or environment())['PATH']):
             raise UnsupportedVoice('ffmpeg is required for Parakeet voice transcription. Install ffmpeg and retry the note.')
-    if platform.system() == 'Darwin' and (platform.machine() != 'arm64' or
-                                          int(platform.mac_ver()[0].split('.')[0] or 0) < 14):
+    if host_os.apple_voice_unsupported():
         raise UnsupportedVoice('Voice notes require macOS 14 or newer on Apple silicon.')
 
 
@@ -71,7 +72,7 @@ def uv_binary(directory, env):
     binary = directory / 'uv'
     if binary.is_file():
         return str(binary)
-    target, digest = UV_ARCHIVES[(platform.system(), platform.machine())]
+    target, digest = host_os.host_archive(UV_ARCHIVES)
     url = 'https://github.com/astral-sh/uv/releases/download/' + UV_VERSION + '/uv-' + target + '.tar.gz'
     with urllib.request.urlopen(url, timeout=120) as response:
         archive = response.read(32 * 1024 * 1024 + 1)
@@ -91,21 +92,51 @@ def uv_binary(directory, env):
 
 def prepare_environment(state, env, backend='parakeet'):
     check_voice_support(backend, env)
-    directory = Path(state) / 'transcription'
+    root = Path(state).resolve() / 'transcription'
+    env = dict(env, HF_HOME=str(root / 'huggingface'))
+    directory = root
     if backend == 'parakeet':
         directory = directory / 'parakeet'
     directory.mkdir(parents=True, exist_ok=True, mode=0o700)
-    if platform.system() not in ('Darwin', 'Linux'):
+    if not host_os.supported_voice_platform():
         raise RuntimeError('unsupported platform')
-    lock_name = ('parakeet' if backend == 'parakeet' else
-                 'macos' if platform.system() == 'Darwin' and platform.machine() == 'arm64' else 'linux')
+    lock_name = 'parakeet' if backend == 'parakeet' else host_os.apple_silicon_choice('macos', 'linux')
     lock = Path(__file__).with_name('transcription-' + lock_name + '.lock')
     script = Path(__file__).with_name('transcribe.py')
     revision = hashlib.sha256(lock.read_bytes() + script.read_bytes()).hexdigest()
     python = directory / 'venv/bin/python'
     ready = directory / 'ready'
-    with (directory / 'setup.lock').open('a') as guard:
+    with (root / 'setup.lock').open('a') as guard:
         fcntl.flock(guard, fcntl.LOCK_EX)
+        model = ('mlx-community--parakeet-tdt-0.6b-v3' if backend == 'parakeet' else host_os.apple_silicon_choice(
+            'mlx-community--whisper-large-v3-turbo', 'mobiuslabsgmbh--faster-whisper-large-v3-turbo'))
+        if env.get('HOME'):
+            name = 'models--' + model
+            old = Path(env['HOME']) / '.cache/huggingface/hub' / name
+            hub = root / 'huggingface/hub'
+            target = hub / name
+            if old.is_dir() and not target.exists():
+                staging = hub / (name + '.migrating')
+                try:
+                    hub.mkdir(parents=True, exist_ok=True, mode=0o700)
+                    if staging.is_symlink():
+                        staging.unlink()
+                    elif staging.exists():
+                        shutil.rmtree(staging)
+                    size = sum(path.stat().st_size for path in old.rglob('*')
+                               if path.is_file() and not path.is_symlink())
+                    if shutil.disk_usage(hub)[2] < size:
+                        raise OSError('insufficient space for model migration')
+                    shutil.copytree(old, staging, symlinks=True, copy_function=host_os.copy_model_file)
+                    os.replace(staging, target)
+                except (OSError, shutil.Error):
+                    if staging.is_symlink():
+                        staging.unlink(missing_ok=True)
+                    elif staging.exists():
+                        shutil.rmtree(staging, ignore_errors=True)
+                    env['HF_HOME'] = str(Path(env['HOME']) / '.cache/huggingface')
+                    env['HF_HUB_OFFLINE'] = '1'
+                    print('model-cache-fallback', flush=True)
         def run(command):
             subprocess.run(command, env=env, cwd=directory, check=True, timeout=SETUP_TIMEOUT,
                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -149,6 +180,7 @@ def prepare_environment(state, env, backend='parakeet'):
 async def setup(state, on_repair=None, backend='parakeet'):
     env = environment()
     check_voice_support(backend, env)
+    env['HF_HOME'] = str(Path(state).resolve() / 'transcription/huggingface')
     env['XDG_CONFIG_HOME'] = str(Path(state).resolve() / 'config')
     process = await asyncio.create_subprocess_exec(
         sys.executable, '-X', 'utf8', str(Path(__file__).resolve()), str(Path(state).resolve()), backend,
@@ -157,6 +189,9 @@ async def setup(state, on_repair=None, backend='parakeet'):
     try:
         output, _ = await process.communicate()
         lines = output.decode('utf-8').strip().splitlines()
+        if 'model-cache-fallback' in lines:
+            env['HF_HOME'] = str(Path(env['HOME']) / '.cache/huggingface')
+            env['HF_HUB_OFFLINE'] = '1'
         if 'model-repair' in lines and on_repair:
             on_repair()
         if process.returncode == 2:

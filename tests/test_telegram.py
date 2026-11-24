@@ -188,6 +188,7 @@ class TelegramTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_plain_retry_keeps_link_urls_for_messages_edits_and_captions(self):
         api = object.__new__(Telegram)
+        api._store = None
         url = 'https://example.test/?a=1&b=2'
         with tempfile.TemporaryDirectory() as temp:
             image = Path(temp) / 'image.png'
@@ -204,6 +205,7 @@ class TelegramTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_plain_retry_keeps_long_link_urls_without_exceeding_capacity(self):
         api = object.__new__(Telegram)
+        api._store = None
         url = 'https://example.test/' + 'a' * 5000
         with tempfile.TemporaryDirectory() as temp:
             image = Path(temp) / 'image.png'
@@ -422,6 +424,47 @@ class TelegramTests(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(call.call_args.args[1]['message_thread_id'], 7)
                     self.assertEqual(call.call_args.args[1]['reply_parameters']['message_id'], 9)
                     self.assertEqual(call.call_args.args[1]['parse_mode'], 'HTML')
+
+    async def test_motion_uploads_and_document_override(self):
+        with tempfile.TemporaryDirectory() as temp:
+            token = Path(temp) / 'token'
+            token.write_text('test-token')
+            api = Telegram(token)
+            for suffix, method, field in (('.mp4', 'sendVideo', 'video'), ('.MOV', 'sendVideo', 'video'),
+                                          ('.m4v', 'sendVideo', 'video'), ('.gif', 'sendAnimation', 'animation')):
+                image = Path(temp) / ('clip' + suffix)
+                image.write_bytes(b'media')
+                row = {'chat': -42, 'thread': 7, 'text': 'Attached', 'image': str(image)}
+                with patch.object(api, '_request', return_value={'message_id': 12}) as request:
+                    await api.send(row)
+                    await api.send(row)
+                    for invocation in request.call_args_list:
+                        self.assertEqual(invocation.args[0], method)
+                        body = invocation.args[1]
+                        self.assertIn(('name="%s"; filename=' % field).encode(), body)
+                        self.assertEqual(b'name="supports_streaming"\r\n\r\ntrue' in body, method == 'sendVideo')
+                    row['as_document'] = True
+                    await api.send(row)
+                    self.assertEqual(request.call_args.args[0], 'sendDocument')
+                    self.assertIn(b'name="document"; filename=', request.call_args.args[1])
+
+    async def test_media_rejection_falls_back_to_document_and_records_problem(self):
+        with tempfile.TemporaryDirectory() as temp:
+            token = Path(temp) / 'token'
+            token.write_text('test-token')
+            api = Telegram(token, store=Mock())
+            for suffix, method in (('.png', 'sendPhoto'), ('.mp4', 'sendVideo'), ('.gif', 'sendAnimation')):
+                image = Path(temp) / ('clip' + suffix)
+                image.write_bytes(b'media')
+                with patch.object(api, 'call_multipart', side_effect=[TelegramError(400), {'message_id': 12}]) as send, \
+                        patch('coordinator.problems.record') as record:
+                    await api.send({'chat': -42, 'thread': 7, 'text': '**Attached**', 'image': str(image)})
+                    self.assertEqual([item.args[0] for item in send.call_args_list], [method, 'sendDocument'])
+                    self.assertEqual(send.call_args.args[2], str(image))
+                    self.assertNotIn('supports_streaming', send.call_args.args[1])
+                    self.assertEqual(send.call_args.args[1]['caption'], 'Attached')
+                    record.assert_called_once_with(api._store, 'telegram', 'media-send-failed',
+                                                   'method=%s telegram=400' % method)
 
     async def test_as_document_forces_document_for_small_photo(self):
         with tempfile.TemporaryDirectory() as temp:

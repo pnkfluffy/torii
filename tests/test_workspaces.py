@@ -27,6 +27,7 @@ class WorkspaceTests(unittest.IsolatedAsyncioTestCase):
         self.git('commit', '-qm', 'base')
         self.base = self.git('rev-parse', 'HEAD').stdout.strip()
         self.state = self.root / 'state'
+        workspaces._DEFAULT_BRANCHES.clear()
 
     def tearDown(self):
         self.temp.cleanup()
@@ -34,6 +35,19 @@ class WorkspaceTests(unittest.IsolatedAsyncioTestCase):
     def git(self, *args, cwd=None, check=True):
         return subprocess.run(('git', '-C', str(cwd or self.project), *args), check=check,
                               text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+    async def test_a_saved_volume_tree_without_the_tree_maker_uses_git_worktree(self):
+        from coordinator import extension
+        real = extension.optional
+        self.state.mkdir()
+        self.git('branch', 'torii/task-2')
+        saved = self.state.resolve() / 'cow-worktrees' / 'task-2'
+        with patch.object(extension, 'optional', lambda name: None if name == 'tree_maker' else real(name)), \
+                patch.object(workspaces, '_mounted', lambda path: True):
+            made = await prepare_task_workspace(self.project, self.state, 2, saved_cwd=str(saved))
+        self.assertEqual(Path(made['cwd']), saved.resolve())
+        self.assertEqual(self.git('rev-parse', 'HEAD', cwd=saved).stdout.strip(), self.base)
+        self.assertEqual(self.git('branch', '--show-current', cwd=saved).stdout.strip(), 'torii/task-2')
 
     def linked_worktree(self, name):
         linked = self.root / name
@@ -73,6 +87,54 @@ class WorkspaceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.git('rev-parse', 'origin/main').stdout.strip(), self.base)
         result = await prepare_task_workspace(self.project, self.state, 1)
         self.assert_workspace_base(result, tip, 'origin/main', True)
+
+    def set_remote_default(self, branch):
+        self.git('symbolic-ref', 'HEAD', 'refs/heads/' + branch, cwd=self.root / 'origin.git')
+
+    async def test_job_starts_from_remote_default_not_checkout_upstream(self):
+        publisher = self.remote_project()
+        tip = self.publish_commit(publisher, 'trunk')
+        self.publish_commit(publisher, 'main')
+        self.set_remote_default('trunk')
+        result = await prepare_task_workspace(self.project, self.state, 1)
+        self.assert_workspace_base(result, tip, 'origin/trunk', True)
+
+    async def test_checkout_without_upstream_starts_from_origin_default(self):
+        publisher = self.remote_project()
+        tip = self.publish_commit(publisher, 'trunk')
+        self.set_remote_default('trunk')
+        self.git('checkout', '-qb', 'local-only')
+        result = await prepare_task_workspace(self.project, self.state, 1)
+        self.assert_workspace_base(result, tip, 'origin/trunk', True)
+
+    async def test_project_setting_overrides_remote_default(self):
+        publisher = self.remote_project()
+        self.publish_commit(publisher, 'trunk')
+        tip = self.publish_commit(publisher, 'integration')
+        self.set_remote_default('trunk')
+        self.git('config', 'torii.defaultBase', 'origin/integration')
+        result = await prepare_task_workspace(self.project, self.state, 1)
+        self.assert_workspace_base(result, tip, 'origin/integration', True)
+
+    async def test_unreadable_remote_default_keeps_checkout_upstream(self):
+        publisher = self.remote_project()
+        tip = self.publish_commit(publisher, 'main')
+        self.publish_commit(publisher, 'trunk')
+        self.set_remote_default('trunk')
+        self.git('fetch', '-q', 'origin')
+        self.git('remote', 'set-url', 'origin', str(self.root / 'missing.git'))
+        result = await prepare_task_workspace(self.project, self.state, 1)
+        self.assert_workspace_base(result, tip, 'origin/main', False)
+
+    async def test_remote_default_is_cached_briefly(self):
+        self.remote_project()
+        self.set_remote_default('main')
+        self.assertEqual(await workspaces._remote_default(self.project, 'origin'), 'main')
+        self.set_remote_default('trunk')
+        self.git('push', '-q', 'origin', 'main:refs/heads/trunk')
+        self.assertEqual(await workspaces._remote_default(self.project, 'origin'), 'main')
+        with patch('coordinator.workspaces.DEFAULT_BRANCH_TTL', 0):
+            self.assertEqual(await workspaces._remote_default(self.project, 'origin'), 'trunk')
 
     async def test_explicit_base_starts_from_fetched_branch_tip(self):
         publisher = self.remote_project()
@@ -193,8 +255,9 @@ class WorkspaceTests(unittest.IsolatedAsyncioTestCase):
                           'time.sleep(60)\n')
         helper.chmod(0o700)
         self.git('remote', 'set-url', 'origin', 'slow::unused')
-        with patch.dict(os.environ, {'PATH': str(self.root) + os.pathsep + os.environ['PATH']}), \
-                patch('coordinator.workspaces.FETCH_TIMEOUT', 1):
+        with patch.dict(os.environ, {'PATH': str(self.root) + os.pathsep + os.environ.get('PATH', os.defpath)}), \
+                patch('coordinator.workspaces.FETCH_TIMEOUT', 1), \
+                patch('coordinator.workspaces.LS_REMOTE_TIMEOUT', 1):
             result = await prepare_task_workspace(self.project, self.state, 1)
         self.assertTrue(ready.exists())
         await until_unlocked(lock, 'the timed-out fetch process group to die')

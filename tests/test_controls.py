@@ -21,8 +21,6 @@ class ControlTests(unittest.TestCase):
         self.store.put('coordinator_home_topic', '1:2')
         self.store.put('opencode_accounts', {'example-host': {'model': 'example-model'}})
         cases = (
-            ({'topic': '1:2'}, True, 'example-host', 'The home chat stays on Claude or ChatGPT.'),
-            ({}, True, 'example-host', 'Pick OpenCode for one chat with topic.'),
             ({'topic': '1:3'}, None, 'example-host', 'OpenCode is off. Turn on delegation.opencode first.'),
             ({'topic': '1:3'}, False, 'example-host', 'OpenCode is off. Turn on delegation.opencode first.'),
             ({'topic': '1:3'}, 'true', 'example-host', 'OpenCode is off. Turn on delegation.opencode first.'),
@@ -43,6 +41,20 @@ class ControlTests(unittest.TestCase):
                 self.assertEqual([tuple(row) for row in self.store.db.execute('SELECT * FROM settings ORDER BY key')], before)
                 self.assertEqual(self.store.db.execute('SELECT count(*) FROM service_requests').fetchone()[0], 0)
                 self.assertEqual(self.store.db.execute('SELECT count(*) FROM outbox').fetchone()[0], 0)
+
+    def test_model_parent_accepts_opencode_for_the_home_chat_and_the_default(self):
+        from coordinator import control_api
+        self.store.db.execute('UPDATE topics SET cwd=?', (self.temp.name,))
+        self.store.put('coordinator_home_topic', '1:2')
+        self.store.put('opencode_enabled', True)
+        self.store.put('opencode_accounts', {'example-host': {'model': 'example-model'}})
+        self.store.put('opencode_active_account', 'example-host')
+        home = control_api.call(self.store, 'model.parent', {'topic': '1:2', 'provider': 'opencode'})
+        self.assertTrue(home.ok, home.text)
+        self.assertEqual(self.store.get('coordinator_selection')['provider'], 'opencode')
+        default = control_api.call(self.store, 'model.parent', {'provider': 'opencode'})
+        self.assertTrue(default.ok, default.text)
+        self.assertEqual(self.store.get('parent_selection'), {'provider': 'opencode', 'model': None})
 
     def test_model_parent_opencode_stores_null_model_and_effort(self):
         from coordinator import control_api, parent_state
@@ -238,43 +250,38 @@ class ControlTests(unittest.TestCase):
         self.assertNotIn('Parent selection:', picked)
         self.assertIn('Parent selection: codex gpt-6.1-sol after active work settles.', unpicked)
 
-    def test_d8_chat_policy_status_preview_and_show(self):
-        from coordinator import control_api, mcp
-        from coordinator.controls import _status_card
-        from coordinator.policy import chat_policy, usage_policy
-        self.store.put('coordinator_home_topic', '1:2')
-        self.store.db.execute('UPDATE topics SET cwd=?', (self.temp.name,))
-        baseline = _status_card(self.store, '1:2')
-        self.assertNotIn('Delegation:', baseline)
-        text = 'Alpha  \n' + 'b' * 100
-        for topic, key in (('1:2', 'coordinator'), ('1:3', 'coordinator:1:3')):
-            self.store.put(key + '_delegation', {'text': text, 'revision': 1})
-            card = _status_card(self.store, topic)
-            preview = 'Delegation: own instructions · ' + ' '.join(text.split())[:60] + '…'
-            self.assertEqual(card.splitlines()[3], preview)
-            shown = control_api.call(self.store, 'policy.show', {'topic': topic})
-            self.assertEqual(shown.text, chat_policy(self.store, key))
-        card = _status_card(self.store, '1:2')
-        self.assertEqual('\n'.join(line for line in card.splitlines() if not line.startswith('Delegation:')), baseline)
-        self.assertEqual(control_api.call(self.store, 'policy.show').text, usage_policy(self.store.directory))
-        response = mcp.dispatch(self.store,
-            {'method': 'tools/call', 'params': {'name': 'policy_show'}}, topic='1:2')
-        self.assertEqual(response['content'][0]['text'], usage_policy(self.store.directory) + '\nnull')
-        self.store.put('coordinator_delegation', {'text': 'Short.', 'revision': 2})
-        self.assertEqual(_status_card(self.store, '1:2').splitlines()[3], 'Delegation: own instructions · Short.')
-
     def test_claude_use_saves_pick_requests_fresh_usage_and_automatic_clears_it(self):
         from coordinator import control_api
         with self.store.db:
             result = control_api.call(self.store, 'account.use', {'alias': 'work'}, topic='1:3')
         self.assertEqual((result.ok, result.text), (True, 'work@example.com is picked for Claude; its usage is being checked.'))
-        self.assertEqual(self.store.get('claude_account_pick'), 'work')
+        self.assertEqual(self.store.get('claude_account_pick'), {'fable': 'work', 'other': 'work'})
         self.assertEqual(self.store.get('claude_pick_refresh')['topic'], '1:3')
         request = self.store.get('claude_pick_refresh')
         control_api.call(self.store, 'account.use', {'alias': 'work'})
         self.assertGreater(self.store.get('claude_pick_refresh')['id'], request['id'])
         result = control_api.call(self.store, 'accounts.claude_auto')
         self.assertEqual((result.ok, result.text), (True, 'Claude account choice is automatic. Running chats stay on their account while it can take work.'))
+        self.assertIsNone(self.store.get('claude_account_pick'))
+        self.assertIsNone(self.store.get('claude_pick_refresh'))
+
+    def test_claude_use_and_automatic_change_one_model_group(self):
+        from coordinator import control_api
+        with self.store.db:
+            control_api.call(self.store, 'account.use', {'alias': 'primary'})
+            result = control_api.call(self.store, 'account.use', {'alias': 'work', 'models': 'fable'}, topic='1:3')
+        self.assertEqual((result.ok, result.text),
+                         (True, 'work@example.com is picked for Claude Fable; its usage is being checked.'))
+        self.assertEqual(self.store.get('claude_account_pick'), {'fable': 'work', 'other': 'primary'})
+        self.assertEqual(self.store.get('claude_pick_refresh')['models'], ['fable'])
+        result = control_api.call(self.store, 'accounts.claude_auto', {'models': 'other'})
+        self.assertEqual(result.text, 'Claude models other than Fable account choice is automatic. '
+                                      'Running chats stay on their account while it can take work.')
+        self.assertEqual(self.store.get('claude_account_pick'), {'fable': 'work', 'other': None})
+        self.assertIsNotNone(self.store.get('claude_pick_refresh'))
+        self.assertEqual(control_api.call(self.store, 'account.use', {'alias': 'work', 'models': 'all'}).text,
+                         'Send fable or other for models.')
+        control_api.call(self.store, 'accounts.claude_auto', {'models': 'fable'})
         self.assertIsNone(self.store.get('claude_account_pick'))
         self.assertIsNone(self.store.get('claude_pick_refresh'))
 
@@ -335,7 +342,7 @@ class ControlTests(unittest.TestCase):
             self.store, 'settings.show', {'topic': '1:2'}).text)
         for provider, label, setting, default, override in (
                 ('claude', 'Claude', 'coordinator_model', 'sonnet', 'claude-sonnet-4-6'),
-                ('codex', 'ChatGPT', 'codex_model', 'gpt-6.1-sol', 'gpt-6-luna')):
+                ('codex', 'ChatGPT', 'codex_model', 'gpt-6.2-sol', 'gpt-6-luna')):
             with self.subTest(provider=provider), self.store.db:
                 self.store.put('coordinator_provider', provider)
                 self.store.put(setting, None)
@@ -376,7 +383,7 @@ class ControlTests(unittest.TestCase):
             self.store.put('worker_model', None)
         text = control_api.call(self.store, 'settings.show', {'topic': '1:2'}).text
         self.assertIn('Chat agent: ChatGPT', text)
-        self.assertIn('Models: Claude workers native default · chat agent gpt-6.1-sol', text)
+        self.assertIn('Models: Claude workers native default · chat agent gpt-6.2-sol', text)
 
 
 
@@ -422,10 +429,10 @@ class ControlTests(unittest.TestCase):
             self.store.put('account_status', status)
             self.store.put('account_blocks', {'primary': {'reason': 'threshold', 'until': now + 11520}})
         with patch('coordinator.accounts.switch_threshold', return_value=.8), \
-                patch('coordinator.controls.switch_threshold', side_effect=lambda store, alias=None: .8 if alias else .98), \
+                patch('coordinator.controls.switch_threshold', side_effect=lambda store, alias=None: .8 if alias else .99), \
                 patch('time.time', return_value=now):
             text = _account_card(self.store, 'primary')
-        self.assertIn('5-hour: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 100%', text)
+        self.assertNotIn('5-hour:', text)
         self.assertIn('Weekly (all models): 🟩🟩⬜⬜⬜⬜⬜⬜⬜⬜ 19%', text)
         self.assertIn('Paused: weekly reached its 20% reserve · back in 3h 12m', text)
         self.assertIn('Fable weekly: no data', text)
@@ -446,10 +453,10 @@ class ControlTests(unittest.TestCase):
                 'identity': {'logged_in': True, 'email': 'work@example.com'},
                 'observed_at': now,
                 'usage': {'five_hour': {'utilization': 0},
-                          'seven_day': {'utilization': 98, 'resets_at': now + 7200}}}})
+                          'seven_day': {'utilization': 99, 'resets_at': now + 7200}}}})
             self.store.put('account_blocks', {'work': {'until': None, 'reason': 'quota'}})
             card = control_api.call(self.store, 'account.show', {'alias': 'work'}).text
-        self.assertIn('5-hour: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 100% · resets later', card)
+        self.assertNotIn('5-hour:', card)
         self.assertIn('Fable weekly: no data', card)
         self.assertIn('Paused: Claude refused requests · back in 1h 59m', card)
 
@@ -465,7 +472,7 @@ class ControlTests(unittest.TestCase):
                           'seven_day': {'utilization': 43}, 'seven_day_fable': {'utilization': 81}}}})
         with patch('subprocess.Popen', side_effect=AssertionError('process started')):
             text = self.command('/accounts')
-        for value in ('work@example.com', '88%', '57%', '19%', '5h', 'week', 'Fable'):
+        for value in ('work@example.com', '57%', '19%', 'week', 'Fable'):
             self.assertIn(value, text)
         self.assertNotIn('Work account', text)
         self.assertEqual(self.store.tasks_list(), [])
@@ -499,7 +506,7 @@ class ControlTests(unittest.TestCase):
             self.store.put('model_account_usage', {'primary': {'opus': {'utilization': .91, 'observed_at': 1}}})
         text = self.command('/accounts')
         self.assertIn('new@example.com', text)
-        self.assertIn('🟡 new@example.com: ? · ? · ?', text)
+        self.assertIn('🟡 new@example.com: ? · ?', text)
         self.assertNotIn('91%', text)
         self.assertNotIn('Last agent observation', text)
 
@@ -513,7 +520,7 @@ class ControlTests(unittest.TestCase):
                           'error': 'timeout', 'checked_at': 3},
                 'work': {'identity': {'email': 'same@example.com', 'logged_in': True}}})
         text = self.command('/accounts')
-        self.assertIn('🟡 same@example.com: ? · 100% · ?', text)
+        self.assertIn('🟡 same@example.com: 100% · ?', text)
         self.assertIn('stale since 1970-01-01 00:00:01 UTC', text)
         self.assertIn('stale since unknown', text)
         self.assertIn('· same login as same@example.com', text)
@@ -531,12 +538,12 @@ class ControlTests(unittest.TestCase):
                 }}, 'work': {'identity': {'email': 'work@example.com', 'logged_in': True}}})
         with patch('coordinator.controls.time.time', return_value=now):
             text = self.command('/accounts')
-        self.assertIn('primary@example.com: 0% · 87.5% · 54%', text)
-        self.assertIn('(left: 5h · week · Fable)', text)
-        self.assertIn('work@example.com: ? · ? · ?', text)
+        self.assertIn('primary@example.com: 87.5% · 54%', text)
+        self.assertIn('(left: week · Fable)', text)
+        self.assertIn('work@example.com: ? · ?', text)
         self.assertEqual(text.count('primary@example.com'), 1)
         self.assertEqual(text.count('work@example.com'), 1)
-        self.assertEqual(text.count('? · ? · ?'), 1)
+        self.assertEqual(text.count('? · ?'), 1)
         window_lines = [line for line in text.splitlines()
                         if line.startswith(('5-hour:', 'Fable weekly:', 'Weekly (all models):'))]
         self.assertTrue(all('UTC' not in line for line in window_lines))
@@ -557,6 +564,7 @@ class ControlTests(unittest.TestCase):
 
 **Accounts**
 /accounts - usage, sign-ins, resets, models
+/login PROVIDER EMAIL - sign a listed account in again
 
 **Projects**
 /projects - your projects, new projects, this topic's folder
@@ -565,6 +573,7 @@ class ControlTests(unittest.TestCase):
 /tldr - catch up on this topic since your last message
 /waiting - what is waiting on you
 /goal CONDITION - keep the agent working until CONDITION holds
+/keep - show or set this chat's keep destination
 
 **Service**
 /health - running agents and system load
@@ -572,15 +581,72 @@ class ControlTests(unittest.TestCase):
 /ping - check that Torii is listening
 /help - this list"""
         self.assertEqual(_HELP, expected)
-        self.assertEqual(self.command('/help'), expected.replace('/waiting - what is waiting on you\n', ''))
-        self.store.put('waits_enabled', True)
-        self.assertEqual(self.command('/help'), expected)
+        from coordinator.health import _subscription
+        balances = '\n\n' + _subscription(self.store) + '\n\n**ChatGPT left** (week)\nNo accounts'
+        self.assertEqual(self.command('/help'), expected + balances)
 
     def test_usage_keeps_only_top_commands_and_hidden_aliases(self):
-        self.assertEqual(set(_USAGE), {'/help', '/setup', '/start', '/accounts', '/projects', '/update',
-                                      '/project', '/health', '/tldr', '/waiting', '/secrets', '/service'})
+        self.assertEqual(set(_USAGE), {'/help', '/setup', '/start', '/accounts', '/login', '/projects', '/update',
+                                      '/project', '/health', '/tldr', '/waiting', '/secrets', '/service', '/keep', '/status'})
         for command in ('/accounts', '/projects', '/secrets', '/help', '/health', '/waiting'):
             self.assertEqual(_USAGE[command], command)
+
+    def signed_out_for_login(self):
+        statuses = self.store.get('account_status')
+        statuses['primary']['identity']['logged_in'] = False
+        self.store.put('account_status', statuses)
+        self.store.put('bot_username', 'torii_test_bot')
+        self.store.put('codex_accounts', {'gpt': {'config_dir': self.temp.name, 'enabled': True},
+                                          'twin': {'config_dir': self.temp.name, 'enabled': True}})
+        self.store.put('codex_account_status', {'gpt': {'identity': {'email': 'gpt@example.com', 'logged_in': False}},
+                                                'twin': {'identity': {'email': 'work@example.com', 'logged_in': True}}})
+
+    def test_login_starts_the_signed_out_account_sign_in(self):
+        self.signed_out_for_login()
+        for text, alias, name in (('/login claude primary@example.com', 'primary', 'Claude'),
+                                  ('/login CLAUDE Primary@Example.com', 'primary', 'Claude'),
+                                  ('/login@torii_test_bot ChatGPT gpt@example.com', 'gpt', 'ChatGPT'),
+                                  ('/login codex gpt@example.com', 'gpt', 'ChatGPT'),
+                                  ('/login gpt@example.com', 'gpt', 'ChatGPT')):
+            with self.subTest(text=text):
+                with patch('coordinator.signin.accounts_root', return_value=Path(self.temp.name) / 'accounts'):
+                    reply = self.command(text)
+                self.assertEqual(reply, 'Starting %s sign-in. The sign-in card follows in a moment.'
+                                 % ('Codex' if name == 'ChatGPT' else name))
+                record = self.store.get('account_signin')
+                self.assertEqual(record['target'], alias)
+                self.assertEqual(record.get('provider', 'claude'), 'codex' if name == 'ChatGPT' else 'claude')
+                self.store.put('account_signin', None)
+
+    def test_login_refusals_list_the_matching_accounts(self):
+        self.signed_out_for_login()
+        cases = (
+            ('/login', 'Usage: /login PROVIDER EMAIL (claude, chatgpt, antigravity), or /login EMAIL.\n'
+                       'Signed out: Claude primary@example.com, ChatGPT gpt@example.com.'),
+            ('/login claude nobody@example.com', 'No Claude account is nobody@example.com. '
+                                                 'Claude accounts: primary@example.com, work@example.com.'),
+            ('/login nobody@example.com', 'No listed account is nobody@example.com. Listed accounts: '
+                                          'Claude primary@example.com, Claude work@example.com, '
+                                          'ChatGPT gpt@example.com, ChatGPT work@example.com.'),
+            ('/login acme primary@example.com', 'Unknown provider acme. Use claude, chatgpt, antigravity.'),
+            ('/login work@example.com', 'work@example.com is on Claude and ChatGPT. Send /login PROVIDER work@example.com.'),
+            ('/login claude work@example.com', 'work@example.com is already signed in.'),
+            ('/login a b c', 'Usage: /login PROVIDER EMAIL (claude, chatgpt, antigravity), or /login EMAIL.\n'
+                             'Signed out: Claude primary@example.com, ChatGPT gpt@example.com.'),
+        )
+        from coordinator.signin import _ACCOUNT_SETTINGS
+        for text, expected in cases:
+            if 'antigravity' not in _ACCOUNT_SETTINGS:
+                expected = expected.replace(', antigravity', '')
+            with self.subTest(text=text):
+                self.assertEqual(self.command(text), expected)
+                self.assertIsNone(self.store.get('account_signin'))
+
+    def test_login_refuses_while_another_sign_in_is_open(self):
+        self.signed_out_for_login()
+        self.store.put('account_signin', {'topic': '1:2', 'provider': 'codex', 'state': 'code'})
+        self.assertEqual(self.command('/login claude primary@example.com'),
+                         'A Codex sign-in is still open. Finish it or tap Cancel on its card first.')
 
     def test_removed_subcommands_render_the_top_card_without_running_their_operations(self):
         from coordinator import control_api
@@ -617,7 +683,7 @@ class ControlTests(unittest.TestCase):
         self.assertEqual(self.store.service_requests_pending(), [])
         self.assertEqual(self.store.tasks_list(), [])
 
-    def test_named_codex_reset_operation_refuses_live_usage_below_95_percent(self):
+    def test_named_codex_reset_operation_refuses_live_usage_below_99_percent(self):
         from coordinator import control_api
         with self.store.db:
             self.store.db.execute("UPDATE topics SET enabled=1 WHERE id='1:2'")
@@ -635,19 +701,21 @@ class ControlTests(unittest.TestCase):
                 patch('coordinator.codex_accounts.link_home', side_effect=lambda directory: directory):
             result = control_api.call(self.store, 'account.codex_reset', {'alias': 'gpt'}, topic='1:2')
         self.assertFalse(result.ok)
-        self.assertEqual(result.text, 'This Codex account is below 95% on its resettable meters')
+        self.assertEqual(result.text, 'This Codex account is below 99% on its resettable meters')
         self.assertEqual([entry.args[0] for entry in server.request.call_args_list],
                          ['account/read', 'account/rateLimits/read'])
         server.stop.assert_awaited_once()
         self.assertEqual(self.store.service_requests_pending(), [])
 
-    def test_help_renders_only_four_bold_section_headers(self):
+    def test_help_renders_command_and_balance_headers(self):
         text = self.command('/help')
         rendered = markdown_to_html(text)
         self.assertEqual([line for line in rendered.splitlines() if line.startswith('<b>')],
-                         ['<b>Accounts</b>', '<b>Projects</b>', '<b>Work</b>', '<b>Service</b>'])
+                         ['<b>Accounts</b>', '<b>Projects</b>', '<b>Work</b>', '<b>Service</b>',
+                          '<b>Subscriptions left</b> (week · Fable)', '<b>ChatGPT left</b> (week)'])
         self.assertEqual(re.findall(r'<(/?)([a-z]+)(?: [^>]*)?>', rendered),
                          [('', 'b'), ('/', 'b'), ('', 'b'), ('/', 'b'),
+                          ('', 'b'), ('/', 'b'), ('', 'b'), ('/', 'b'),
                           ('', 'b'), ('/', 'b'), ('', 'b'), ('/', 'b')])
         for placeholder in ('CONDITION',):
             self.assertIn(placeholder, rendered)
@@ -665,59 +733,16 @@ class ControlTests(unittest.TestCase):
             self.assertFalse(handle_control(self.store, '1:2', 43, 'implement feature'))
         self.assertEqual(self.store.tasks_list(), [])
 
-
-
-    def test_policy_show_uses_file_or_bundled_default(self):
+    def test_policy_set_refuses_invalid_text_and_keeps_personal_rules(self):
         from coordinator import control_api
-        from coordinator.policy import usage_policy
-        (self.store.directory / 'USAGE.md').unlink()
-        self.assertEqual(control_api.call(self.store, 'policy.show').text,
-                         (Path(__file__).resolve().parents[1] / 'coordinator/defaults/USAGE.md').read_text())
-        policy = 'Use one worker.\n'
-        (self.store.directory / 'USAGE.md').write_text(policy)
-        self.assertEqual(control_api.call(self.store, 'policy.show').text, policy)
-        self.assertEqual(usage_policy(self.store.directory), policy)
-
-    def test_policy_set_replaces_file_atomically_and_privately(self):
-        from coordinator import control_api
-        target = self.store.directory / 'USAGE.md'
-        target.write_text('Old policy')
-        replacements = []
-        replace = os.replace
-        fsync = os.fsync
-
-        def inspect_replace(source, destination):
-            source = Path(source)
-            self.assertEqual(source.parent, self.store.directory)
-            self.assertEqual(destination, target)
-            self.assertEqual(target.read_text(), 'Old policy')
-            self.assertEqual(source.read_text(), 'Use one worker.')
-            self.assertEqual(stat.S_IMODE(source.stat().st_mode), 0o600)
-            replacements.append(source)
-            replace(source, destination)
-
-        with patch('coordinator.controls.os.replace', side_effect=inspect_replace), \
-                patch('coordinator.controls.os.fsync', wraps=fsync) as synced:
-            saved = control_api.call(self.store, 'policy.set', {'text': 'Use one worker.'})
-        self.assertTrue(saved.ok)
-        self.assertEqual(saved.text, 'Usage policy saved. Coordinators load it with their next message; new workers at launch.')
-        self.assertEqual(target.read_text(), 'Use one worker.')
-        self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o600)
-        self.assertEqual(len(replacements), 1)
-        synced.assert_called_once()
-        self.assertFalse(replacements[0].exists())
-
-    def test_policy_set_refuses_invalid_text_and_cleans_failed_write(self):
-        from coordinator import control_api
-        target = self.store.directory / 'USAGE.md'
-        target.write_text('Old policy')
+        from coordinator.policy import personal_path
+        target = personal_path(self.store)
+        target.write_text('- Old rule\n')
         for text in ('', '   ', 'a' * 4001):
             self.assertFalse(control_api.call(self.store, 'policy.set', {'text': text}).ok)
-        with patch('coordinator.controls.os.replace', side_effect=OSError('write failed')):
-            result = control_api.call(self.store, 'policy.set', {'text': 'New policy'})
-        self.assertEqual(result.state, 'failed')
-        self.assertEqual(target.read_text(), 'Old policy')
-        self.assertEqual(list(self.store.directory.glob('.USAGE-*')), [])
+        self.assertEqual(target.read_text(), '- Old rule\n')
+        self.assertTrue(control_api.call(self.store, 'policy.set', {'text': '- New rule'}).ok)
+        self.assertEqual(target.read_text(), '- New rule\n')
 
     def test_changes_persist_without_paths(self):
         from coordinator import control_api
@@ -797,7 +822,7 @@ class ControlTests(unittest.TestCase):
         asyncio.run(refresh_accounts(self.store, collect, aliases=['work']))
         wide = control_api.call(self.store, 'account.show', {'alias': 'work'}).text
         self.assertIn('Weekly (all models): 🟩🟩🟩🟩🟩🟩⬜⬜⬜⬜ 60% · resets in 5h 0m', held)
-        self.assertIn('5-hour: 🟩🟩🟩🟩🟩🟩🟩⬜⬜⬜ 70% · resets in 5h 0m', held)
+        self.assertNotIn('5-hour:', held)
         self.assertNotIn('Out ·', held)
         self.assertIn('Paused:', held)
         self.assertNotIn('Paused:', wide)
@@ -859,7 +884,7 @@ class ControlTests(unittest.TestCase):
     def test_cached_usage_is_sanitized(self):
         with self.store.db:
             status = self.store.get('account_status')
-            status['work'].update(observed_at=time.time(), usage={'five_hour': {'utilization': 50,
+            status['work'].update(observed_at=time.time(), usage={'seven_day': {'utilization': 50,
                                    'resets_at': time.time() + 3600}})
             self.store.put('account_status', status)
             self.store.put('account_blocks', {'work': {'until': time.time() + 3600, 'reason': '/secret/token'}})
@@ -874,7 +899,7 @@ class ControlTests(unittest.TestCase):
                 self.store.task_create('1:2', 'private task ' + str(index))
             self.store.task_create('1:3', 'other task')
         self.assertFalse(handle_control(self.store, '1:2', 42, '/queue'))
-        self.assertFalse(handle_control(self.store, '1:2', 42, '/status'))
+        self.assertTrue(handle_control(self.store, '1:2', 42, '/status'))
         text = self.command('/setup')
         self.assertFalse(handle_control(self.store, '1:2', 42, '/settings'))
         self.assertNotIn('private task 0', text)
@@ -929,7 +954,7 @@ class ControlTests(unittest.TestCase):
     def test_status_card_shows_usage_as_a_bar_and_the_running_task(self):
         self.store.put('account_status', {'primary': {'identity': {'email': 'primary@example.com', 'logged_in': True},
             'observed_at': time.time(), 'usage': {
-            'five_hour': {'utilization': 62, 'resets_at': time.time() + 2 * 3600 + 15 * 60 + 30}}}})
+            'seven_day': {'utilization': 62, 'resets_at': time.time() + 2 * 3600 + 15 * 60 + 30}}}})
         self.store.task_create('1:2', 'do the thing')
 
         from coordinator import control_api

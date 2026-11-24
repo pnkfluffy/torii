@@ -5,20 +5,19 @@ from datetime import datetime, timezone
 import json
 import os
 import logging
-import re
 import sqlite3
-import subprocess
 import time
 from pathlib import Path
 
-from . import intake, problems, parent, parent_state
+from . import intake, problems, parent, parent_state, sweeps
 from .accounts import AccountBroker, DEFAULT_ACCOUNTS
+from .adapters import CAPS
 from .codex_accounts import CodexBroker, limit_windows, monitor_codex_accounts
 from .control_api import BRIEF_LIMIT, WORKER_PROVIDERS
 from .envelopes import FILL_START, waiting_secrets
 from .failures import internal_detail
 from .media import MediaError, TranscriptionSlots, attachment_instructions, is_audio, prepare_attachments, prepare_transcripts
-from .policy import COORDINATOR_POLICY, REPLY_FIRST, chat_policy, default_coordinator_model
+from .policy import COORDINATOR_MODEL, chat_policy
 from .providers import ProviderRunner
 from .session import AccountsUnavailable, CoordinatorSession, message_tag, message_uuid
 from .signin import SignIns
@@ -28,7 +27,7 @@ from .workers import STEER_OPS, STEER_PREFIX, WorkerPool, can_resume_finished, h
 from .log import running_commit
 from . import extension
 from .extension import Native
-from . import host_os
+from .host_os import boot_time
 
 logger = logging.getLogger(__name__)
 TASK_RESTART_LIMIT = 5
@@ -53,6 +52,7 @@ LOOP_ESSENTIAL = {
     'accounts': True,
     'codex_accounts': True,
     'opencode_accounts': True,
+    'antigravity_accounts': False,
     'command_menu': False,
     'reactions': False,
     'restart_watch': True,
@@ -66,6 +66,11 @@ LOOP_ESSENTIAL = {
     'code_request_intake': False,
     'code_request_sender': False,
     'worktree_cleanup': False,
+    'close_save': False,
+    'records_sync': False,
+    'records_sweep': False,
+    'result_journal': False,
+    'invariants': False,
     'host_logs': False,
     'session_cleanup': False,
     'stray_report': False,
@@ -77,6 +82,11 @@ LOOP_NAMES = {
     'signins': 'account sign-in',
     'tldr': 'summaries',
     'worktree_cleanup': 'worktree cleanup',
+    'close_save': 'close-save clear',
+    'records_sync': 'records sync',
+    'records_sweep': 'job record rewrite',
+    'result_journal': 'worker result journal',
+    'invariants': 'invariant checks',
     'host_logs': 'host log cleanup',
     'session_cleanup': 'native session cleanup',
     'stray_report': 'unowned storage report',
@@ -86,19 +96,6 @@ LOOP_NAMES = {
 if extension.available('update_freeze'):
     LOOP_ESSENTIAL['update_freeze'] = False
     LOOP_NAMES['update_freeze'] = 'Signed updater status'
-
-
-def boot_time():
-    if host_os.linux():
-        match = re.search(r'^btime (\d+)$', host_os.proc_text('stat'), re.MULTILINE)
-        return int(match.group(1)) if match else None
-    try:
-        output = subprocess.run(['sysctl', '-n', 'kern.boottime'], capture_output=True, text=True,
-                                check=True, timeout=1).stdout
-    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
-        return None
-    match = re.search(r'\bsec\s*=\s*(\d+)', output)
-    return int(match.group(1)) if match else None
 
 
 def last_check(run):
@@ -117,6 +114,8 @@ async def pause(wake, seconds):
 
 
 SHUTDOWN_SECONDS = 15
+CONSUMED_FLUSH_SECONDS = 2
+CLOSE_SAVE_INTERVAL = 300
 
 
 class _Restart(Exception):
@@ -144,7 +143,7 @@ class Service:
         self.runner = runner
         self.project_root = project_root
         self.pair_only = pair_only
-        self.coordinator_model = coordinator_model or default_coordinator_model(store)
+        self.coordinator_model = coordinator_model or COORDINATOR_MODEL
         self.session_factory = session_factory or parent.start
         self.sessions = {}
         self.wound_down = set()
@@ -157,6 +156,7 @@ class Service:
         self.on_restart = None
         self.feed_tasks = {}
         self.audio_tasks = {}
+        self.attachment_tasks = {}
         self.chat_scratch_tasks = {}
         self.audio_slots = None
         self.audio_barriers = {}
@@ -176,11 +176,8 @@ class Service:
         self.workers = WorkerPool(store, runner, self.accounts, vault, self.codex_accounts)
         from .lifecycle import JobLifecycle
         self.jobs = JobLifecycle(self)
-        self.network_available = True
         binaries = getattr(runner, 'binaries', {})
-        from .muse_accounts import binary as muse_binary
-        self.signins = SignIns(store, binaries.get('claude', 'claude'), codex_binary=binaries.get('codex', 'codex'),
-                              muse_binary=lambda: muse_binary(store))
+        self.signins = SignIns(store, binaries.get('claude', 'claude'), codex_binary=binaries.get('codex', 'codex'))
         from .updates import Updater
         self.updater = Updater(self)
         with store.db:
@@ -189,14 +186,6 @@ class Service:
             if store.get('accounts') is None:
                 store.put('accounts', DEFAULT_ACCOUNTS)
 
-
-    @property
-    def network_available(self):
-        return getattr(self.store, 'network_available', True)
-
-    @network_available.setter
-    def network_available(self, value):
-        self.store.network_available = value
 
     def wake(self, name):
         if not hasattr(self, 'wakes'):
@@ -210,7 +199,7 @@ class Service:
         if (session is not None and not session.closed and not session.idle()
                 or self.store.get('topic_lifecycle:' + topic)):
             return False
-        pending = self.store.db.execute("SELECT id FROM messages WHERE topic=? AND delivered IN ('pending','sending')", (topic,))
+        pending = self.store.db.execute("SELECT id FROM messages WHERE topic=? AND delivered='pending'", (topic,))
         if any(row['id'] not in callbacks for row in pending):
             return False
         return not any(not task.done() for message_id, task in self.feed_tasks.items()
@@ -324,7 +313,16 @@ class Service:
             else:
                 text = ("This chat is paused: the key of OpenCode account %s failed. Fix the key file. "
                         "I'll check again every five minutes.") % alias
-            text += ' Torii does not move this chat to another agent. Your messages are saved.'
+            text += ' No other agent of its queue can take it now. Your messages are saved.'
+        elif error.provider == 'antigravity':
+            from .extension import optional
+            antigravity_accounts = optional('antigravity_accounts')
+            broker = antigravity_accounts.AntigravityBroker(self.store)
+            reason = 'out_of_usage' if error.alias and broker.held(error.alias) else 'unavailable'
+            text = ('This chat is paused: no Antigravity account can run its model now%s. '
+                    "I'll continue when an Antigravity account has usage again. "
+                    'No other agent of its queue can take it now. Your messages are saved.') % (
+                    ' until ' + reset if reset else '')
         elif error.provider == 'codex' and error.alias and not self.codex_accounts.signed_in(error.alias):
             reason = 'signed_out_or_disabled'
             text = ('The main chat is paused: ChatGPT account %s is signed out or turned off. '
@@ -332,11 +330,14 @@ class Service:
                     self.codex_accounts.label(error.alias))
         elif error.provider == 'codex' and self.codex_accounts.exhausted(error.alias, parent=True):
             reason = 'out_of_usage'
-            text = ('The main chat is paused: ChatGPT account %s is out of usage%s. '
-                    'Torii does not switch ChatGPT accounts on its own. Pick another account with /accounts '
-                    '%s Your messages are saved.') % (
-                    self.codex_accounts.label(error.alias), ' until ' + reset if reset else '',
-                    "to continue now, or I'll continue at the reset." if reset else 'to continue.')
+            text = ('The main chat is paused: ChatGPT account %s is out of usage%s. ') % (
+                    self.codex_accounts.label(error.alias), ' until ' + reset if reset else '')
+            if self.codex_accounts.automatic():
+                text += "I'll continue when any ChatGPT account frees up. Your messages are saved."
+            else:
+                text += ('Torii does not switch ChatGPT accounts on its own. Pick another account with /accounts '
+                         '%s Your messages are saved.') % (
+                         "to continue now, or I'll continue at the reset." if reset else 'to continue.')
         elif error.provider == 'claude':
             reset = datetime.fromtimestamp(error.reset_at, timezone.utc).isoformat() if error.reset_at else None
             text = ('No Claude account is available.' +
@@ -427,15 +428,8 @@ class Service:
         resumed = bool(self.store.get(key + '_session'))
         rotated = bool(self.store.get('coordinator_rotation_from') or
                        previous_session and getattr(previous_session, 'rejected', False))
-        visible = [dict(item) for item in self.store.topics() if item['enabled'] and
-                   (topic == self.home_topic() or item['id'] == topic)]
-        details = [{'id': item['id'], 'name': item['name'], 'cwd': item['cwd']} for item in visible]
-        instructions = (COORDINATOR_POLICY + '\nRegistered channels: ' +
-                        json.dumps(details, separators=(',', ':')) + '\nConnected agents: ' +
-                        ', '.join(parent.connected_agents(self.store)))
-        if self.store.get('close_clears_space', False) is True:
-            from .close_saves import scratch
-            instructions += '\nChat scratch: ' + str(scratch(self.store, topic=topic, create=True))
+        from .policy import instructions as rule_instructions
+        instructions = rule_instructions(self.store, key, 'coordinator')[0]
         model = self.store.get('coordinator_model') or self.coordinator_model
         try:
             if retry_pause:
@@ -464,7 +458,7 @@ class Service:
                 return None
             self.parent_retry[topic] = time.monotonic() + PARENT_RETRY
             problems.record(self.store, 'coordinator', 'start-failed', internal_detail(error), level=logging.ERROR,
-                            topic=topic)
+                            topic=topic, every=3600)
             return None
         if session is None:
             return None
@@ -508,14 +502,25 @@ class Service:
         elif fallback or switched or (not resumed and topic != self.home_topic()):
             tasks = self.store.tasks_list(status='open', topic=None if topic == self.home_topic() else topic)
             recent = [dict(row) for row in self.store.db.execute(
-                "SELECT kind,text FROM messages WHERE topic=? AND kind!='restarted' AND delivered!='pending' "
+                "SELECT id,kind,text,created,telegram_message FROM messages WHERE topic=? AND kind!='restarted' AND delivered!='pending' "
                 "AND (receipt IS NULL OR receipt!='superseded') "
                 "ORDER BY id DESC LIMIT 5", (topic,))]
-            messages = [dict(item, text=item['text'][:500]) for item in reversed(recent)]
+            messages = []
+            for item in reversed(recent):
+                message = {'kind': item['kind'], 'text': item['text'][:500],
+                           'created': datetime.fromtimestamp(item['created'], timezone.utc).isoformat()}
+                if item['kind'] == 'owner':
+                    reply = self.store.db.execute('''SELECT 1 FROM outbox o WHERE o.topic=? AND o.delivered=1
+                        AND (o.reply_to=? OR (o.kind='report' AND o.created>=?) OR EXISTS
+                        (SELECT 1 FROM parent_reply_owners p JOIN parent_reply_turns t
+                        ON t.host=p.host AND t.turn=p.turn WHERE p.message=? AND t.outbox=o.id)) LIMIT 1''',
+                        (topic, item['telegram_message'], item['created'], item['id'])).fetchone()
+                    message['reply_status'] = 'confirmed' if reply else 'reply not linked'
+                messages.append(message)
             preface = ''
             if switched:
                 change = session.switch
-                labels = {'claude': 'Claude', 'codex': 'ChatGPT', 'opencode': 'OpenCode'}
+                labels = {'claude': 'Claude', 'codex': 'ChatGPT', 'opencode': 'OpenCode', 'antigravity': 'Antigravity'}
                 preface = ('This chat moved from %s to %s because %s. '
                            'Your earlier conversation is not in this context.\n\n') % (
                            labels[change['from']], labels[change['to']], change['reason'])
@@ -524,20 +529,24 @@ class Service:
                 messages.pop(0)
                 encoded = json.dumps(messages)
             prefix = preface + 'Channel continuity: Open jobs: '
-            suffix = '. Recent messages: ' + encoded
+            suffix = (' Reply status shows linked replies and same-chat sends after the message; '
+                      'check job notes before redoing anything. Recent messages: ' + encoded)
             summary = parent_state.jobs_summary(
                 self.store, tasks, parent_state.RESTART_NOTICE_CHARS - len(prefix) - len(suffix))
             self.replace_notice(topic, prefix + summary + suffix if preface or tasks or recent else None)
             if switched:
                 with self.store.db:
-                    note = 'This chat now runs on %s (%s).' % (labels[change['to']], change['reason'])
-                    selection = parent_state.effective_agent(self.store, key)['selection']
-                    if change['to'] == 'codex' and not selection:
-                        note += ' It returns to Claude at the next restart after Claude recovers.'
-                    elif change['to'] == 'codex' and selection.get('provider') == 'claude':
-                        note += ' It returns to your selected Claude model after Claude recovers and current work settles.'
-                    if 'out of usage' not in change['reason'] and change['reason'] != 'Claude can take work again':
-                        self.store.enqueue_report(topic, note)
+                    reason = change['reason'][0].upper() + change['reason'][1:]
+                    if change['reason'].endswith(('is out of usage', 'did not start')):
+                        from . import moves
+                        agent = {'provider': change['to'], 'model': getattr(session, 'model', None)}
+                        note = '%s; this chat runs on %s until %s can run again.' % (
+                            reason, moves.label(agent), labels[parent_state.providers(self.store, key)[0]])
+                    elif change['reason'].endswith('can take work again'):
+                        note = '%s; this chat is back on %s.' % (reason, labels[change['to']])
+                    else:
+                        note = 'This chat now runs on %s (%s).' % (labels[change['to']], change['reason'])
+                    self.store.enqueue_report(topic, note)
                     self.store.put(key + '_switch', None)
         return session
 
@@ -583,17 +592,42 @@ class Service:
             self.start_audio(row)
 
     async def _prepare_audio(self, row):
-        attachments = await prepare_attachments(self.store, self.telegram, row)
+        attachments = await self._attachments(row)
         await prepare_transcripts(self.store, row, attachments, self.audio_slots)
         return attachments
 
+    async def _attachments(self, row):
+        if row['id'] not in self.attachment_tasks:
+            task = asyncio.create_task(prepare_attachments(self.store, self.telegram, row))
+            self.attachment_tasks[row['id']] = task
+            task.add_done_callback(lambda done: self.attachment_tasks.pop(row['id'], None))
+        return await asyncio.shield(self.attachment_tasks[row['id']])
+
+    async def _run_wait_worker(self, worker, topic):
+        suffix = ''
+        if worker['status'] != 'running':
+            row = self.store.db.execute("""SELECT m.* FROM task_iterations i
+                JOIN messages m ON m.id=i.origin JOIN wait_jobs j ON j.wait=i.wait AND j.task=i.task
+                WHERE i.task=? AND i.k=? AND m.kind='owner' AND m.images IS NOT NULL
+                AND j.then_provider=?""", (worker['task'], worker['iteration'], worker['provider'])).fetchone()
+            if row:
+                attachments = await self._attachments(dict(row))
+                suffix = attachment_instructions(attachments, provider=worker['provider'])
+        if suffix:
+            return await self.workers.run(worker, topic, prompt_suffix=suffix)
+        return await self.workers.run(worker, topic)
+
     async def _prepare_message(self, row, session=None, batch=False):
         text = row['text']
+        if row['kind'] == 'worker_result':
+            payload = json.loads(text)
+            keys = ('worker', 'task', 'status', 'success', 'text', 'error', 'failure_code', 'failure_detail', 'results')
+            text = json.dumps({key: payload[key] for key in keys if key in payload}, default=str)
         if row['kind'] in ('owner', 'forwarded') and row['images']:
             try:
                 audio = self.start_audio(row)
                 attachments = (await asyncio.shield(audio) if audio is not None else
-                               await prepare_attachments(self.store, self.telegram, row))
+                               await self._attachments(row))
             except MediaError as error:
                 with self.store.db:
                     problems.record(self.store, 'attachment', 'unavailable', str(error), topic=row['topic'],
@@ -603,12 +637,15 @@ class Service:
                 return None
             text += attachment_instructions(attachments, coordinator=True, provider=getattr(session, 'provider', 'claude'),
                                             forwarded=row['kind'] == 'forwarded')
-        reply_first = REPLY_FIRST if row['kind'] == 'owner' else ''
         if row['kind'] == 'owner':
             from .waits import owner_header
             row = dict(row, waiting=self.store.wait_hook('header-failed', owner_header, self.store, row['topic']))
+        if row['kind'] == 'event' and row.get('source_worker') is not None:
+            worker = self.store.db.execute('SELECT task FROM workers WHERE id=?', (row['source_worker'],)).fetchone()
+            if worker and worker['task'] is not None:
+                row = dict(row, event_worker=row['source_worker'], event_task=worker['task'])
         identity = intake.identity(self.store, row) if batch else ''
-        return message_tag(self.store.topic(row['topic']), row) + identity + reply_first + text
+        return message_tag(self.store.topic(row['topic']), row) + identity + text
 
     async def _send_message(self, row, prompt, session, batch=None):
         message_ids = [item['id'] for item in batch] if batch is not None else [row['id']]
@@ -651,14 +688,6 @@ class Service:
                             message=row['id'])
             raise
 
-    async def _deliver_audio(self, row, session, previous=None):
-        if previous is not None:
-            await asyncio.wait([previous])
-        prompt = await self._prepare_message(row, session)
-        if prompt is not None:
-            self.last_turn[row['topic']] = time.monotonic()
-            await self._send_message(row, prompt, session)
-
     def _intake_topic(self, row, enabled):
         return (self.home_topic() if row['topic'] not in enabled and row['kind'] == 'worker_result'
                 else row['topic'])
@@ -691,10 +720,9 @@ class Service:
         self.last_turn[topic] = time.monotonic()
         await self._send_message(first, '\n\n'.join(text for row, text in prepared), session, batch=batch)
 
-    async def _feed_batches(self, enabled, existing_only=False):
+    async def _feed_batches(self, enabled):
         self._finish_feed_tasks()
-        pending = [row for row in self.store.reconcile_message_batches()
-                   if not existing_only or row.get('batch_id') is not None]
+        pending = self.store.reconcile_message_batches()
         routes = {}
         for row in pending:
             if row.get('batch_id') is not None:
@@ -720,8 +748,7 @@ class Service:
                         self.restart_messages[topic] = notice
                         continue
             rows = [row for row in self.store.reconcile_message_batches()
-                    if destination(row) == topic and row['id'] not in self.feed_tasks
-                    and (not existing_only or row.get('batch_id') is not None)]
+                    if destination(row) == topic and row['id'] not in self.feed_tasks]
             if getattr(session, 'provider', None) == 'opencode':
                 from . import opencode_recovery
                 recovery = opencode_recovery.state(self.store, session.key)
@@ -788,7 +815,14 @@ class Service:
                                 ' state=unavailable' if uncertain else '')
             elif getattr(session, '_parent_retiring', False):
                 continue
+            elif (getattr(session, 'provider', None) == 'claude' and session.idle() and
+                  getattr(session, '_account_move', lambda: None)() is not None and
+                  not any(not task.done() for message_id, task in self.feed_tasks.items()
+                          if self.store.db.execute('SELECT topic FROM messages WHERE id=?',
+                                                   (message_id,)).fetchone()[0] == topic)):
+                session.relaunch(refresh=True)
             elif ((parent_state.effective_agent(self.store, self.session_key(topic))['selection'] or
+                   (self.store.get(self.session_key(topic) + '_host') or {}).get('provider', 'claude') != 'claude' or
                    (self.store.get(self.session_key(topic) + '_host') or {}).get('picked')) and
                   parent_state.selection_changed(session) and session.idle() and
                   not any(not task.done() for message_id, task in self.feed_tasks.items()
@@ -803,78 +837,51 @@ class Service:
                             if self.store.db.execute('SELECT topic FROM messages WHERE id=?',
                                                      (message_id,)).fetchone()[0] == topic)):
                 await session.stop()
-                if self.store.get('close_clears_space', False) is True and topic not in self.chat_scratch_tasks:
+                if topic not in self.chat_scratch_tasks:
                     self.chat_scratch_tasks[topic] = asyncio.create_task(self._clear_chat_scratch(topic))
                 self.wound_down.add(topic)
-        started = False
-        previous = {topic: task for topic, task in self.audio_barriers.items() if not task.done()}
-        self.audio_barriers = previous
-        batching = self.store.get('coordinator_intake_batching', False) is True
-        pending = self.store.messages_pending()
-        if batching or any(row.get('batch_id') is not None for row in pending):
-            started = await self._feed_batches(enabled, existing_only=not batching)
-            if not batching:
-                pending = self.store.messages_pending()
-        for row in (() if batching else pending):
-            if row.get('batch_id') is not None:
-                continue
-            if row['id'] in self.feed_tasks:
-                continue
-            topic = row['topic']
-            if topic not in enabled and row['kind'] == 'worker_result':
-                topic = self.home_topic()
-            session = await self.start_session(topic)
-            if session is None:
-                continue
-            notice = self.restart_messages.pop(topic, None)
-            if notice is not None and notice != row['id']:
-                restart = next((item for item in self.store.messages_pending() if item['id'] == notice), None)
-                if restart:
-                    prompt = await self._prepare_message(restart, session)
-                    if prompt is not None and await self._send_message(restart, prompt, session) == 'closed':
-                        self.restart_messages[topic] = notice
-                        continue
-            if getattr(session, 'provider', None) == 'opencode':
-                from . import opencode_recovery
-                recovery = opencode_recovery.state(self.store, session.key)
-                if recovery.get('phase') == 'catchup' and row['id'] != recovery.get('notice'):
-                    continue
-            if row['id'] in self.audio_tasks or topic in previous:
-                task = asyncio.create_task(self._deliver_audio(row, session, previous.get(topic)))
-                self.feed_tasks[row['id']] = previous[topic] = task
-                started = True
-                continue
-            prompt = await self._prepare_message(row, session)
-            if prompt is None:
-                continue
-            self.last_turn[topic] = time.monotonic()
-            task = asyncio.create_task(self._send_message(row, prompt, session))
-            self.feed_tasks[row['id']] = task
-            started = True
+        self.audio_barriers = {topic: task for topic, task in self.audio_barriers.items() if not task.done()}
+        started = await self._feed_batches(enabled)
         self._finish_feed_tasks()
-        if self.store.get('auto_resume', False) is True:
-            for topic in enabled:
-                if self.chat_settled(topic):
-                    await self.jobs.settled(topic)
+        for topic in enabled:
+            if topic and self.jobs.finish_due(topic) and self.chat_settled(topic):
+                self.jobs.finish_reminders(topic)
         return started
 
     async def feed(self):
+        lock_deadline = None
         while True:
-            if not await self.feed_once():
-                retry_at = self.store.get('coordinator_account_retry_at')
-                if retry_at:
-                    await pause(self.wake('feed'), min(60, max(0.1, retry_at - time.time())))
+            try:
+                started = await self.feed_once()
+                if not started:
+                    retry_at = self.store.get('coordinator_account_retry_at')
+                    if retry_at:
+                        await pause(self.wake('feed'), min(60, max(0.1, retry_at - time.time())))
+                    else:
+                        await pause(self.wake('feed'), FEED_IDLE)
                 else:
-                    await pause(self.wake('feed'), FEED_IDLE)
-            else:
-                await asyncio.sleep(0)
+                    await asyncio.sleep(0)
+                if lock_deadline is not None:
+                    problems.record(self.store, 'storage', 'db-locked', 'operation=feed', every=60)
+                lock_deadline = None
+            except sqlite3.OperationalError as error:
+                if ('locked' not in str(error).lower() and 'busy' not in str(error).lower()):
+                    raise
+                if self.store.db.in_transaction:
+                    self.store.db.rollback()
+                problems.lock_wait(self.store, 'feed')
+                if lock_deadline is None:
+                    lock_deadline = time.monotonic() + 30
+                remaining = lock_deadline - time.monotonic()
+                if remaining <= 0:
+                    raise
+                await asyncio.sleep(min(1, remaining))
 
     async def workers_once(self):
         self.workers.storage.schedule()
         from .setup_flow import blocked
         if self.pair_only or blocked(self.store):
             return False
-        await self.jobs.resume_due()
         started = False
         rows = self.store.db.execute(
             "SELECT * FROM workers WHERE status IN ('queued','running','waiting_for_secret','waiting_for_quota') ORDER BY id").fetchall()
@@ -907,10 +914,8 @@ class Service:
                 continue
             if row['status'] == 'waiting_for_quota':
                 broker = self.workers.broker(row['provider'])
-                if row['provider'] == 'opencode':
-                    if not await broker.ready(row.get('account_alias'), row['id']):
-                        continue
-                elif not broker.select():
+                ready = await broker.ready(row)
+                if not ready and not self.workers.can_move(row):
                     continue
                 with self.store.db:
                     self.store.db.execute("UPDATE workers SET status='queued',updated=? "
@@ -972,7 +977,7 @@ class Service:
                         continue
             if row['status'] != 'running' and row['work'] == 'dev' and row['task'] in writing_jobs:
                 continue
-            task = asyncio.create_task(self.workers.run(dict(row), self.store.topic(row['topic'])))
+            task = asyncio.create_task(self._run_wait_worker(dict(row), self.store.topic(row['topic'])))
             self.worker_tasks[row['id']] = task
             if row['work'] == 'dev':
                 writing_jobs.add(row['task'])
@@ -984,7 +989,18 @@ class Service:
         return started
 
     async def workers_loop(self):
+        next_log_check = 0
+        next_codex_check = 0
         while True:
+            if time.monotonic() >= next_codex_check:
+                self.workers.check_recovery()
+                next_codex_check = time.monotonic() + 60
+            if time.monotonic() >= next_log_check:
+                from .workers import log_sizes, warn_log_sizes
+                rows = [dict(row) for row in self.store.db.execute("SELECT * FROM workers WHERE status='running'")]
+                sizes = await asyncio.to_thread(log_sizes, self.store, rows)
+                warn_log_sizes(self.store, sizes)
+                next_log_check = time.monotonic() + 30
             if not await self.workers_once():
                 await asyncio.sleep(0.1)
             else:
@@ -999,14 +1015,9 @@ class Service:
                     del pending[request_id]
                     task.result()
         release_messages(self.store)
-        space_enabled = self.store.get('close_clears_space', False) is True
-        if getattr(self, '_close_space_enabled', False) != space_enabled:
-            self._close_space_enabled = space_enabled
+        if close_saves.pending(self.store):
             self.wake('worktree_cleanup').set()
-        if ((self.store.get('closed_copy_delete', False) is True
-                and self.store.get('closed_copy_cleanup_pending', {})) or
-                space_enabled and close_saves.pending(self.store)):
-            self.wake('worktree_cleanup').set()
+            self.wake('close_save').set()
         requests = self.store.service_requests_pending()
         settled = False
         for request in requests:
@@ -1017,6 +1028,12 @@ class Service:
                 storage_for(self.store).changed.set()
                 with self.store.db:
                     self.store.service_request_settle(request['id'], 'done')
+                settled = True
+                continue
+            if op == '_cleanup.antigravity_refs':
+                antigravity = extension.optional('antigravity_runtime')
+                recovered = not antigravity or await antigravity.recover_job(self.store, params['task'])
+                self.store.service_request_settle(request['id'], 'done' if recovered else 'failed')
                 settled = True
                 continue
             if op == '_cleanup.stray_report':
@@ -1084,7 +1101,7 @@ class Service:
                 except Exception as error:
                     result = None
                     notice = 'Codex banked reset could not finish. Check usage before trying again.'
-                    logger.exception('banked reset failed type=%s', type(error).__name__)
+                    problems.record(self.store, 'accounts', 'banked-reset-failed', type(error).__name__, level=logging.ERROR, every=3600)
                 with self.store.db:
                     if result is None:
                         self.store.enqueue_report(params['_topic'], notice)
@@ -1124,13 +1141,16 @@ class Service:
                     current = self.workers.get(worker['id'])
                     if current['status'] in ('queued', 'waiting_for_secret', 'waiting_for_quota'):
                         if op == 'workers.steer':
+                            from .workers import STEER_ELISION, continuation_brief, remember_steer
                             prompt = current['prompt'] + '\n\nFollow-up:\n' + params['prompt']
-                            if len(prompt) > BRIEF_LIMIT:
-                                self.refuse_steer(request['id'], params,
-                                                  'The queued brief would exceed %d characters.' % BRIEF_LIMIT,
-                                                  worker)
-                                settled = True
-                                continue
+                            remember_steer(self.store, current, params['prompt'], request['id'])
+                            if current['fresh']:
+                                from .moves import HANDOFF
+                                prompt = continuation_brief(self.store, current)
+                                if current['prompt'].startswith(HANDOFF):
+                                    prompt = HANDOFF + prompt.removeprefix(HANDOFF)
+                            elif len(prompt) > BRIEF_LIMIT:
+                                prompt = STEER_ELISION + prompt[-(BRIEF_LIMIT - len(STEER_ELISION)):]
                             self.store.db.execute('UPDATE workers SET prompt=?,updated=? WHERE id=?',
                                                   (prompt, time.time(), worker['id']))
                         elif op == 'workers.stop':
@@ -1168,19 +1188,33 @@ class Service:
                 settled = True
                 continue
             if op == 'workers.steer' and worker['status'] == 'done':
-                with self.store.db:
+                from .control_api import Refused
+                from .idle_trim import mark_worker, spawn_guard
+                resumed = False
+                with self.store.transaction():
                     current = self.workers.get(worker['id'])
                     task = self.worker_tasks.get(worker['id'])
                     if (can_resume_finished(self.store, current)
                             and (task is None or task.done())):
+                        try:
+                            spawn_guard(self.store, current['task'])
+                        except Refused:
+                            continue
+                        from .workers import remember_steer
+                        remember_steer(self.store, current, params['prompt'], request['id'])
                         self.store.db.execute("""UPDATE workers SET status='queued',prompt=?,host=?,last_seq=0,
-                            fresh=0,pid=NULL,updated=? WHERE id=?""",
+                            fresh=0,pid=NULL,updated=?,iteration=(SELECT iteration FROM tasks WHERE id=workers.task)
+                            WHERE id=?""",
                             (params['prompt'], 'worker-%d-resume-%d' % (worker['id'], request['id']),
                              time.time(), worker['id']))
+                        mark_worker(self.store, current['task'], current['id'])
                         self.store.service_request_settle(request['id'], 'done', {'receipt': 'resumed'})
-                        settled = True
-                        continue
-                    worker = current
+                        settled = resumed = True
+                    else:
+                        worker = current
+                if resumed:
+                    self.store.consumed.pop(worker['id'], None)
+                    continue
             control = self.workers.controls.get(worker['id'])
             if not control:
                 if worker['status'] != 'running':
@@ -1210,12 +1244,16 @@ class Service:
     async def worker_control(self, request, params, worker, control):
         op = request['op']
         prompt = params['prompt'] if op == 'workers.steer' else '/goal ' + params['condition']
-        if op == 'workers.goal' and worker['provider'] == 'codex':
+        if op == 'workers.goal' and CAPS[worker['provider']].goals == 'native':
             outcome = await control.goal(STEER_PREFIX + str(request['id']), params['condition'])
         else:
             outcome = await control.steer(STEER_PREFIX + str(request['id']), prompt)
         state = ('done' if outcome in ('received', 'queued') else 'uncertain' if outcome == 'uncertain'
                  else 'refused')
+        if op == 'workers.steer' and state in ('done', 'uncertain'):
+            from .workers import remember_steer
+            with self.store.db:
+                remember_steer(self.store, worker, prompt, request['id'])
         if state != 'done':
             problems.record(self.store, 'worker', 'steer-' + outcome, 'op=%s request=%s' % (op, request['id']),
                             topic=worker['topic'], task=worker['task'], worker=worker['id'])
@@ -1320,7 +1358,6 @@ class Service:
             row = self.store.pending_delivery()
             if not row:
                 return False
-            row = self.signins.muse_card(row)
             wait_card = row['kind'] in ('wait-ask', 'owner-waiting')
             if wait_card:
                 with self.store.db:
@@ -1389,9 +1426,6 @@ class Service:
                 'wait_already_answered': 'This question was already answered.',
                 'duplicate': 'Already received.',
                 'envelope_cancel': 'Envelope cancelled.',
-                'envelope_arm': 'Send the value as your next message.',
-                'envelope_busy': 'Another credential ask is waiting in your private chat. '
-                                 'Send its value or tap Cancel on its card first.',
                 'envelope_expired': 'This ask expired. Tap Ask again on its card.',
                 'envelope_closed': 'This envelope is already closed.'}.get(outcome, 'See the next message.')
         parameters = ({'url': 'https://t.me/' + self.store.get('bot_username') + '?start=' + FILL_START}
@@ -1488,7 +1522,6 @@ class Service:
                 failures = 0
                 conflicts = 0
                 self.poll_succeeded = True
-                self.network_available = True
                 from .updates import KEY, WATCHED, watch
                 if self.updater.commit and (self.store.get(KEY) or {}).get('phase') in WATCHED:
                     process = await asyncio.to_thread(watch.process_identity, os.getpid())
@@ -1508,7 +1541,6 @@ class Service:
                 for query_id, outcome in answers:
                     await self.answer_callback(query_id, outcome)
             except TelegramError as error:
-                self.network_available = False
                 if error.code == 409:
                     self.poll_succeeded = False
                     conflicts += 1
@@ -1516,7 +1548,7 @@ class Service:
                         await asyncio.sleep(1)
                         continue
                     problems.record(self.store, 'telegram', 'poll-stopped', 'telegram=%s' % error.code,
-                                    level=logging.ERROR)
+                                    level=logging.ERROR, every=3600)
                     with self.store.db:
                         if not self.store.get('poll_conflict_notified') and self.store.get('owner') is not None:
                             self.store.enqueue_report(self.store.get('control_topic') or self.home_topic(),
@@ -1525,7 +1557,7 @@ class Service:
                     await asyncio.Event().wait()
                 if error.code == 401:
                     self.poll_succeeded = False
-                    problems.record(self.store, 'telegram', 'poll-stopped', 'telegram=401', level=logging.ERROR)
+                    problems.record(self.store, 'telegram', 'poll-stopped', 'telegram=401', level=logging.ERROR, every=3600)
                     await asyncio.Event().wait()
                 failures += 1
                 logger.info('poll retry code=%s retry_after=%s', error.code, error.retry_after)
@@ -1548,8 +1580,7 @@ class Service:
                 continue
             scope = (self.store.chat(), self.store.get('owner'))
             commands = command_menu(self.store)
-            identity = (scope, self.store.get('telegram_updates_enabled', False) is True,
-                        self.store.get('waits_enabled', False) is True)
+            identity = (scope, self.store.get('telegram_updates_enabled', False) is True)
             if all(scope) and identity != installed:
                 try:
                     await self.telegram.call('setMyCommands', commands=commands,
@@ -1587,6 +1618,11 @@ class Service:
         while True:
             await self.envelopes_once()
             await asyncio.sleep(1)
+
+    async def consumed_loop(self):
+        while True:
+            await asyncio.sleep(CONSUMED_FLUSH_SECONDS)
+            self.store.consumed_flush()
 
     def exit_for_restart(self):
         if self.on_restart is not None:
@@ -1631,7 +1667,7 @@ class Service:
                     self.store.put('restart_requested_v2', request)
                     self.store.put('last_restart_v2', last)
                 problems.record(self.store, 'service', 'restart-backup-failed', internal_detail(error),
-                                level=logging.ERROR)
+                                level=logging.ERROR, every=3600)
                 raise
             logger.info('service restart requested backup=%s', backup.name)
             if owned_update:
@@ -1666,9 +1702,8 @@ class Service:
                     attempt = 0
                     cooldown = LOOP_COOLDOWN
                 attempt += 1
-                logger.exception('task crashed task=%s attempt=%s', name, attempt)
                 problems.record(self.store, 'service', 'loop-crashed', 'loop=%s attempt=%s %s' % (
-                    name, attempt, internal_detail(error)), level=logging.ERROR)
+                    name, attempt, internal_detail(error)), level=logging.ERROR, every=3600, scope=name)
                 if attempt <= self.task_restart_limit:
                     await asyncio.sleep(self.task_restart_backoff)
                     continue
@@ -1678,7 +1713,7 @@ class Service:
                     notified = True
                     try:
                         problems.record(self.store, 'service', 'loop-stopped', 'loop=%s %s' % (
-                            name, internal_detail(error)), level=logging.ERROR)
+                            name, internal_detail(error)), level=logging.ERROR, every=3600, scope=name)
                         if self.home_topic():
                             with self.store.db:
                                 self.store.enqueue_report(self.home_topic(),
@@ -1686,7 +1721,7 @@ class Service:
                                     'Everything else keeps running.' % self.loop_names[name])
                             self.wake('deliver').set()
                     except sqlite3.Error:
-                        logger.exception('loop pause reporting failed task=%s', name)
+                        logger.warning('loop pause reporting failed task=%s', name, exc_info=True)
                 await asyncio.sleep(cooldown)
                 cooldown = min(cooldown * 2, LOOP_COOLDOWN_LIMIT)
 
@@ -1704,29 +1739,58 @@ class Service:
 
     async def worktree_cleanup_loop(self):
         from .worker_storage import storage_for
-        from .workspaces import CLEANUP_INTERVAL, cleanup_closed_worktrees
-        from .workspaces import cleanup_closed_copies
+        from .workspaces import CLEANUP_INTERVAL, cleanup_closed_copies
         sweep = True
         retry_failed = False
-        next_sweep = time.monotonic() + CLEANUP_INTERVAL
+        next_limits = time.monotonic() + CLEANUP_INTERVAL
+        next_extras = time.monotonic()
         storage = storage_for(self.store)
         while True:
             event = self.wake('worktree_cleanup')
             event.clear()
             more = False
-            if self.store.get('closed_copy_delete', False) is True or self.store.get('close_clears_space', False) is True:
-                more = await cleanup_closed_copies(self.store, sweep=sweep, retry_failed=retry_failed)
-            else:
-                await cleanup_closed_worktrees(self.store, retry_failed=retry_failed)
+            extras = True
+            from .close_saves import expire_ignored, expire_results, fade_results
+            from .workspaces import _repository_lock
+            more = await cleanup_closed_copies(self.store, sweep=sweep, retry_failed=retry_failed)
+            extras = not more or time.monotonic() >= next_extras
+            if extras:
+                next_extras = time.monotonic() + CLEANUP_INTERVAL
+                async with _repository_lock(self.store.directory, 'results-fade'):
+                    more = await fade_results(self.store) or more
+                    await expire_results(self.store)
+                await expire_ignored(self.store)
+            if extras and self.store.get('idle_trim', 0):
+                from .idle_trim import sweep as sweep_idle
+                await asyncio.to_thread(sweep_idle, self.store.directory)
+            if time.monotonic() >= next_limits:
+                from .job_limits import sweep as job_limits
+                next_limits = time.monotonic() + CLEANUP_INTERVAL
+                if await asyncio.to_thread(job_limits, self.store.directory):
+                    self.wake('deliver').set()
+                self.wake('close_save').set()
             await storage.reconcile()
+            if sweep:
+                from .opencode_cleanup import sweep as sweep_opencode
+                await sweep_opencode(self.store)
+            from .records import sweep as sweep_records
+            sweep_records(self.store)
+            from .records import retry_keep_in_thread
+            keep_queue = self.store.directory / 'keep' / 'queue'
+            if keep_queue.is_dir() and any(keep_queue.iterdir()):
+                await asyncio.to_thread(retry_keep_in_thread, self.store.directory)
             storage.schedule()
             retry_failed = True
-            delay = max(0, next_sweep - time.monotonic())
-            if self.store.get('closed_copy_delete', False) is not True:
+            from .close_saves import deletion_delay
+            from .scan_process import ScanError
+            try:
+                due = await deletion_delay(self.store)
+            except ScanError:
                 delay = CLEANUP_INTERVAL
-            if self.store.get('close_clears_space', False) is True:
-                from .close_saves import deletion_delay
-                delay = 0 if more else deletion_delay(self.store)
+            else:
+                delay = 0 if more else min(CLEANUP_INTERVAL, due) if due is not None else CLEANUP_INTERVAL
+            if self.store.db.execute('SELECT 1 FROM keep_queue LIMIT 1').fetchone():
+                delay = min(delay, 60) if delay is not None else 60
             timer = asyncio.create_task(asyncio.sleep(delay)) if delay is not None else asyncio.create_task(asyncio.Event().wait())
             wake = asyncio.create_task(event.wait())
             try:
@@ -1734,12 +1798,56 @@ class Service:
                 for finished in done:
                     finished.result()
                 sweep = timer in done
-                if sweep:
-                    next_sweep = time.monotonic() + CLEANUP_INTERVAL
             finally:
                 timer.cancel()
                 wake.cancel()
                 await asyncio.gather(timer, wake, return_exceptions=True)
+
+    async def close_save_loop(self):
+        """Save and clear newly closed jobs without waiting behind fade, idle trim and job limits."""
+        from .close_saves import deletion_delay
+        from .scan_process import ScanError
+        from .workspaces import cleanup_closed_copies
+        while True:
+            event = self.wake('close_save')
+            event.clear()
+            delay = CLOSE_SAVE_INTERVAL
+            more = await cleanup_closed_copies(self.store)
+            try:
+                due = await deletion_delay(self.store)
+            except ScanError:
+                due = None
+            delay = 0 if more else min(delay, due) if due is not None else delay
+            await pause(event, delay)
+
+    async def records_sweep_loop(self):
+        from . import records
+        while True:
+            await asyncio.sleep(60)
+            records.sweep(self.store)
+            if (self.store.get('journal_import') or {}).get('done'):
+                continue
+            await asyncio.to_thread(records.import_all_notes_in_thread, self.store.directory, self.vault)
+
+    async def result_journal_loop(self):
+        from . import records
+        while True:
+            await asyncio.sleep(5)
+            if self.store.db.execute('SELECT 1 FROM worker_ledger_pending LIMIT 1').fetchone():
+                await asyncio.to_thread(records.result_entries_in_thread, self.store.directory, self.vault)
+
+    async def invariants_loop(self):
+        from .invariants import run
+        while True:
+            await asyncio.sleep(60)
+            await asyncio.to_thread(run, self.store.directory)
+
+    async def records_sync_loop(self):
+        from . import records
+        state = {}
+        while True:
+            await asyncio.sleep(15)
+            await records.commit_tick(self.store, state)
 
     async def host_log_cleanup_loop(self):
         await self.host_logs.run()
@@ -1747,6 +1855,7 @@ class Service:
     async def stray_report_loop(self):
         from .stray_report import next_night, run_once
         pruned = 0
+        memory_due = next_night(time.time())
         while True:
             event = self.wake('stray_report')
             event.clear()
@@ -1754,7 +1863,12 @@ class Service:
             if next_night(pruned) <= now:
                 problems.prune(self.store)
                 pruned = now
-            delay = max(1, next_night(pruned) - time.time())
+            if memory_due <= now:
+                from .memory import nightly
+                active = {topic for topic, session in self.sessions.items() if not session.closed and not session.idle()}
+                nightly(self.store, active)
+                memory_due = next_night(now)
+            delay = max(1, min(next_night(pruned), memory_due) - time.time())
             if self.store.get('stray_report_enabled', False) is True:
                 history = self.store.get('stray_report_history', [])
                 due = next_night(history[-1]['created']) if history else 0
@@ -1768,20 +1882,20 @@ class Service:
             await pause(event, delay)
 
     async def waits_once(self):
-        if self.store.get('waits_enabled', False) is not True:
-            return
         from .waits import poll_github
         await poll_github(self.store)
-        for item in self.store.wait_due():
-            self.store.wait_hook('timer-trigger-failed', self.store.wait_fire, item['id'], outcome='due')
+        sweeps.run(self.store, 'timer-trigger', [item['id'] for item in self.store.wait_due()], self.fire_wait, area='waits')
         self.store.wait_hook('unblocked-job-failed', self.store.wait_resume_unblocked)
         self.store.wait_hook('card-refresh-failed', self.store.refresh_owner_waiting)
         for name in ('feed', 'deliver', 'workers'):
             self.wake(name).set()
 
+    def fire_wait(self, wait_id):
+        pending = self.store.db.execute('SELECT arguments FROM wait_pending_fires WHERE wait=?', (wait_id,)).fetchone()
+        with self.store.transaction():
+            self.store.wait_fire(wait_id, **(json.loads(pending['arguments']) if pending else {'outcome': 'due'}))
+
     async def waits_started(self):
-        if self.store.get('waits_enabled', False) is not True:
-            return
         self.store.wait_hook('service-started-signal-failed', self.store.wait_signal, 'service.started', internal=True)
         await self.updater.waits_changed(started=True)
 
@@ -1801,9 +1915,13 @@ class Service:
                  ('command_menu', self.command_menu),
                  ('reactions', self.reactions),
                  ('restart_watch', self.restart_watch), ('envelopes', self.envelopes),
+                 ('consumed', self.consumed_loop),
                  ('signins', self.signins.run)]
         if self.updater.freeze is not None:
             loops.insert(3, ('update_freeze', lambda: self.updater.freeze.run()))
+        antigravity = extension.optional('antigravity_accounts')
+        if antigravity is not None:
+            loops.append(('antigravity_accounts', lambda: antigravity.monitor(self.store)))
         loops.append(('group_setup', self.group_setup))
         if not self.pair_only:
             loops += [('feed', self.feed), ('workers', self.workers_loop), ('controls', self.controls),
@@ -1812,7 +1930,12 @@ class Service:
             if requests is not None:
                 loops += [('code_request_intake', lambda: requests.intake_loop(self.store)),
                           ('code_request_sender', lambda: requests.sender_loop(self.store))]
-            loops += [('worktree_cleanup', self.worktree_cleanup_loop), ('host_logs', self.host_log_cleanup_loop)]
+            loops += [('worktree_cleanup', self.worktree_cleanup_loop), ('close_save', self.close_save_loop),
+                      ('host_logs', self.host_log_cleanup_loop)]
+            loops.append(('records_sync', self.records_sync_loop))
+            loops.append(('records_sweep', self.records_sweep_loop))
+            loops.append(('result_journal', self.result_journal_loop))
+            loops.append(('invariants', self.invariants_loop))
             from .session_storage import storage_for
             loops.append(('session_cleanup', lambda: storage_for(self.store).run()))
             loops.append(('stray_report', self.stray_report_loop))
@@ -1827,7 +1950,7 @@ class Service:
             problems.record(self.store, 'service', 'started', 'previous exit: unknown, no record')
         elif previous.get('state') == 'running':
             problems.record(self.store, 'service', 'unclean-exit', 'previous run started %s ended without an exit '
-                            'record' % problems.stamp(previous['started']), level=logging.ERROR)
+                            'record' % problems.stamp(previous['started']), level=logging.ERROR, every=3600)
         else:
             problems.record(self.store, 'service', 'started', 'previous exit: ' + previous['cause'])
         with self.store.db:
@@ -1860,26 +1983,19 @@ class Service:
         home = self.home_topic()
         home = home if home in enabled else next(iter(enabled), None)
         stopped = {}
-        stopped_jobs = {}
         for row in self.store.db.execute("SELECT topic,task,result FROM workers WHERE status='interrupted' AND updated>?",
                                          (checked if known else run.get('started', 0),)):
             if json.loads(row['result'] or '{}').get('failure_code') == 'interrupted':
                 channel = row['topic'] if row['topic'] in enabled else home
                 stopped[channel] = stopped.get(channel, 0) + 1
-                stopped_jobs.setdefault(channel, set()).add(row['task'])
         with self.store.db:
             self.store.put('service_run', dict(run, checked=time.time()))
             for topic in enabled:
                 count = stopped.get(topic, 0)
                 if count:
-                    if self.store.get('auto_resume', False) is True:
-                        jobs = len(stopped_jobs[topic])
-                        self.store.enqueue_report(topic, 'Torii is back; checking %d stopped %s for auto-resume.'
-                                                  % (jobs, 'job' if jobs == 1 else 'jobs'))
-                    else:
-                        noun = 'agent was' if count == 1 else 'agents were'
-                        self.store.enqueue_report(
-                            topic, f'Torii just came back online - {count} {noun} stopped. Ask me to resume them.')
+                    noun = 'agent was' if count == 1 else 'agents were'
+                    self.store.enqueue_report(
+                        topic, f'Torii just came back online - {count} {noun} stopped. Ask me to resume them.')
                 elif rebooted:
                     self.store.enqueue_report(topic, 'Torii just came back online.')
 
@@ -1925,8 +2041,7 @@ class Service:
             logger.info('service restart requested')
             cause = 'restart reason=' + (self.restart_reason or 'unknown')
         except _TaskFailed as failure:
-            logger.error('%s', failure)
-            problems.record(self.store, 'service', 'loop-failed', str(failure), level=logging.ERROR)
+            problems.record(self.store, 'service', 'loop-failed', str(failure), level=logging.ERROR, every=3600, scope=str(failure))
             cause = 'loop failed: ' + str(failure)
             raise
         except asyncio.CancelledError:
@@ -1940,20 +2055,25 @@ class Service:
             try:
                 await asyncio.wait_for(self.shutdown(tasks), SHUTDOWN_SECONDS)
             except asyncio.TimeoutError:
-                logger.error('service shutdown timed out seconds=%s', SHUTDOWN_SECONDS)
+                problems.record(self.store, 'service', 'shutdown-timeout', str(SHUTDOWN_SECONDS), level=logging.ERROR, every=3600)
 
     async def shutdown(self, tasks):
         children = (tasks + list(self.feed_tasks.values()) + list(self.worker_tasks.values())
                     + list(self.control_tasks.values()) + list(self.stop_tasks.values())
                     + list(getattr(self, 'audio_tasks', {}).values())
+                    + list(getattr(self, 'attachment_tasks', {}).values())
                     + list(getattr(self, 'chat_scratch_tasks', {}).values())
                     + list(getattr(self, 'parent_rechecks', {}).values()))
         if getattr(self, 'setup_accounts_task', None) is not None:
             children.append(self.setup_accounts_task)
         for task in children:
             task.cancel()
-        await asyncio.gather(*children, return_exceptions=True)
-        for session in self.sessions.values():
-            if hasattr(session, 'detach'):
-                await session.detach()
+        try:
+            await asyncio.gather(*children, return_exceptions=True)
+            self.store.consumed_flush(wait=True)
+            for session in self.sessions.values():
+                if hasattr(session, 'detach'):
+                    await session.detach()
+        finally:
+            self.store.consumed_flush(wait=True)
         await self.extension.close()

@@ -2,8 +2,9 @@
 
 from dataclasses import dataclass
 import os
-import sys
 from pathlib import Path
+
+from . import host_os
 
 
 @dataclass(frozen=True)
@@ -15,8 +16,7 @@ class AttachmentPaths:
     def protected(self, path, metadata=None):
         path = Path(path).resolve()
         def normalized(value):
-            value = str(value)
-            return Path(value.casefold() if sys.platform == 'darwin' else value)
+            return Path(host_os.path_case_key(value))
         candidate = normalized(path)
         if any(normalized(root) in (candidate, *candidate.parents) for root in self.directories):
             return True
@@ -87,7 +87,7 @@ def attachment_paths(store=None, token_file=None):
     for state in states:
         if state.is_dir():
             for file in state.iterdir():
-                name = file.name.casefold() if sys.platform == 'darwin' else file.name
+                name = host_os.path_case_key(file.name)
                 if (name.startswith('shared-mcp') and name.endswith(('.json', '.tmp')) or
                         '-mcp-' in name and name.endswith('.json')):
                     files.append(file)

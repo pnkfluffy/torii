@@ -8,6 +8,7 @@ import json
 import logging
 import os
 from pathlib import Path
+import shutil
 import signal
 import stat
 import subprocess
@@ -15,18 +16,45 @@ import tempfile
 import time
 import uuid
 
+from . import extension, host_os, scan_process
 from .host_os import delete_tree_background as delete_tree
 from .host_os import move_to_trash, trash_directory
 
 logger = logging.getLogger(__name__)
 FETCH_TIMEOUT = 30
+LS_REMOTE_TIMEOUT = 10
+DEFAULT_BRANCH_TTL = 300
+_DEFAULT_BRANCHES = {}
 GIT_TIMEOUT = 30
-CLEANUP_CURSOR_SETTING = 'closed_worktree_cleanup_cursor'
-CLEANUP_AGE = 24 * 60 * 60
-CLEANUP_LIMIT = 10
 CLEANUP_INTERVAL = 60 * 60
+LOCK_TURN = 0.1
+COW_FOLDER = 'cow-worktrees'
+COW_MIN_FREE = 5 * 1024 ** 3
+COW_MIN_SHARE = 0.10
+COW_IMAGE_FLOOR = 0.08
+STOP_GRACE = 2
 WORKTREE_OPERATIONS = ('rebase-merge', 'rebase-apply', 'MERGE_HEAD', 'CHERRY_PICK_HEAD',
                        'REVERT_HEAD', 'BISECT_LOG', 'BISECT_START', 'sequencer')
+
+
+def _cleanup_problem(store, code, detail, level=logging.WARNING):
+    from . import problems
+    try:
+        if store is None:
+            logger.warning('worktree cleanup problem code=%s detail=%s', code, detail)
+        else:
+            problems.record(store, 'workspaces', code, detail, level=level, every=CLEANUP_INTERVAL)
+    except Exception as error:
+        try:
+            logger.warning('worktree cleanup problem reporting failed code=%s type=%s', code, type(error).__name__)
+        except Exception:
+            pass
+
+
+def repository_lock_path(state_dir, project_key):
+    folder = Path(state_dir) / 'locks'
+    folder.mkdir(parents=True, exist_ok=True, mode=0o700)
+    return folder / ('worktree-' + hashlib.sha256(str(project_key).encode()).hexdigest()[:16] + '.lock')
 
 
 @contextlib.asynccontextmanager
@@ -34,10 +62,7 @@ async def _repository_lock(state_dir, project_key, wait=True):
     """Serialize worktree changes to one repository across service and MCP processes.
     Git fails when two worktree changes overlap: a prune or add reads the other's
     half-written administrative folder."""
-    folder = Path(state_dir) / 'locks'
-    folder.mkdir(parents=True, exist_ok=True, mode=0o700)
-    name = 'worktree-' + hashlib.sha256(str(project_key).encode()).hexdigest()[:16] + '.lock'
-    fd = os.open(str(folder / name), os.O_CREAT | os.O_RDWR, 0o600)
+    fd = os.open(str(repository_lock_path(state_dir, project_key)), os.O_CREAT | os.O_RDWR, 0o600)
     try:
         while True:
             try:
@@ -68,10 +93,10 @@ def _signal_group(process, number):
         logger.warning('cannot signal workspace process group pid=%s signal=%s', process.pid, number)
 
 
-async def _stop_process_group(process):
+async def _stop_process_group(process, grace=STOP_GRACE):
     _signal_group(process, signal.SIGTERM)
     try:
-        await asyncio.wait_for(process.wait(), 2)
+        await asyncio.wait_for(process.wait(), grace)
     except asyncio.TimeoutError:
         pass
     _signal_group(process, signal.SIGKILL)
@@ -82,16 +107,17 @@ async def _stop_process_group(process):
             pass
 
 
-async def _stop_spawned(spawn):
+async def _stop_spawned(spawn, grace=STOP_GRACE):
     try:
         process = await spawn
     except Exception as error:
         logger.warning('workspace command did not start during stop type=%s', type(error).__name__)
         return
-    await _stop_process_group(process)
+    await _stop_process_group(process, grace)
 
 
-async def _command(*args, cwd=None, check=True, env=None, strip=True, reject_stderr=False):
+async def _command(*args, cwd=None, check=True, env=None, strip=True, reject_stderr=False, errors=False,
+                   grace=STOP_GRACE):
     spawn = asyncio.ensure_future(asyncio.create_subprocess_exec(
         *map(str, args), cwd=str(cwd) if cwd else None, env=env,
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
@@ -100,7 +126,7 @@ async def _command(*args, cwd=None, check=True, env=None, strip=True, reject_std
         process = await asyncio.shield(spawn)
         stdout, stderr = await process.communicate()
     except asyncio.CancelledError:
-        cleanup = asyncio.create_task(_stop_spawned(spawn))
+        cleanup = asyncio.create_task(_stop_spawned(spawn, grace))
         while True:
             try:
                 await asyncio.shield(cleanup)
@@ -117,6 +143,8 @@ async def _command(*args, cwd=None, check=True, env=None, strip=True, reject_std
         raise RuntimeError(message)
     if reject_stderr and stderr.strip():
         raise RuntimeError('Git reported a warning: ' + stderr.decode(errors='replace').strip())
+    if errors:
+        return process.returncode, text, stderr.decode(errors='replace').strip()
     return process.returncode, text
 
 
@@ -210,6 +238,28 @@ def ensure_project_commit(project_cwd: Path):
             'commit', '--allow-empty', '-qm', 'Initial empty commit', env=env)
 
 
+def _remote_env():
+    return dict(os.environ, GIT_TERMINAL_PROMPT='0', GIT_SSH_COMMAND='ssh -o BatchMode=yes')
+
+
+async def _remote_default(project_root, remote):
+    """Return the remote's current default branch, asked fresh and kept briefly, or '' when it cannot be read."""
+    key = (str(project_root), remote)
+    cached = _DEFAULT_BRANCHES.get(key)
+    if cached and time.monotonic() - cached[0] < DEFAULT_BRANCH_TTL:
+        return cached[1]
+    try:
+        code, text = await asyncio.wait_for(_git(project_root, 'ls-remote', '--symref', '--', remote, 'HEAD',
+                                                 check=False, env=_remote_env()), LS_REMOTE_TIMEOUT)
+    except (asyncio.TimeoutError, OSError, RuntimeError):
+        return ''
+    name = next((line.split('\t')[0].removeprefix('ref: refs/heads/') for line in text.splitlines()
+                 if line.startswith('ref: refs/heads/') and line.endswith('\tHEAD')), '') if not code else ''
+    if name:
+        _DEFAULT_BRANCHES[key] = (time.monotonic(), name)
+    return name
+
+
 async def _start_point(project_root, base):
     remote, upstream = '', ''
     code, current = await _git(project_root, 'symbolic-ref', '--quiet', 'HEAD', check=False)
@@ -217,6 +267,14 @@ async def _start_point(project_root, base):
         _, tracking = await _git(project_root, 'for-each-ref',
                                  '--format=%(upstream:remotename)%00%(upstream:remoteref)', current)
         remote, _, upstream = tracking.partition('\0')
+    if base is None:
+        _, configured = await _git(project_root, 'config', '--get', 'torii.defaultBase', check=False)
+        if configured:
+            base = configured
+        elif remote or not (await _git(project_root, 'remote', 'get-url', 'origin', check=False))[0]:
+            default = await _remote_default(project_root, remote or 'origin')
+            if default:
+                remote, upstream = remote or 'origin', 'refs/heads/' + default
     if base is None and not upstream:
         _, commit = await _git(project_root, 'rev-parse', 'HEAD')
         return {'base_ref': 'HEAD', 'base_commit': commit, 'fetched': False}
@@ -231,7 +289,7 @@ async def _start_point(project_root, base):
         raise ValueError(f'Invalid base branch: {name}')
     base_ref = remote + '/' + name
     tracking_ref = 'refs/remotes/' + base_ref
-    env = dict(os.environ, GIT_TERMINAL_PROMPT='0', GIT_SSH_COMMAND='ssh -o BatchMode=yes')
+    env = _remote_env()
     error = ''
     try:
         await asyncio.wait_for(_git(
@@ -248,8 +306,126 @@ async def _start_point(project_root, base):
     return {'base_ref': base_ref, 'base_commit': commit, 'fetched': not error}
 
 
-def _workspace_target(state_dir, task_id):
-    return Path(state_dir).resolve() / 'worktrees' / f'task-{task_id}'
+def cow_root(state_dir):
+    return Path(state_dir).resolve() / COW_FOLDER
+
+
+def _mounted(path):
+    return host_os.mount_point(path)
+
+
+def volume_mounted(state_dir):
+    return _mounted(cow_root(state_dir))
+
+
+def on_volume(state_dir, path):
+    return path is not None and Path(path).is_relative_to(cow_root(state_dir))
+
+
+def check_volume(state_dir, path):
+    """Refuse work on a volume tree while the volume is absent, so an empty mount point never reads as a cleared copy."""
+    if on_volume(state_dir, path) and not volume_mounted(state_dir):
+        raise ValueError('the copy-on-write worktree volume is not mounted')
+
+
+def volume_side(state_dir, path, name):
+    """Return the folder that holds moved data of path on path's own filesystem."""
+    return cow_root(state_dir) / ('.' + name) if on_volume(state_dir, path) else Path(state_dir) / name
+
+
+def trash_for(state_dir, path):
+    if on_volume(state_dir, path):
+        return host_os.volume_trash_directory(cow_root(state_dir))
+    return trash_directory()
+
+
+def _workspace_targets(state_dir, task_id):
+    name = f'task-{task_id}'
+    return Path(state_dir).resolve() / 'worktrees' / name, cow_root(state_dir) / name
+
+
+def _workspace_target(state_dir, task_id, saved_cwd=None):
+    """A job tree is on the copy-on-write volume when its folder is there; otherwise it is in worktrees."""
+    plain, cow = _workspace_targets(state_dir, task_id)
+    if saved_cwd is not None:
+        return cow if Path(saved_cwd).is_relative_to(cow) else plain
+    return cow if os.path.lexists(cow) else plain
+
+
+def staged_copy(stage, record):
+    return Path(record['copy']) if 'copy' in record else stage / 'copy'
+
+
+def stage_fields(state_dir, target, stage):
+    if not on_volume(state_dir, target):
+        return {}
+    return {'copy': str(cow_root(state_dir) / '.worktree-deletions' / stage.name / 'copy')}
+
+
+def _cow_space(state_dir):
+    """The volume needs free room, and so does the file system under its sparse image."""
+    usage = shutil.disk_usage(cow_root(state_dir))
+    if usage.free < COW_MIN_FREE or usage.free < usage.total * COW_MIN_SHARE:
+        return 'the copy-on-write volume is low on space'
+    info = os.stat(cow_root(state_dir))
+    backing = Path('/sys/dev/block/%d:%d/loop/backing_file' % (os.major(info.st_dev), os.minor(info.st_dev)))
+    if backing.is_file():
+        image = Path(backing.read_text().strip())
+        usage = shutil.disk_usage(image.parent)
+        if usage.free < usage.total * COW_IMAGE_FLOOR:
+            return 'the file system under the copy-on-write image is low on space'
+    return None
+
+
+async def _plain_worktree(project_root, target, commit, branch, new_branch):
+    target.parent.mkdir(parents=True, exist_ok=True)
+    await _git(project_root, 'worktree', 'add', *(('-b', branch, target, commit) if new_branch else (target, branch)))
+    return target
+
+
+async def _new_tree_target(state_dir, task_id, store):
+    """A new job's tree is on the copy-on-write volume only while the volume is mounted and has room."""
+    plain, cow = _workspace_targets(state_dir, task_id)
+    if not volume_mounted(state_dir):
+        return plain
+    reason = await asyncio.to_thread(_cow_space, state_dir)
+    if reason:
+        _cleanup_problem(store, 'cow-worktree-fallback', reason)
+        return plain
+    return cow
+
+
+async def _clear_failed_tree(state_dir, project_root, target, commit, branch, new_branch):
+    """Undo what a failed or stopped tree maker call left, so git worktree add can run.
+    Only the folder Torii chose for the call is cleared. A new branch goes only while it still
+    points at its start commit and no worktree has it."""
+    if any(Path(record['worktree']) == target for record in await _worktree_records(project_root, check=False)):
+        await _git(project_root, 'worktree', 'remove', '--force', target, check=False, timeout=GIT_TIMEOUT)
+    if os.path.lexists(target):
+        try:
+            move_to_trash(target, trash_for(state_dir, target), name=target.name + '.failed-tree')
+        except OSError as error:
+            raise RuntimeError('Cannot clear the failed job tree: ' + str(error)) from error
+    if new_branch and not any(record.get('branch') == 'refs/heads/' + branch
+                              for record in await _worktree_records(project_root, check=False)):
+        await _git(project_root, 'update-ref', '-d', 'refs/heads/' + branch, commit, check=False, timeout=GIT_TIMEOUT)
+
+
+async def _make_detached_worktree(store, repository, target, commit):
+    """Try the job tree maker while the caller holds the repository lock."""
+    state_dir = store.directory
+    if store.get('cow_worktrees', False) is not True and not on_volume(state_dir, target):
+        return False
+    maker = extension.optional('tree_maker')
+    if maker is None:
+        return False
+    records = await _worktree_records(repository, timeout=GIT_TIMEOUT)
+    if any(Path(record['worktree']) == target for record in records):
+        return False
+    made = await maker.make(state_dir, repository, target, commit, None, False, store, lock_held=True)
+    if made is None:
+        await _clear_failed_tree(state_dir, repository, target, commit, None, False)
+    return made is not None
 
 
 def _saved_workspace_relative(target, saved_cwd):
@@ -262,18 +438,36 @@ def _saved_workspace_relative(target, saved_cwd):
         raise ValueError('The saved job worktree is not its original task folder.') from error
 
 
+async def _finish_workspace(store, task_id, project_root, identity, target, branch, rebuilt, rebuild_started, start):
+    commit = await _validate_existing(project_root, target, branch)
+    if store is not None:
+        from .close_saves import restore
+        restored = await restore(store, task_id, target, Path(identity['project_key']))
+        if rebuilt or restored:
+            start['rebuilt'] = True
+            with store.db:
+                store.db.execute('UPDATE task_iterations SET rebuild_seconds=? WHERE task=? AND k=(SELECT iteration FROM tasks WHERE id=?)',
+                                 (time.monotonic() - rebuild_started, task_id, task_id))
+    return commit
+
+
 async def prepare_task_workspace(project_cwd: Path, state_dir: Path, task_id: int, base=None,
-                                 *, saved_cwd=None, store=None) -> dict:
-    """Name the branch and folder by the global task id, so topics sharing a repository never collide."""
+                                 *, saved_cwd=None, store=None, cow=False) -> dict:
+    """Name the branch and folder by the global task id, so topics sharing a repository never collide.
+    With cow and the add-on tree maker, the maker makes the tree, on the copy-on-write volume when it is ready."""
+    maker = extension.optional('tree_maker')
+    cow = cow and maker is not None
     rebuild_started = time.monotonic()
     rebuilt = False
     identity = await project_identity(project_cwd)
     branch = f'torii/task-{task_id}'
-    target = _workspace_target(state_dir, task_id)
+    target = _workspace_target(state_dir, task_id, saved_cwd)
     relative_saved = _saved_workspace_relative(target, saved_cwd) if saved_cwd is not None else None
+    check_volume(state_dir, target)
     lock_key = identity['project_key']
     if identity['base_commit'] is None and lock_key == identity['cwd']:
         lock_key = str(Path(lock_key) / '.git')
+    pending = None
     async with _repository_lock(state_dir, lock_key):
         if identity['base_commit'] is None:
             try:
@@ -288,17 +482,16 @@ async def prepare_task_workspace(project_cwd: Path, state_dir: Path, task_id: in
         project_root = Path(identity['project_root'])
         relative_cwd = (relative_saved if relative_saved is not None else
                         Path(identity['cwd']).relative_to(project_root))
-        _recover_staged_registrations(state_dir, identity['project_key'])
+        await _async_recover_staged_registrations(state_dir, identity['project_key'], store=store)
         start = {'base_ref': 'HEAD', 'fetched': False}
         if saved_cwd is not None and target.is_symlink():
             raise RuntimeError(f'Workspace path collision: {target}')
-        if store is not None and store.get('close_saves_any_branch', False) is True:
-            from .close_saves import rebuild_branch, enabled
-            if enabled(store) and saved_cwd is not None:
-                saved_branch, restored = await rebuild_branch(store, task_id, target, Path(identity['project_key']))
-                if saved_branch:
-                    branch = saved_branch
-                    rebuilt = restored
+        if store is not None and saved_cwd is not None:
+            from .close_saves import rebuild_branch
+            saved_branch, restored = await rebuild_branch(store, task_id, target, Path(identity['project_key']))
+            if saved_branch:
+                branch = saved_branch
+                rebuilt = restored
         if not target.exists():
             rebuilt = saved_cwd is not None
             records = await _worktree_records(project_root, check=saved_cwd is not None)
@@ -309,8 +502,10 @@ async def prepare_task_workspace(project_cwd: Path, state_dir: Path, task_id: in
                     raise RuntimeError(f'Job branch is already used by {existing}')
             if saved_cwd is None:
                 start = await _start_point(project_root, base)
-                target.parent.mkdir(parents=True, exist_ok=True)
-                await _git(project_root, 'worktree', 'add', '-b', branch, target, start['base_commit'])
+                if cow:
+                    target, pending = await _new_tree_target(state_dir, task_id, store), start['base_commit']
+                else:
+                    await _plain_worktree(project_root, target, start['base_commit'], branch, True)
             else:
                 code, _ = await _git(project_root, 'show-ref', '--verify', '--quiet',
                                      'refs/heads/' + branch, check=False)
@@ -323,18 +518,24 @@ async def prepare_task_workspace(project_cwd: Path, state_dir: Path, task_id: in
                         move_to_trash(git_dir, trash_directory(), name=target.name + '.git-worktree')
                     except OSError as error:
                         raise RuntimeError('Cannot preserve the saved worktree Git data: ' + str(error)) from error
-                target.parent.mkdir(parents=True, exist_ok=True)
-                await _git(project_root, 'worktree', 'add', target, branch)
-        start['base_commit'] = await _validate_existing(project_root, target, branch)
-        if store is not None:
-            from .close_saves import restore, enabled
-            if enabled(store):
-                restored = await restore(store, task_id, target, Path(identity['project_key']))
-                if rebuilt or restored:
-                    start['rebuilt'] = True
-                    with store.db:
-                        store.db.execute('UPDATE task_iterations SET rebuild_seconds=? WHERE task=? AND k=(SELECT iteration FROM tasks WHERE id=?)',
-                                         (time.monotonic() - rebuild_started, task_id, task_id))
+                if cow or on_volume(state_dir, target):
+                    _, pending = await _git(project_root, 'rev-parse', '--verify', 'refs/heads/' + branch + '^{commit}')
+                else:
+                    await _plain_worktree(project_root, target, None, branch, False)
+        if pending is None:
+            start['base_commit'] = await _finish_workspace(store, task_id, project_root, identity, target, branch,
+                                                           rebuilt, rebuild_started, start)
+    if pending is not None:
+        new_branch = saved_cwd is None
+        made = None if maker is None else await maker.make(state_dir, project_root, target, pending, branch, new_branch, store)
+        async with _repository_lock(state_dir, lock_key):
+            if made is None:
+                await _clear_failed_tree(state_dir, project_root, target, pending, branch, new_branch)
+                if new_branch:
+                    target = Path(state_dir).resolve() / 'worktrees' / target.name
+                await _plain_worktree(project_root, target, pending, branch, new_branch)
+            start['base_commit'] = await _finish_workspace(store, task_id, project_root, identity, target, branch,
+                                                           rebuilt, rebuild_started, start)
     workspace_cwd = target / relative_cwd
     workspace_cwd.mkdir(parents=True, exist_ok=True)
     return {'cwd': str(workspace_cwd), 'branch': branch, 'project_root': str(project_root),
@@ -375,204 +576,9 @@ async def _registered_git_directory(repository, target, *, timeout=None):
     return matches[0]
 
 
-def _cleanup_task_reason(store, task, target, now, *, immediate=False):
-    if not task or task['status'] not in ('done', 'dropped'):
-        return 'job is open or missing'
-    if not immediate and now - task['updated'] < CLEANUP_AGE:
-        return 'job closed less than 24 hours ago'
-    if not task['worktree']:
-        return 'job has no saved worktree'
-    _saved_workspace_relative(target, task['worktree'])
-    if target.resolve() != target or not stat.S_ISDIR(target.lstat().st_mode):
-        return 'task folder is a symlink or is not a directory'
-    if not Path(task['worktree']).is_dir():
-        return 'saved working directory is missing'
-    for worker in store.db.execute("SELECT task,cwd FROM workers WHERE status NOT IN ('done','interrupted')"):
-        if worker['task'] == task['id']:
-            return 'job has an unfinished worker'
-        if worker['cwd'] and Path(worker['cwd']).resolve().is_relative_to(target):
-            return 'an unfinished worker uses the task folder'
-    for row in store.db.execute('SELECT image FROM outbox WHERE delivered=0 AND retired=0 AND image IS NOT NULL'):
-        if row['image'] and Path(row['image']).resolve().is_relative_to(target):
-            return "a Telegram file queued from it hasn't been sent yet"
-    return None
-
-
 def _workspace_operation(git_dir):
     return next((name for name in WORKTREE_OPERATIONS
                  if (git_dir / name).exists() or (git_dir / name).is_symlink()), None)
-
-
-async def _cleanup_git_directory(repository, target):
-    records = [record for record in await _worktree_records(repository, timeout=GIT_TIMEOUT)
-               if Path(record['worktree']) == target]
-    if len(records) != 1 or not records[0].get('branch', '').startswith('refs/heads/'):
-        raise ValueError('worktree registration has no attached local branch')
-    branch_ref = records[0]['branch']
-    if 'locked' in records[0]:
-        raise ValueError('worktree is locked')
-    await _validate_existing(repository, target, branch_ref.removeprefix('refs/heads/'), timeout=GIT_TIMEOUT)
-    _, git_dir = await _git(target, 'rev-parse', '--git-dir', timeout=GIT_TIMEOUT)
-    git_dir = _resolved_git_dir(target, git_dir)
-    if git_dir != await _registered_git_directory(repository, target, timeout=GIT_TIMEOUT):
-        raise ValueError('worktree Git data folder does not match its registration')
-    submodule_layout = ((target / '.gitmodules').exists(), (git_dir / 'modules').exists())
-    operation = _workspace_operation(git_dir)
-    if operation:
-        raise ValueError('Git operation is in progress: ' + operation)
-    _, changes = await _git(target, 'status', '--porcelain', '--untracked-files=all',
-                            '--ignore-submodules=all', env=dict(os.environ, GIT_OPTIONAL_LOCKS='0'),
-                            timeout=GIT_TIMEOUT, reject_stderr=True)
-    if changes:
-        raise ValueError('worktree has tracked or untracked changes')
-    _, flags = await _git(target, 'ls-files', '-v', '-z', timeout=GIT_TIMEOUT, strip=False)
-    if any(entry and (entry[0] == 'S' or entry[0].islower()) for entry in flags.split('\0')):
-        raise ValueError('worktree has skip-worktree or assume-unchanged entries that can hide edits')
-    _, entries = await _git(target, 'ls-files', '--stage', '-z', timeout=GIT_TIMEOUT, strip=False)
-    if not any(submodule_layout) and any(entry.startswith('160000 ') for entry in entries.split('\0')):
-        raise ValueError('submodule metadata is missing')
-    if submodule_layout != ((target / '.gitmodules').exists(), (git_dir / 'modules').exists()):
-        raise ValueError('Submodule layout changed during cleanup')
-    return git_dir, branch_ref
-
-
-async def cleanup_task_workspace(store, task_id, now=None):
-    """Move one eligible closed job's code to Trash and keep all repository branches."""
-    from .close_saves import enabled, save_job
-    if enabled(store):
-        return await save_job(store, task_id)
-    if store.get('closed_copy_delete', False) is True:
-        return await stage_closed_copy(store, task_id)
-    now = time.time() if now is None else now
-    task = store.task_get(task_id)
-    number = task['number'] if task else task_id
-    try:
-        target = _workspace_target(store.directory, task_id)
-        reason = _cleanup_task_reason(store, task, target, now)
-        if reason:
-            raise ValueError(reason)
-        topic = store.topic(task['topic'])
-        if not topic or not topic['cwd']:
-            raise ValueError('project folder is unavailable')
-        identity = await project_identity(Path(topic['cwd']), timeout=GIT_TIMEOUT)
-        if identity['base_commit'] is None:
-            raise ValueError('project has no Git worktree')
-        repository = Path(identity['project_key'])
-        async with _repository_lock(store.directory, identity['project_key']):
-            task = store.task_get(task_id)
-            reason = _cleanup_task_reason(store, task, target, now)
-            if reason:
-                raise ValueError(reason)
-            original = target.lstat()
-            git_dir, branch_ref = await _cleanup_git_directory(repository, target)
-            trash = trash_directory()
-            ancestor = trash
-            while not ancestor.exists():
-                ancestor = ancestor.parent
-            device = ancestor.stat().st_dev
-            if target.lstat().st_dev != device or git_dir.lstat().st_dev != device:
-                raise ValueError('Trash is on another filesystem')
-            reason = _cleanup_task_reason(store, store.task_get(task_id), target, now)
-            if reason:
-                raise ValueError(reason)
-            manifest = None
-            if (target / '.gitmodules').exists() or (git_dir / 'modules').exists():
-                from .worktree_salvage import preserve_worktree, verify_preserved_worktree
-                manifest = await preserve_worktree(target, store.directory / 'results' / target.name / 'worktree-salvage')
-            if manifest is not None:
-                await verify_preserved_worktree(target, manifest)
-            with store.db:
-                if not store.db.in_transaction:
-                    store.db.execute('BEGIN IMMEDIATE')
-                reason = _cleanup_task_reason(store, store.task_get(task_id), target, now)
-                if reason:
-                    raise ValueError(reason)
-                current = target.lstat()
-                if (current.st_dev, current.st_ino) != (original.st_dev, original.st_ino):
-                    raise ValueError('task folder changed during cleanup')
-                if ((git_dir / 'locked').exists() or _workspace_operation(git_dir)
-                        or (git_dir / 'HEAD').read_text().strip() != 'ref: ' + branch_ref):
-                    raise ValueError('Git branch, operation, or lock changed during cleanup')
-                if manifest is None and ((target / '.gitmodules').exists() or (git_dir / 'modules').exists()):
-                    raise ValueError('Submodule layout changed during cleanup')
-                trash = trash_directory()
-                trash.mkdir(mode=0o700, parents=True, exist_ok=True)
-                device = trash.stat().st_dev
-                if target.lstat().st_dev != device or git_dir.lstat().st_dev != device:
-                    raise ValueError('Trash is on another filesystem')
-                moved = move_to_trash(target, trash)
-            try:
-                move_to_trash(git_dir, trash, name=target.name + '.git-worktree')
-            except BaseException:
-                try:
-                    if target.exists() or target.is_symlink():
-                        raise FileExistsError('Cannot restore the task folder over another path.')
-                    moved.rename(target)
-                except OSError:
-                    logger.exception('worktree cleanup rollback failed job=%s trash=%s repository=%s',
-                                     number, moved, repository)
-                raise
-        logger.info('worktree cleanup moved job=%s trash=%s repository=%s', number, moved, repository)
-        return moved
-    except (OSError, RuntimeError, ValueError, asyncio.TimeoutError) as error:
-        if (isinstance(error, FileNotFoundError) and error.filename == str(target)
-                and not target.exists() and not target.is_symlink()):
-            return None
-        detail = ' '.join(str(error).splitlines()) or type(error).__name__
-        logger.debug('worktree cleanup skipped job=%s reason=%s', number, detail)
-        return None
-
-
-async def cleanup_closed_worktrees(store, limit=CLEANUP_LIMIT, now=None, *, retry_failed=True):
-    """Save sweep progress and bound Git checks while skipping unavailable jobs for free."""
-    if store.get('closed_copy_delete', False) is True or store.get('close_clears_space', False) is True:
-        await cleanup_closed_copies(store, sweep=True, retry_failed=retry_failed)
-        return 0
-    if list(_deletion_stages(store.directory)):
-        await cleanup_closed_copies(store, sweep=True, retry_failed=retry_failed)
-    after = store.get(CLEANUP_CURSOR_SETTING, 0)
-    now = time.time() if now is None else now
-    checked = 0
-    while checked < limit:
-        page_size = limit - checked
-        tasks = store.closed_tasks_page(after, page_size)
-        for task in tasks:
-            try:
-                target = _workspace_target(store.directory, task['id'])
-                ready = _cleanup_task_reason(store, store.task_get(task['id']), target, now) is None
-                if ready:
-                    topic = store.topic(task['topic'])
-                    ready = bool(topic and topic['cwd'] and Path(topic['cwd']).expanduser().is_dir())
-            except (OSError, RuntimeError, ValueError):
-                ready = False
-            if ready:
-                await cleanup_task_workspace(store, task['id'], now=now)
-                checked += 1
-            after = task['id']
-            with store.db:
-                store.put(CLEANUP_CURSOR_SETTING, after)
-        if len(tasks) < page_size:
-            with store.db:
-                store.put(CLEANUP_CURSOR_SETTING, 0)
-            return 0
-    return after
-
-
-def request_closed_copy_cleanup(store, task_id=None, cwd=None):
-    from .close_saves import enabled, request
-    if enabled(store):
-        request(store, task_id, cwd)
-        return
-    if store.get('closed_copy_delete', False) is not True:
-        return
-    pending = store.get('closed_copy_cleanup_pending', {})
-    root = Path(store.directory).resolve() / 'worktrees'
-    current = Path(cwd).resolve() if cwd else None
-    for task in store.db.execute("SELECT id FROM tasks WHERE status IN ('done','dropped')"):
-        target = root / ('task-' + str(task['id']))
-        if task['id'] == task_id or current is not None and current.is_relative_to(target):
-            pending[str(task['id'])] = uuid.uuid4().hex
-    store.put('closed_copy_cleanup_pending', pending)
 
 
 def _save_deletion(stage, record):
@@ -589,47 +595,248 @@ def _save_deletion(stage, record):
         os.close(fd)
 
 
+async def _save_deletion_bounded(store, stage, record):
+    try:
+        await scan_process.run_async(_save_deletion, stage, record)
+    except Exception as error:
+        _cleanup_problem(store, 'closed-copy-record-write-failed', type(error).__name__)
+        raise scan_process.ScanError('worktree deletion record write failed') from error
+
+
+def _prepare_deletion_stage(state_dir, stage, record):
+    root = Path(state_dir) / 'worktree-deletions'
+    preparing = Path(state_dir) / 'worktree-deletion-preparing'
+    if stage.parent != root or root.is_symlink() or preparing.is_symlink():
+        raise ValueError('Unsafe deletion stage path')
+    root.mkdir(mode=0o700, exist_ok=True)
+    preparing.mkdir(mode=0o700, exist_ok=True)
+    temporary = preparing / (stage.name + '-' + uuid.uuid4().hex)
+    temporary.mkdir(mode=0o700)
+    _save_deletion(temporary, record)
+    if stage.exists() or stage.is_symlink():
+        raise ValueError('Deletion stage already exists')
+    if 'copy' in record:
+        copy = Path(record['copy'])
+        if copy != cow_root(state_dir) / '.worktree-deletions' / stage.name / 'copy':
+            raise ValueError('Unsafe volume deletion stage path')
+        copy.parent.parent.mkdir(mode=0o700, exist_ok=True)
+        if copy.parent.parent.is_symlink():
+            raise ValueError('Unsafe volume deletion stage path')
+        copy.parent.mkdir(mode=0o700)
+    temporary.rename(stage)
+    for directory in (preparing, root):
+        fd = os.open(str(directory), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    return stage
+
+
+async def async_prepare_deletion_stage(store, stage, record):
+    check_volume(store.directory, record.get('copy'))
+    try:
+        return await scan_process.run_async(_prepare_deletion_stage, store.directory, Path(stage), record)
+    except Exception as error:
+        _cleanup_problem(store, 'closed-copy-record-write-failed', type(error).__name__)
+        raise scan_process.ScanError('worktree deletion stage preparation failed') from error
+
+
+def _check_finalization_stage(stage):
+    if not stat.S_ISDIR(stage.lstat().st_mode):
+        raise ValueError('Deletion finalization stage is not a directory')
+    with os.scandir(stage) as entries:
+        for entry in entries:
+            if entry.name not in ('record.json', 'record.tmp') or not entry.is_file(follow_symlinks=False):
+                raise ValueError('Deletion finalization stage contains unexpected data')
+
+
+def _move_finalization_stage(state_dir, stage):
+    root = Path(state_dir) / 'worktree-deletion-finalizing'
+    if stage.parent != Path(state_dir) / 'worktree-deletions' or root.is_symlink():
+        raise ValueError('Unsafe deletion finalization path')
+    _check_finalization_stage(stage)
+    root.mkdir(mode=0o700, exist_ok=True)
+    destination = root / stage.name
+    if destination.exists() or destination.is_symlink():
+        raise ValueError('Deletion finalization stage already exists')
+    stage.rename(destination)
+    return destination
+
+
+def _scan_finalization_stages(state_dir):
+    root = Path(state_dir) / 'worktree-deletion-finalizing'
+    try:
+        info = root.lstat()
+    except FileNotFoundError:
+        return []
+    if not stat.S_ISDIR(info.st_mode):
+        raise ValueError('Deletion finalization folder is not a directory')
+    stages = sorted(root.iterdir())
+    for stage in stages:
+        _check_finalization_stage(stage)
+    return stages
+
+
+def _remove_volume_stage(record):
+    folder = Path(record['copy']).parent
+    if os.path.lexists(folder / 'copy'):
+        raise ValueError('Staged volume copy still exists')
+    with contextlib.suppress(FileNotFoundError):
+        folder.rmdir()
+
+
+async def _finish_stage(store, stage, options, record):
+    if 'copy' in record:
+        _require_mount(record)
+        await scan_process.run_async(_remove_volume_stage, record)
+    moved = await scan_process.run_async(_move_finalization_stage, store.directory, stage)
+    await delete_tree(moved, **options)
+    with store.db:
+        store.db.execute('DELETE FROM settings WHERE key=?', ('closed_copy_finalized:' + stage.name,))
+
+
+async def _recover_finalization_stages(store):
+    """Finish each half-deleted stage. True once none is left waiting after a failure."""
+    from . import sweeps
+
+    async def finish(stage):
+        await delete_tree(stage)
+        with store.db:
+            store.db.execute('DELETE FROM settings WHERE key=?', ('closed_copy_finalized:' + stage.name,))
+    try:
+        stages = await scan_process.run_async(_scan_finalization_stages, store.directory)
+    except Exception as error:
+        _cleanup_problem(store, 'closed-copy-finalization-failed', sweeps.describe(error))
+        return False
+    await sweeps.arun(store, 'closed-copy-finalization', stages, finish, area='workspaces', key=lambda stage: stage.name)
+    return not any(sweeps.waiting(store, 'closed-copy-finalization', stage.name) for stage in stages)
+
+
+async def _account_completed_stage(store, stage, record):
+    from . import close_saves
+    key = 'closed_copy_finalized:' + stage.name
+    if store.db.execute('SELECT 1 FROM settings WHERE key=?', (key,)).fetchone():
+        return True
+    if 'space_k' in record:
+        task = {'id': record['task'], 'iteration': record['space_k']}
+        stamp = close_saves.checkpoint_stamp(store, task)
+        phase, saved = await close_saves.async_load(store, task)
+        saved.setdefault('freed', dict.fromkeys(('copy', 'deps', 'extras', 'prune'), 0))
+        saved['freed']['copy'] += record['removed']['bytes'] - saved['freed']['deps']
+        encoded = await close_saves.async_encode_checkpoint(store, saved)
+    with store.db:
+        if not store.db.in_transaction:
+            store.db.execute('BEGIN IMMEDIATE')
+        if store.db.execute('SELECT 1 FROM settings WHERE key=?', (key,)).fetchone():
+            return True
+        if 'space_k' in record:
+            if not close_saves.references_current(store, stamp):
+                return False
+            store.db.execute('UPDATE task_iterations SET bytes_freed=COALESCE(bytes_freed,0)+? WHERE task=? AND k=?',
+                             (record['removed']['bytes'], record['task'], record['space_k']))
+            close_saves.checkpoint_encoded(store, task, phase, encoded)
+        else:
+            store.put('closed_copy_state:' + str(record['task']), {'state': 'gone', 'reason': ''})
+        store.put(key, True)
+    return True
+
+
 def _deletion_stages(state_dir, on_error=None):
     root = Path(state_dir) / 'worktree-deletions'
     try:
-        if root.is_symlink():
-            raise ValueError('Deletion staging folder is a symlink')
-        stages = sorted(root.iterdir()) if root.is_dir() else []
+        try:
+            root_info = root.lstat()
+        except FileNotFoundError:
+            return
+        if not stat.S_ISDIR(root_info.st_mode):
+            raise ValueError('Deletion staging folder is not a directory')
+        stages = sorted(root.iterdir())
     except (OSError, ValueError) as error:
         if on_error:
             on_error(root, error)
         return
     for stage in stages:
         try:
-            if stage.is_dir() and not stage.is_symlink() and (stage / 'record.json').is_file():
-                record = json.loads((stage / 'record.json').read_text())
-                if (not isinstance(record, dict)
-                        or any(type(record.get(key)) is not int for key in ('task', 'number'))
-                        or any(not isinstance(record.get(key), str) for key in ('target', 'repository', 'git_dir', 'branch'))
-                        or type(record.get('detached')) is not bool
-                        or not isinstance(record.get('git_inode'), list) or len(record['git_inode']) != 2
-                        or any(type(value) is not int for value in record['git_inode'])
-                        or not isinstance(record.get('ignored'), list)
-                        or any(not isinstance(value, str) for value in record['ignored'])
-                        or not isinstance(record.get('removed'), dict)
-                        or any(type(record['removed'].get(key)) is not int or record['removed'][key] < 0
-                               for key in ('bytes', 'files'))):
-                    raise ValueError('Staged deletion record is incomplete')
-                if Path(record['target']) != _workspace_target(state_dir, record['task']):
-                    raise ValueError('Staged deletion has an unsafe task path')
-                git_dir = Path(record['git_dir'])
-                if git_dir.parent != Path(record['repository']) / 'worktrees':
-                    raise ValueError('Staged deletion has an unsafe Git data path')
-                yield stage, record
-        except FileNotFoundError:
-            continue
+            info = stage.lstat()
+            if not stat.S_ISDIR(info.st_mode):
+                raise ValueError('Deletion stage is not a directory')
+            pathname = stage / 'record.json'
+            fd = os.open(str(pathname), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+            with os.fdopen(fd) as handle:
+                info = os.fstat(handle.fileno())
+                if not stat.S_ISREG(info.st_mode):
+                    raise ValueError('Deletion stage record is not a regular file')
+                record = json.load(handle)
+            if (not isinstance(record, dict)
+                    or any(type(record.get(key)) is not int for key in ('task', 'number'))
+                    or any(not isinstance(record.get(key), str) for key in ('target', 'repository', 'git_dir', 'branch'))
+                    or type(record.get('detached')) is not bool
+                    or not isinstance(record.get('git_inode'), list) or len(record['git_inode']) != 2
+                    or any(type(value) is not int for value in record['git_inode'])
+                    or not isinstance(record.get('ignored'), list)
+                    or any(not isinstance(value, str) for value in record['ignored'])
+                    or not isinstance(record.get('removed'), dict)
+                    or any(type(record['removed'].get(key)) is not int or record['removed'][key] < 0
+                           for key in ('bytes', 'files'))):
+                raise ValueError('Staged deletion record is incomplete')
+            targets = _workspace_targets(state_dir, record['task'])
+            if Path(record['target']) not in targets:
+                raise ValueError('Staged deletion has an unsafe task path')
+            if (('copy' in record) != (Path(record['target']) == targets[1]) or 'copy' in record
+                    and record['copy'] != str(cow_root(state_dir) / '.worktree-deletions' / stage.name / 'copy')):
+                raise ValueError('Staged deletion has an unsafe copy path')
+            git_dir = Path(record['git_dir'])
+            if git_dir.parent != Path(record['repository']) / 'worktrees':
+                raise ValueError('Staged deletion has an unsafe Git data path')
+            yield stage, record
+        except FileNotFoundError as error:
+            if stage.exists() or stage.is_symlink():
+                if on_error:
+                    on_error(stage, error)
         except Exception as error:
             if on_error:
                 on_error(stage, error)
 
 
+def _scan_deletion_stages(state_dir):
+    invalid = [None, 0]
+    def record_error(stage, error):
+        if invalid[0] is None:
+            invalid[0] = (stage, type(error).__name__, str(error)[:500])
+        invalid[1] += 1
+    return list(_deletion_stages(state_dir, on_error=record_error)), invalid
+
+
+async def _async_deletion_stages(state_dir, store=None):
+    try:
+        stages, invalid = await scan_process.run_async(_scan_deletion_stages, Path(state_dir))
+    except Exception as error:
+        _cleanup_problem(store, 'closed-copy-scan-failed', type(error).__name__)
+        raise scan_process.ScanError('worktree deletion scan failed') from error
+    representative, count = invalid
+    if representative is not None:
+        stage, kind, detail = representative
+        _cleanup_problem(store, 'closed-copy-record-invalid',
+                         str(stage) + ': ' + detail + ' invalid_records=' + str(count))
+        raise scan_process.ScanError('worktree deletion record is invalid')
+    if store is not None:
+        stages = [(stage, record) for stage, record in stages
+                  if not store.get('closed_copy_retired:' + stage.name, False)]
+    return stages
+
+
+async def async_deletion_stages(store):
+    return await _async_deletion_stages(store.directory, store)
+
+
+def _require_mount(record):
+    if 'copy' in record and not _mounted(Path(record['copy']).parents[2]):
+        raise ValueError('the copy-on-write worktree volume is not mounted')
+
+
 def _detach_staged(stage, record):
-    if record['detached'] or not (stage / 'copy').is_dir():
+    if record['detached'] or not staged_copy(stage, record).is_dir():
         return
     git_dir = Path(record['git_dir'])
     if not (stage / 'git').exists():
@@ -647,227 +854,121 @@ def _detach_staged(stage, record):
     _save_deletion(stage, record)
 
 
-def _recover_staged_registrations(state_dir, repository):
-    for stage, record in list(_deletion_stages(state_dir)):
-        if record['repository'] == str(repository) and not record['detached']:
-            _detach_staged(stage, record)
+def _detach_scan_stage(stage, record):
+    _detach_staged(stage, record)
+    return stage, record
 
 
-def closed_copy_answer(state):
-    if state['state'] == 'gone' and state['reason']:
-        return 'Its code copy is already absent.'
-    if state['state'] == 'staged' and state['reason']:
-        return 'Its code copy was staged; its branch is kept. Background deletion needs attention: ' + state['reason'] + '.'
-    if state['state'] in ('staged', 'gone'):
-        return 'Its code copy was deleted; its branch is kept. Staged bytes are removed in the background.'
-    if state['reason'] == 'worktree has tracked or untracked changes':
-        return 'Its code copy has uncommitted changes or untracked files, so it stays until they are committed or discarded.'
-    return 'Its code copy is kept because ' + state['reason'] + '.'
-
-
-def _absent_copy_state(store, task_id):
-    state = {'state': 'gone', 'reason': 'code copy is already absent'}
-    for stage, record in _deletion_stages(store.directory):
-        if record['task'] == task_id:
-            state = {'state': 'staged', 'reason': record.get('error', ''), 'stage': str(stage)}
-            break
-    with store.db:
-        store.put('closed_copy_state:' + str(task_id), state)
-    return state
-
-
-async def stage_closed_copy(store, task_id):
-    """Release a proven saved copy and its registration before background byte removal."""
-    task = store.task_get(task_id)
-    target = _workspace_target(store.directory, task_id)
-    number = task['number'] if task else task_id
-    state_key = 'closed_copy_state:' + str(task_id)
+async def _async_detach_staged(stage, record, store=None):
     try:
-        if not target.exists() and not target.is_symlink():
-            return _absent_copy_state(store, task_id)
-        reason = _cleanup_task_reason(store, task, target, time.time(), immediate=True)
-        if reason:
-            raise ValueError(reason)
-        topic = store.topic(task['topic'])
-        if not topic or not topic['cwd']:
-            raise ValueError('project folder is unavailable')
-        identity = await project_identity(Path(topic['cwd']), timeout=GIT_TIMEOUT)
-        if identity['base_commit'] is None:
-            raise ValueError('project has no Git worktree')
-        repository = Path(identity['project_key'])
-        async with _repository_lock(store.directory, repository):
-            if not target.exists() and not target.is_symlink():
-                return _absent_copy_state(store, task_id)
-            original = target.lstat()
-            git_dir, branch_ref = await _cleanup_git_directory(repository, target)
-            if branch_ref != 'refs/heads/torii/task-' + str(task_id):
-                raise ValueError('worktree is not on the saved job branch')
-            reason = _cleanup_task_reason(store, store.task_get(task_id), target, time.time(), immediate=True)
-            if reason:
-                raise ValueError(reason)
-            if store.get('closed_copy_delete', False) is not True:
-                raise ValueError('closed copy deletion is off')
-            manifest = None
-            _, ignored = await _git(target, 'ls-files', '--others', '--ignored', '--exclude-standard',
-                                    '--directory', '-z', timeout=GIT_TIMEOUT, strip=False)
-            root = store.directory / 'worktree-deletions'
-            if root.is_symlink():
-                raise ValueError('Deletion staging folder is a symlink')
-            root.mkdir(mode=0o700, exist_ok=True)
-            info = git_dir.lstat()
-            current = target.lstat()
-            if (current.st_dev, current.st_ino) != (original.st_dev, original.st_ino):
-                raise ValueError('task folder changed during cleanup')
-            if current.st_dev != root.stat().st_dev or info.st_dev != root.stat().st_dev:
-                raise ValueError('Deletion staging folder is on another filesystem')
-            if (target / '.gitmodules').exists() or (git_dir / 'modules').exists():
-                from .worktree_salvage import preserve_worktree, verify_preserved_worktree
-                manifest = await preserve_worktree(target, store.directory / 'results' / target.name / 'worktree-salvage')
-            stage = root / (target.name + '-' + uuid.uuid4().hex)
-            stage.mkdir(mode=0o700)
-            record = dict(task=task_id, number=number, target=str(target), repository=str(repository),
-                          git_dir=str(git_dir), git_inode=[info.st_dev, info.st_ino], branch=branch_ref,
-                          ignored=sorted({name.split('/')[0] for name in ignored.split('\0') if name}),
-                          detached=False, removed={'bytes': 0, 'files': 0})
-            if manifest is not None:
-                record['salvage'] = str(manifest)
-            _save_deletion(stage, record)
-            checked_dir, checked_branch = await _cleanup_git_directory(repository, target)
-            if manifest is not None:
-                await verify_preserved_worktree(target, manifest)
-            with store.db:
-                if not store.db.in_transaction:
-                    store.db.execute('BEGIN IMMEDIATE')
-                if store.get('closed_copy_delete', False) is not True:
-                    raise ValueError('closed copy deletion is off')
-                reason = _cleanup_task_reason(store, store.task_get(task_id), target, time.time(), immediate=True)
-                if reason:
-                    raise ValueError(reason)
-                current = target.lstat()
-                if (current.st_dev, current.st_ino) != (original.st_dev, original.st_ino):
-                    raise ValueError('task folder changed during cleanup')
-                if checked_dir != git_dir or checked_branch != branch_ref:
-                    raise ValueError('Git registration changed during cleanup')
-                current_git = git_dir.lstat()
-                if (current_git.st_dev, current_git.st_ino) != (info.st_dev, info.st_ino):
-                    raise ValueError('Git data folder changed during cleanup')
-                if ((git_dir / 'locked').exists() or _workspace_operation(git_dir)
-                        or (git_dir / 'HEAD').read_text().strip() != 'ref: ' + branch_ref):
-                    raise ValueError('Git branch, operation, or lock changed during cleanup')
-                if manifest is None and ((target / '.gitmodules').exists() or (git_dir / 'modules').exists()):
-                    raise ValueError('Submodule layout changed during cleanup')
-                if current.st_dev != stage.stat().st_dev or info.st_dev != stage.stat().st_dev:
-                    raise ValueError('Deletion staging folder is on another filesystem')
-                target.rename(stage / 'copy')
-                try:
-                    _detach_staged(stage, record)
-                except BaseException:
-                    if (stage / 'git').exists():
-                        (stage / 'git').rename(git_dir)
-                    (stage / 'copy').rename(target)
-                    raise
-                state = {'state': 'staged', 'reason': '', 'stage': str(stage)}
-                store.put(state_key, state)
-        return state
-    except (OSError, RuntimeError, ValueError, asyncio.TimeoutError) as error:
+        _, updated = await scan_process.run_async(_detach_scan_stage, stage, record)
+        return updated
+    except Exception as error:
+        _cleanup_problem(store, 'closed-copy-recovery-failed', type(error).__name__)
+        raise scan_process.ScanError('worktree registration recovery failed') from error
+
+
+async def async_detach_staged(store, stage, record):
+    return await _async_detach_staged(stage, record, store)
+
+
+async def _async_recover_staged_registrations(state_dir, repository, store=None):
+    stages = await _async_deletion_stages(state_dir, store)
+    recovered = []
+    for stage, record in stages:
+        if record['repository'] != str(repository):
+            continue
+        if record.get('restoring'):
+            _cleanup_problem(store, 'closed-copy-recovery-failed', 'restoration is incomplete')
+            raise scan_process.ScanError('worktree restoration is incomplete')
+        if record['detached']:
+            continue
+        recovered.append((stage, await _async_detach_staged(stage, record, store)))
+    return recovered
+
+
+async def async_recover_staged_registrations(store, repository):
+    return await _async_recover_staged_registrations(store.directory, repository, store)
+
+
+async def _delete_stage(store, stage, record):
+    """Delete one staged copy. A failure keeps its reason on the stage and on the job, then goes to the sweep."""
+    from . import close_saves
+    try:
+        if store.db.execute('SELECT 1 FROM settings WHERE key=?', ('closed_copy_finalized:' + stage.name,)).fetchone():
+            await _finish_stage(store, stage, {}, record)
+            return
+        async with _repository_lock(store.directory, record['repository']):
+            record = await async_detach_staged(store, stage, record)
+        if not record['detached']:
+            await _finish_stage(store, stage, {}, record)
+            return
+        options = {'paced': True} if 'space_k' in record else {}
+        async with _repository_lock(store.directory, record['repository']):
+            if not await close_saves.verify_staged(store, stage, record):
+                return
+        await delete_tree(staged_copy(stage, record), progress=record['removed'], **options)
+        if 'space_k' in record:
+            await delete_tree(stage / 'git', progress=record['removed'], **options)
+        else:
+            await delete_tree(stage / 'git')
+        await _save_deletion_bounded(store, stage, record)
+        if not await _account_completed_stage(store, stage, record):
+            return
+        await _finish_stage(store, stage, options, record)
+    except Exception as error:
         reason = ' '.join(str(error).splitlines()) or type(error).__name__
-        state = {'state': 'kept', 'reason': reason}
+        record['error'] = reason
+        if stage.exists():
+            await _save_deletion_bounded(store, stage, record)
+        if isinstance(error, close_saves.ParkInUse):
+            task = store.task_get(record['task'])
+            if task and task['iteration'] == record['space_k']:
+                close_saves.hold(store, task, error)
+            raise
         with store.db:
-            store.put(state_key, state)
-        logger.info('worktree cleanup kept job=%s folder=%s reason=%s', number, target, reason)
-        return state
+            if not store.db.execute('SELECT 1 FROM settings WHERE key=?',
+                                    ('closed_copy_finalized:' + stage.name,)).fetchone():
+                store.put('closed_copy_state:' + str(record['task']),
+                          {'state': 'staged', 'reason': reason, 'stage': str(stage)})
+        raise
+    logger.info('worktree cleanup deleted job=%s folder=%s bytes=%s files=%s ignored=%s',
+                record['number'], record['target'], record['removed']['bytes'],
+                record['removed']['files'], json.dumps(record['ignored']))
 
 
 async def cleanup_closed_copies(store, *, sweep=False, retry_failed=True):
     """One service consumer drains durable events and crash leftovers without an age limit."""
-    from . import problems, close_saves
-
-    def invalid(stage, error):
-        try:
-            problems.record(store, 'workspaces', 'closed-copy-record-invalid', str(stage) + ': ' + str(error),
-                            every=CLEANUP_INTERVAL)
-        except Exception as failure:
-            logger.error('worktree cleanup invalid record reporting failed type=%s', type(failure).__name__)
+    from . import close_saves, sweeps
 
     async with _repository_lock(store.directory, 'closed-copy-deletion'):
-        more = False
-        if close_saves.enabled(store):
+        if not await _recover_finalization_stages(store):
+            return False
+        try:
+            await async_deletion_stages(store)
+        except scan_process.ScanError:
+            return False
+        if sweep:
+            await close_saves.retry_holds(store)
+        deadline = time.monotonic() + close_saves.DRAIN_SECONDS
+        more = await close_saves.drain(store)
+    while more and time.monotonic() < deadline:
+        await asyncio.sleep(LOCK_TURN)
+        async with _repository_lock(store.directory, 'closed-copy-deletion'):
             more = await close_saves.drain(store)
-        with store.db:
-            if not store.db.in_transaction:
-                store.db.execute('BEGIN IMMEDIATE')
-            pending = store.get('closed_copy_cleanup_pending', {})
-            store.put('closed_copy_cleanup_pending', {})
-        if store.get('closed_copy_delete', False) is True and not close_saves.enabled(store):
-            tasks = ([row['id'] for row in store.db.execute(
-                "SELECT id FROM tasks WHERE status IN ('done','dropped') ORDER BY id")]
-                if sweep else [int(task) for task, check in pending.items() if check])
-            for task_id in tasks:
-                await stage_closed_copy(store, task_id)
-        for stage, record in list(_deletion_stages(store.directory, on_error=invalid)):
-            if 'space_k' in record:
-                if record.get('retry_at', 0) > time.time():
-                    continue
-            elif record.get('error') and (not sweep or not retry_failed):
-                continue
-            try:
-                async with _repository_lock(store.directory, record['repository']):
-                    with store.db:
-                        _detach_staged(stage, record)
-                if not record['detached']:
-                    await delete_tree(stage)
-                    continue
-                options = {'paced': True} if 'space_k' in record else {}
-                async with _repository_lock(store.directory, record['repository']):
-                    if not await close_saves.verify_staged(store, stage, record):
-                        continue
-                await delete_tree(stage / 'copy', progress=record['removed'], **options)
-                if 'space_k' in record:
-                    await delete_tree(stage / 'git', progress=record['removed'], **options)
-                else:
-                    await delete_tree(stage / 'git')
-                await delete_tree(stage, **options)
-            except asyncio.CancelledError:
-                try:
-                    _save_deletion(stage, record)
-                except OSError:
-                    pass
-                raise
-            except Exception as error:
-                reason = ' '.join(str(error).splitlines()) or type(error).__name__
-                record['error'] = reason
-                if 'space_k' in record:
-                    record['attempts'] = record.get('attempts', 0) + 1
-                    record['retry_at'] = time.time() + min(300, 2 ** min(record['attempts'], 9))
-                try:
-                    _save_deletion(stage, record)
-                except Exception as save_error:
-                    reason += '; progress could not be saved: ' + str(save_error)
-                try:
-                    with store.db:
-                        store.put('closed_copy_state:' + str(record['task']),
-                                  {'state': 'staged', 'reason': reason, 'stage': str(stage)})
-                    problems.record(store, 'workspaces', 'closed-copy-delete-failed', reason,
-                                    task=record['task'], every=CLEANUP_INTERVAL)
-                except Exception as failure:
-                    logger.error('worktree cleanup failure reporting failed job=%s type=%s',
-                                 record['number'], type(failure).__name__)
-                continue
-            logger.info('worktree cleanup deleted job=%s folder=%s bytes=%s files=%s ignored=%s',
-                        record['number'], record['target'], record['removed']['bytes'],
-                        record['removed']['files'], json.dumps(record['ignored']))
-            with store.db:
-                if 'space_k' in record:
-                    store.db.execute('UPDATE task_iterations SET bytes_freed=COALESCE(bytes_freed,0)+? WHERE task=? AND k=?',
-                                     (record['removed']['bytes'], record['task'], record['space_k']))
-                    task = {'id': record['task'], 'iteration': record['space_k']}
-                    phase, saved = close_saves.load(store, task)
-                    saved.setdefault('freed', dict.fromkeys(('copy', 'deps', 'extras', 'prune'), 0))
-                    saved['freed']['copy'] += record['removed']['bytes'] - saved['freed']['deps']
-                    close_saves.checkpoint(store, task, phase, saved)
-                else:
-                    store.put('closed_copy_state:' + str(record['task']), {'state': 'gone', 'reason': ''})
-        if close_saves.enabled(store):
-            await close_saves.finish(store)
-            return more and close_saves.pending(store)
-    return False
+    if more:
+        logger.info('close save drain paused at its %s s budget; the rest waits for the next pass',
+                    close_saves.DRAIN_SECONDS)
+    async with _repository_lock(store.directory, 'closed-copy-deletion'):
+        store.db.commit()
+        try:
+            stages = await async_deletion_stages(store)
+        except scan_process.ScanError:
+            return False
+        await sweeps.arun(store, 'closed-copy-delete', [
+            (stage, record) for stage, record in stages
+            if 'space_k' in record or not record.get('error') or sweep and retry_failed],
+            lambda item: _delete_stage(store, *item), area='workspaces', key=lambda item: item[0].name,
+            refs=lambda item: {'task': item[1]['task']})
+        await close_saves.finish(store)
+        return more and close_saves.pending(store)

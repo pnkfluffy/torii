@@ -14,6 +14,26 @@ from coordinator.host import HostClient, _launchers
 from tests.support import _group_alive, read_jsonl, stop_test_hosts
 
 
+class SecurityGuardTests(unittest.IsolatedAsyncioTestCase):
+    async def test_unmocked_security_launches_are_blocked(self):
+        with tempfile.TemporaryDirectory() as directory:
+            binary = Path(directory) / 'security'
+            marker = Path(directory) / 'called'
+            binary.write_text('#!/bin/sh\ntouch ' + str(marker) + '\n')
+            binary.chmod(0o700)
+            with self.assertRaisesRegex(AssertionError, 'security'):
+                subprocess.run([str(binary)], check=True)
+            with self.assertRaisesRegex(AssertionError, 'security'):
+                await asyncio.create_subprocess_exec(str(binary))
+            with self.assertRaisesRegex(AssertionError, 'security'):
+                subprocess.run([str(binary)], check=True, executable=str(binary))
+            with self.assertRaisesRegex(AssertionError, 'security'):
+                os.system(str(binary))
+            with self.assertRaisesRegex(AssertionError, 'security'):
+                sys.audit('os.exec', str(binary), [str(binary)], {})
+            self.assertFalse(marker.exists())
+
+
 class ReadJsonlTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()

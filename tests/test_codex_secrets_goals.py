@@ -178,6 +178,8 @@ class CodexSecretsGoalsTests(unittest.IsolatedAsyncioTestCase):
         self.root = Path(self.temporary.name).resolve()
         self.addCleanup(self.temporary.cleanup)
         isolate_shared_mcp_home(self, self.root)
+        from tests.support import fake_codex_hook_trust
+        fake_codex_hook_trust(self)
         self.addCleanup(stop_test_hosts, self.root)
         self.sid = str(uuid.uuid4())
         self.binary = self.root / 'fake-codex'
@@ -653,7 +655,7 @@ class CodexSecretsGoalsTests(unittest.IsolatedAsyncioTestCase):
                 gate.set()
                 await asyncio.wait_for(queue, 5)
                 done = await settle(run)
-                self.assertEqual(self.request_state(stop), 'done')
+                await until(lambda: self.request_state(stop) == 'done', 'the stop request to settle')
                 self.assertEqual(json.loads(done['result'])['failure_code'], 'owner_stopped')
                 self.assertFalse((self.root / 'continued').exists())
                 directory = self.root / 'state/hosts' / done['host']

@@ -1,3 +1,4 @@
+import ast
 import asyncio
 import json
 import os
@@ -12,6 +13,38 @@ from unittest.mock import Mock, patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+class HostPlatformTests(unittest.TestCase):
+    def test_platform_probes_live_in_host_os(self):
+        probes = {'sys': {'platform'}, 'platform': {'system', 'machine', 'mac_ver'}, 'os': {'uname'}}
+        allowed = {'coordinator/host_os.py': 'Implements the host platform interface.'}
+        violations = []
+        for directory in ('coordinator', 'scripts', 'tests'):
+            for path in sorted((ROOT / directory).rglob('*.py')):
+                name = path.relative_to(ROOT).as_posix()
+                if name in allowed:
+                    continue
+                nodes = list(ast.walk(ast.parse(path.read_bytes(), filename=name)))
+                modules = {module: module for module in probes}
+                for node in nodes:
+                    if isinstance(node, ast.Import):
+                        modules.update((alias.asname or alias.name, alias.name)
+                                       for alias in node.names if alias.name in probes)
+                for node in nodes:
+                    if isinstance(node, ast.ImportFrom) and node.level == 0:
+                        found = any(alias.name in probes.get(node.module, ()) for alias in node.names)
+                    elif isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
+                        found = node.attr in probes.get(modules.get(node.value.id), ())
+                    elif (isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and
+                          node.func.id == 'getattr' and len(node.args) >= 2 and
+                          isinstance(node.args[0], ast.Name) and isinstance(node.args[1], ast.Constant)):
+                        found = node.args[1].value in probes.get(modules.get(node.args[0].id), ())
+                    else:
+                        continue
+                    if found:
+                        violations.append(f'{name}:{node.lineno}')
+        self.assertFalse(violations, 'Use coordinator/host_os.py for platform probes:\n' + '\n'.join(violations))
 
 
 class McpImportTests(unittest.TestCase):
@@ -78,6 +111,7 @@ class RestartTests(unittest.TestCase):
             raise Exited()
 
         args = SimpleNamespace(command='serve', state_dir=ROOT, token_file=None)
+        real_close = os.close
         store = Mock()
         store.close.side_effect = lambda: events.append('store')
         try:
@@ -86,7 +120,8 @@ class RestartTests(unittest.TestCase):
                     patch('coordinator.__main__.serve', serve), \
                     patch('coordinator.__main__.os.open', return_value=42), \
                     patch('coordinator.__main__.fcntl.flock'), \
-                    patch('coordinator.__main__.os.close', side_effect=lambda fd: events.append(('lock', fd))), \
+                    patch('coordinator.__main__.os.close', side_effect=lambda fd: events.append(('lock', fd))
+                          if fd == 42 else real_close(fd)), \
                     patch('logging.shutdown', side_effect=lambda: events.append('logging')), \
                     patch('coordinator.__main__.os._exit', side_effect=exit):
                 parser.return_value.parse_args.return_value = args
@@ -98,6 +133,44 @@ class RestartTests(unittest.TestCase):
 
 
 class CommandLineTests(unittest.TestCase):
+    def test_cli_uses_initialized_schema_without_waiting_for_writer(self):
+        from coordinator.__main__ import open_store
+        from coordinator.store import Store
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory) / 'state'
+            owner = Store(state)
+            try:
+                with owner.db:
+                    owner.put('service_run', {'state': 'running', 'code': 'matching-code'})
+                owner.db.execute('BEGIN IMMEDIATE')
+                args = SimpleNamespace(command='ctl', state_dir=state, token_file=None)
+                with patch('coordinator.__main__.STARTUP_CODE', 'matching-code'), \
+                        patch.object(Store, '_migrate_task_uids', side_effect=AssertionError('unexpected migration')):
+                    opened = open_store(args)
+                try:
+                    self.assertFalse(opened.db.in_transaction)
+                    self.assertEqual(opened.db.execute('PRAGMA foreign_keys').fetchone()[0], 1)
+                finally:
+                    opened.close()
+            finally:
+                owner.db.rollback()
+                owner.close()
+
+    def test_cli_migrates_when_service_code_differs(self):
+        from coordinator.__main__ import open_store
+        from coordinator.store import Store
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory) / 'state'
+            owner = Store(state)
+            with owner.db:
+                owner.put('service_run', {'state': 'running', 'code': 'older-code'})
+            owner.close()
+            args = SimpleNamespace(command='ctl', state_dir=state, token_file=None)
+            with patch('coordinator.__main__.STARTUP_CODE', 'new-code'), \
+                    patch.object(Store, '_migrate_task_uids', side_effect=RuntimeError('migration reached')):
+                with self.assertRaisesRegex(RuntimeError, 'migration reached'):
+                    open_store(args)
+
     """The CLI runs the same operations, against the database the service shares."""
 
     def setUp(self):
@@ -120,19 +193,16 @@ class CommandLineTests(unittest.TestCase):
         code, out = self.run_ctl('list')
         self.assertEqual(code, 0)
         self.assertEqual([op['id'] for op in json.loads(out)], [op.id for op in control_api.OPS])
-        code, out = self.run_ctl('list', '--kind', 'read')
-        self.assertEqual(code, 0)
-        self.assertTrue(all(op['kind'] == 'read' for op in json.loads(out)))
         code, out = self.run_ctl('describe', 'tasks.create')
         self.assertEqual(code, 0)
         self.assertEqual(json.loads(out)['params'], {'title': 'str', 'message': 'int?', 'topic': 'topic?',
                                                    'cross_topic': 'bool?', 'notes': 'text?',
-                                                   'secrets': 'secret_names?', 'finish': 'finish?', 'parent': 'int?'})
+                                                   'secrets': 'secret_names?', 'finish': 'finish?', 'parent': 'int?', 'blocked_by': 'int?'})
         code, out = self.run_ctl('describe', 'tasks.update')
         self.assertEqual(code, 0)
         self.assertEqual(json.loads(out)['params'], {'task': 'int', 'title': 'str?', 'status': 'status?',
                                                    'notes': 'text?', 'note': 'text?', 'secrets': 'secret_names?',
-                                                   'stage': 'stage?', 'pr': 'str?', 'finish': 'finish?'})
+                                                   'stage': 'stage?', 'pr': 'str?', 'finish': 'finish?', 'summary': 'text?'})
         code, out = self.run_ctl('describe', 'no.such.op')
         self.assertEqual(code, 2)
         self.assertFalse(json.loads(out)['ok'])

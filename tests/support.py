@@ -11,19 +11,34 @@ import asyncio
 from contextvars import ContextVar
 import fcntl
 from functools import wraps
+import importlib
 import json
 import os
 from pathlib import Path
+import pickle
+import re
 import signal
 import subprocess
 import sys
+import threading
 import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 from xml.etree import ElementTree
 
 from coordinator.formatting import markdown_to_html
 from coordinator.vault import VaultError, fingerprint
+
+
+INTAKE_IDENTITY = re.compile(r'\[sender="(?:[^"\\]|\\.)*" job=(?:null|\d+) created=\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ\] ')
+
+
+def plain(text):
+    return INTAKE_IDENTITY.sub('', text)
+
+
+def sent_parts(session):
+    return [part for _, text in session.sent for part in re.split(r'\n\n(?=\[topic=)', plain(text))]
 
 
 class FakeVault:
@@ -87,10 +102,27 @@ def read_jsonl(path):
     return [json.loads(line) for line in lines if line.endswith('\n') and line.strip()]
 
 
+def fake_codex_hook_trust(test):
+    trust = patch('coordinator.worker_hooks.codex_trust_override', new_callable=AsyncMock,
+                  return_value='hooks.state."fixture".trusted_hash="sha256:fixture"')
+    trust.start()
+    test.addCleanup(trust.stop)
+    inherited = patch('coordinator.shared_mcp.codex_inherited', new_callable=AsyncMock, return_value={})
+    inherited.start()
+    test.addCleanup(inherited.stop)
+    for name in ('coordinator.providers.codex_inherited', 'coordinator.codex_session.codex_inherited'):
+        item = patch(name, new_callable=AsyncMock, return_value={})
+        item.start()
+        test.addCleanup(item.stop)
+
+
 def isolate_shared_mcp_home(test, root):
     home = Path(root) / 'shared_mcp-home'
     home.mkdir()
-    environment = patch.dict(os.environ, {'HOME': str(home)})
+    values = {'HOME': str(home)}
+    if 'CODEX_HOME' in os.environ:
+        values['CODEX_HOME'] = str(home / '.codex')
+    environment = patch.dict(os.environ, values)
     environment.start()
     test.addCleanup(environment.stop)
 
@@ -202,6 +234,57 @@ def _register_test_host(directory):
     return hosts[directory]
 
 
+def _stop_test_scan(process):
+    if process.poll() is None:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        process.wait(timeout=SETTLE)
+
+
+def install_inprocess_scans():
+    """Run cleanup scans on a thread of the test process; tests that need the real child call real_scans."""
+    from coordinator import scan_process
+
+    def run(function, *args, timeout=scan_process.TIMEOUT):
+        delay = scan_process.backoff_delay()
+        if delay:
+            time.sleep(delay)
+        started = time.monotonic()
+        module, name, args = pickle.loads(pickle.dumps((function.__module__, function.__name__, args)))
+        outcome = []
+
+        def scan():
+            try:
+                outcome.append((True, getattr(importlib.import_module(module), name)(*args)))
+            except Exception as error:
+                outcome.append((False, error))
+        thread = threading.Thread(target=scan, daemon=True)
+        thread.start()
+        thread.join(timeout)
+        if thread.is_alive():
+            scan_process._scan_failed(function, time.monotonic() - started, 'timed out')
+            raise scan_process.ScanError('scan timed out')
+        scan_process._scan_succeeded()
+        succeeded, result = pickle.loads(pickle.dumps(outcome[0], protocol=pickle.HIGHEST_PROTOCOL))
+        if not succeeded:
+            raise result
+        return result
+
+    global _real_scan_run
+    _real_scan_run = scan_process.run
+    patch.object(scan_process, 'run', run).start()
+
+
+def real_scans():
+    """Restore the child-process scans for the calling test module; call it from setUpModule."""
+    from coordinator import scan_process
+    patcher = patch.object(scan_process, 'run', _real_scan_run)
+    patcher.start()
+    unittest.addModuleCleanup(patcher.stop)
+
+
 def install_test_host_cleanup():
     from coordinator.host import HostClient
 
@@ -259,8 +342,13 @@ def install_test_host_cleanup():
     def initialize_process(process, args, *fields, **options):
         initialize(process, args, *fields, **options)
         tracked = _launching_test_host.get() if options.get('start_new_session') else None
-        if isinstance(args, (list, tuple)) and len(args) == 5 and list(args[1:4]) == ['-m', 'coordinator', 'host']:
-            tracked = tracked or _register_test_host(args[-1])
+        if isinstance(args, (list, tuple)):
+            if len(args) == 5 and list(args[1:4]) == ['-m', 'coordinator', 'host']:
+                tracked = tracked or _register_test_host(args[-1])
+            if (_running_host_tests and options.get('start_new_session')
+                    and list(args[1:3]) == ['-m', 'coordinator.scan_process']):
+                test, _ = _running_host_tests[-1]
+                test.addCleanup(_stop_test_scan, process)
         if tracked is not None:
             tracked.launchers.append(process)
 
@@ -268,6 +356,19 @@ def install_test_host_cleanup():
     unittest.IsolatedAsyncioTestCase.run = guard_run(unittest.IsolatedAsyncioTestCase.run)
     HostClient.launch = classmethod(launch_host)
     subprocess.Popen.__init__ = initialize_process
+
+
+async def finish_background_tasks():
+    """Cancel and await the service tasks and executor threads a test left running, so no scan writes after its folder is removed."""
+    for _ in range(20):
+        pending = [task for task in asyncio.all_tasks() if task is not asyncio.current_task()]
+        if not pending:
+            break
+        for task in pending:
+            task.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
+        await asyncio.sleep(0)
+    await asyncio.get_running_loop().shutdown_default_executor()
 
 
 def stop_test_hosts(root):

@@ -14,6 +14,7 @@ import uuid
 from unittest.mock import patch
 
 from coordinator import control_api, mcp, opencode_accounts, signin
+from coordinator.extension import available
 from coordinator.accounts import AccountBroker
 from coordinator.opencode_accounts import PINNED_VERSION
 from coordinator.providers import ProviderRunner
@@ -27,7 +28,7 @@ class OpenCodeAccountsTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix='opencode-accounts-')
         self.addCleanup(self.temp.cleanup)
-        self.root = Path(self.temp.name)
+        self.root = Path(self.temp.name).resolve()
         self.home = self.root / 'home'
         self.home.mkdir()
         self.environment = patch.dict(os.environ, {'HOME': str(self.home)})
@@ -456,7 +457,8 @@ class OpenCodeAccountsTests(unittest.TestCase):
     def test_piece_a_control_manifest_keeps_opencode_out_of_worker_dispatch(self):
         for name in ('opencode.binary', 'opencode.account', 'opencode.use', 'delegation.opencode'):
             self.assertEqual(control_api.find(name).kind, control_api.WRITE)
-        self.assertEqual(control_api.find('workers.spawn').params['provider'], 'worker_provider')
+        self.assertEqual(control_api.find('workers.spawn').params['provider'],
+                         'worker_provider?' if available('routing') else 'worker_provider')
         for name, kind in (('topic.bind', 'provider'), ('model.parent', 'parent_provider')):
             self.assertEqual(control_api.find(name).params['provider'].rstrip('?'), kind)
         for enabled in (False, True):
@@ -474,7 +476,7 @@ class OpenCodeBrokenPathStartupTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         temporary = tempfile.TemporaryDirectory(prefix='opencode-startup-')
         self.addCleanup(temporary.cleanup)
-        self.root = Path(temporary.name)
+        self.root = Path(temporary.name).resolve()
         home = self.root / 'home'
         home.mkdir()
         environment = patch.dict(os.environ, {'HOME': str(home)})

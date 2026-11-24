@@ -11,12 +11,13 @@ import time
 import unittest
 from unittest.mock import AsyncMock, patch
 
-from coordinator import control_api, worker_storage
+from coordinator import control_api, sweeps, worker_storage
 from coordinator.providers import ProviderRunner, RunResult
 from coordinator.native_protocol import RunControl
 from coordinator.service import Service
 from tests.test_worker_storage import SID, TOPIC, StorageSupport
 from tests.test_codex_secrets_goals import SERVER
+from tests.support import settle
 
 
 GO_MODULE_CACHE = '''
@@ -52,6 +53,8 @@ class ReviewSupport(StorageSupport):
     def setUp(self):
         super().setUp()
         self.addCleanup(writable_tree, str(self.base))
+        from tests.support import fake_codex_hook_trust
+        fake_codex_hook_trust(self)
 
     def fake_claude(self, pre):
         binary = self.root / 'fake-review-claude'
@@ -106,7 +109,7 @@ class CleanupLimitsTests(ReviewSupport, unittest.IsolatedAsyncioTestCase):
                                          min(300, 2 ** (attempt + 1)))
                         clock.return_value += 3600
                     state = storage.state(worker['id'])
-                    self.assertEqual((state['pending'], state['attempts']), (1, 0))
+                    self.assertEqual((state['pending'], state['attempts']), (1, 25))
                     self.assertEqual(self.failures(), 0)
                     self.assertTrue(self.scratch(worker).is_dir())
                     proofs.return_value = gone.return_value = True
@@ -115,7 +118,7 @@ class CleanupLimitsTests(ReviewSupport, unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(storage.state(worker['id'])['pending'], 0)
                 self.assertFalse(self.scratch(worker).exists())
 
-    async def test_transient_cleanup_errors_are_recorded_hourly_per_worker(self):
+    async def test_each_cleanup_error_is_one_row_per_worker_with_backoff(self):
         workers = []
         storage = worker_storage.WorkerStorage(self.store)
         for _ in range(2):
@@ -123,30 +126,31 @@ class CleanupLimitsTests(ReviewSupport, unittest.IsolatedAsyncioTestCase):
             self.store.worker_complete(worker['id'], {'success': True}, 'done')
             workers.append(worker)
         with patch('time.time', return_value=1800000000.0) as clock:
-            for _ in range(2):
+            for count in (1, 2):
                 for worker in workers:
-                    storage.retry(worker['id'], OSError('temporary refusal'))
-            self.assertEqual(self.failures(), 2)
-            clock.return_value += 3600
-            for worker in workers:
-                storage.retry(worker['id'], OSError('temporary refusal'))
+                    storage.failed(worker['id'], OSError('temporary refusal'))
+                    state = storage.state(worker['id'])
+                    self.assertEqual(state['pending'], 1)
+                    self.assertEqual(state['retry_at'] - clock.return_value, min(2 ** count, sweeps.delay(count)))
         rows = self.store.db.execute(
-            "SELECT worker,COUNT(*) FROM problems WHERE code='temp-cleanup-failed' GROUP BY worker ORDER BY worker").fetchall()
-        self.assertEqual([tuple(row) for row in rows], [(worker['id'], 2) for worker in workers])
+            "SELECT worker,task,detail FROM problems WHERE code='temp-cleanup-failed' ORDER BY id").fetchall()
+        self.assertEqual([row['worker'] for row in rows], [worker['id'] for worker in workers] * 2)
+        self.assertEqual(rows[0]['task'], workers[0]['task'])
+        self.assertEqual(rows[-1]['detail'], 'item=%d failures=2 OSError: temporary refusal' % workers[1]['id'])
 
-    async def test_cleanup_error_at_cap_handles_a_missing_worker_row(self):
+    async def test_cleanup_error_handles_a_missing_worker_row(self):
         self.store.db.commit()
         self.store.db.execute('PRAGMA foreign_keys=OFF')
         with self.store.db:
-            self.store.db.execute('INSERT INTO worker_temp_state(worker,pending,attempts) VALUES (9999,2,19)')
+            self.store.db.execute('INSERT INTO worker_temp_state(worker,pending,attempts) VALUES (9999,2,3)')
         self.store.db.execute('PRAGMA foreign_keys=ON')
         storage = worker_storage.WorkerStorage(self.store)
-        storage.retry(9999, OSError('missing worker'))
+        storage.failed(9999, OSError('missing worker'))
         state = storage.state(9999)
-        self.assertEqual((state['pending'], state['attempts']), (0, 20))
+        self.assertEqual((state['pending'], state['attempts']), (1, 3))
         row = self.store.db.execute(
             "SELECT worker,topic,task,detail FROM problems WHERE code='temp-cleanup-failed'").fetchone()
-        self.assertEqual(tuple(row), (9999, None, None, 'missing worker'))
+        self.assertEqual(tuple(row), (9999, None, None, 'item=9999 failures=1 OSError: missing worker'))
 
     async def test_relaunch_uses_next_host_version_and_preserves_native_session(self):
         for suffix in ('', '-resume-17'):
@@ -162,36 +166,44 @@ class CleanupLimitsTests(ReviewSupport, unittest.IsolatedAsyncioTestCase):
                         if hosts:
                             self.store.db.execute("UPDATE workers SET status='queued',fresh=0 WHERE id=?", (worker['id'],))
                             worker = service.workers.get(worker['id'])
-                        done = await service.workers.run(worker, self.store.topic(TOPIC))
+                        done = await settle(service.workers.run(worker, self.store.topic(TOPIC)))
                         self.assertTrue(json.loads(done['result'])['success'], done)
-                        await self.drain(service)
+                        await settle(self.drain(service))
                         hosts.append(done['host'])
                         sessions.append(done['session'])
                 self.assertEqual(hosts, [base, base + '.2', base + '.3'])
                 self.assertTrue(sessions[0])
                 self.assertEqual(sessions, [sessions[0]] * 3)
 
-    async def test_temp_cleanup_stops_after_twenty_failures_and_reconciliation_keeps_it_stopped(self):
+    async def test_failing_temp_cleanup_backs_off_stays_pending_and_a_success_clears_it(self):
         worker, _ = self.spawn()
         self.scratch(worker).mkdir()
         self.saved_host(worker)
         self.store.worker_complete(worker['id'], {'success': True}, 'done')
         service = Service(self.store, None, self.fake_claude(SMALL), self.root)
         storage = service.workers.storage
-        with self.temp_scope(), self.assertLogs('coordinator.problems', level='ERROR') as terminal, \
-                patch('time.time', return_value=1800000000.0) as clock, \
+        with self.temp_scope(), patch('time.time', return_value=1800000000.0) as clock, \
                 patch('coordinator.worker_storage._scratch_paths', side_effect=OSError('permanent refusal')) as failed:
-            for _ in range(25):
+            for _ in range(8):
                 storage.schedule()
                 await self.drain(service)
                 await storage.reconcile()
-                clock.return_value += 301
-            self.assertEqual(failed.call_count, 20)
-        state = storage.state(worker['id'])
-        self.assertEqual((state['pending'], state['attempts']), (0, 20))
-        self.assertEqual(self.failures(), 3)
-        self.assertEqual(len(terminal.output), 1)
-        self.assertTrue(self.scratch(worker).is_dir())
+                clock.return_value += 3600
+            self.assertEqual(failed.call_count, 8)
+            state = storage.state(worker['id'])
+            self.assertEqual(state['pending'], 1)
+            self.assertEqual(self.failures(), 8)
+            detail = self.store.db.execute("SELECT detail FROM problems WHERE code='temp-cleanup-failed' "
+                                           "ORDER BY id DESC LIMIT 1").fetchone()[0]
+            self.assertRegex(detail, r'^item=%d failures=8 OSError: permanent refusal at ' % worker['id'])
+            self.assertTrue(self.scratch(worker).is_dir())
+            clock.return_value = state['retry_at']
+        with self.temp_scope(), patch('time.time', return_value=clock.return_value):
+            storage.schedule()
+            await self.drain(service)
+        self.assertEqual(storage.state(worker['id'])['pending'], 0)
+        self.assertFalse(self.scratch(worker).exists())
+        self.assertIsNone(self.store.db.execute('SELECT 1 FROM sweep_failures').fetchone())
 
     async def test_null_spec_environment_requeues_cleanup_without_restart(self):
         worker, _ = self.spawn()
@@ -206,7 +218,7 @@ class CleanupLimitsTests(ReviewSupport, unittest.IsolatedAsyncioTestCase):
             await asyncio.gather(*list(storage.tasks.values()), return_exceptions=True)
             await asyncio.sleep(0)
             state = storage.state(worker['id'])
-            self.assertEqual((state['pending'], state['attempts']), (1, 1))
+            self.assertEqual((state['pending'], state['attempts']), (1, 0))
             (host / 'spec.json').write_text(json.dumps({'worker_temp': True, 'env': {'TMPDIR': str(self.scratch(worker))}}))
             with patch('time.time', return_value=state['retry_at']):
                 storage.schedule()
@@ -235,7 +247,7 @@ class StorageTransactionTests(StorageSupport, unittest.IsolatedAsyncioTestCase):
                 detached = self.base / ('detached-' + str(worker_id))
                 arguments, expected = {
                     'remember': ((worker_id, [detached]), {'pending': 1, 'staged': json.dumps([str(detached)])}),
-                    'retry': ((worker_id,), {'pending': 1, 'attempts': 0}),
+                    'retry': ((worker_id,), {'pending': 1, 'attempts': 1}),
                     'reconcile': ((), {'pending': 1}),
                     'prepare': ((worker_id,), {'finished': 0, 'epoch': before['epoch'] + 1}),
                     'cleanup': ((worker_id,), {'pending': 0, 'staged': '[]'}),
@@ -316,8 +328,10 @@ class SteerDuringDeleteRepro(ReviewSupport, unittest.IsolatedAsyncioTestCase):
                 release.wait(30)
             return actual(path, *args, **kwargs)
 
-        slow.avoids_symlink_attacks = actual.avoids_symlink_attacks
-        with self.temp_scope(), patch('shutil.rmtree', slow):
+        async def delete(path, **options):
+            await worker_storage._background(slow, path)
+
+        with self.temp_scope(), patch('coordinator.workspaces.delete_tree', new=delete):
             try:
                 await service.workers_once()
                 self.assertTrue(await asyncio.wait_for(asyncio.to_thread(entered.wait, 30), 35))
@@ -411,9 +425,11 @@ readonly.chmod(0o555)
                     raise PermissionError('fixture read-only volume')
             return actual(path, *args, **kwargs)
 
-        failing.avoids_symlink_attacks = actual.avoids_symlink_attacks
+        async def delete(path, **options):
+            await worker_storage._background(failing, path)
+
         now = time.time()
-        with self.temp_scope(), patch('shutil.rmtree', failing), patch('time.time', return_value=now):
+        with self.temp_scope(), patch('coordinator.workspaces.delete_tree', new=delete), patch('time.time', return_value=now):
             await service.workers.run(worker, self.store.topic(TOPIC))
             await self.drain(service)
             for _ in range(5):
@@ -421,11 +437,15 @@ readonly.chmod(0o555)
                 await self.drain(service)
             self.assertEqual(len(attempts), 1)
             self.assertEqual(self.failures(), 1)
+            with patch('time.time', return_value=now + 1):
+                await service.workers_once()
+                await self.drain(service)
+            self.assertEqual(len(attempts), 1)
             with patch('time.time', return_value=now + 3):
                 await service.workers_once()
                 await self.drain(service)
             self.assertEqual(len(attempts), 2)
-            self.assertEqual(self.failures(), 1)
+            self.assertEqual(self.failures(), 2)
             with patch('time.time', return_value=now + 8):
                 await service.workers_once()
                 await self.drain(service)
@@ -449,7 +469,7 @@ readonly.chmod(0o555)
             with patch('time.time', return_value=now + 3):
                 await service.workers_once()
                 await self.drain(service)
-            self.assertEqual(self.failures(), 1)
+            self.assertEqual(self.failures(), 2)
             (host / 'spec.json').write_text(json.dumps({'worker_temp': True, 'env': {'TMPDIR': str(self.scratch(worker))}}))
             with patch('time.time', return_value=now + 8):
                 await service.workers_once()
@@ -503,8 +523,11 @@ readonly.chmod(0o555)
                 release.wait(30)
             return actual(path, *args, **kwargs)
 
-        slow.avoids_symlink_attacks = actual.avoids_symlink_attacks
-        with self.temp_scope(), patch('shutil.rmtree', slow), patch.object(service.extension, 'start', AsyncMock()), \
+        async def delete(path, **options):
+            await worker_storage._background(slow, path)
+
+        with self.temp_scope(), patch('coordinator.workspaces.delete_tree', new=delete), \
+                patch.object(service.extension, 'start', AsyncMock()), \
                 patch('coordinator.reactions.check_administrators', AsyncMock()), \
                 patch.object(service, 'announce_start', AsyncMock()), patch.object(service, 'supervised', return_value=[]):
             startup = asyncio.create_task(service.run())
@@ -524,6 +547,7 @@ readonly.chmod(0o555)
 
 
 class CleanupCostTests(ReviewSupport, unittest.IsolatedAsyncioTestCase):
+    @patch('coordinator.close_saves.preserve_worker_proofs', new=AsyncMock(return_value=True))
     async def test_startup_and_later_passes_read_bounded_rows_with_5000_final_workers(self):
         now = time.time()
         with self.store.db:
@@ -621,7 +645,7 @@ with Path(SEEN).open('a') as log:
                 result.success = False
                 result.quota_limited = True
                 result.managed = False
-                result.rate_limit_info = {'status': 'rejected', 'rateLimitType': 'five_hour',
+                result.rate_limit_info = {'status': 'rejected', 'rateLimitType': 'seven_day',
                                           'resetsAt': time.time() + 3600}
             return result
 
@@ -687,7 +711,7 @@ with Path(SEEN).open('a') as log:
 
 
 class OpenCodeInstructionTests(ReviewSupport, unittest.IsolatedAsyncioTestCase):
-    async def test_opencode_omits_results_that_external_directory_permission_denies(self):
+    async def test_opencode_receives_handoff_path_with_external_directory_denied(self):
         from tests.fake_opencode import install_fake_opencode
         from tests.test_opencode_runtime import ACCOUNT
         binary = install_fake_opencode(self.root / 'opencode-fake')
@@ -701,7 +725,7 @@ class OpenCodeInstructionTests(ReviewSupport, unittest.IsolatedAsyncioTestCase):
         self.store.put('opencode_binary', str(binary))
         for enabled in (False, True):
             with self.subTest(worker_temp=enabled), self.temp_scope(), \
-                    patch('coordinator.providers.platform', 'linux'), \
+                    patch('coordinator.host_os.uses_worker_coalitions', new=lambda: False), \
                     patch('coordinator.opencode_accounts.account_home', return_value=key_home), \
                     patch('coordinator.opencode_runtime.managed_preference_paths', return_value=()):
                 self.store.put('worker_temp', enabled)
@@ -712,10 +736,32 @@ class OpenCodeInstructionTests(ReviewSupport, unittest.IsolatedAsyncioTestCase):
                 from coordinator.workers import host_directory
                 spec = json.loads((host_directory(self.store.directory, done) / 'spec.json').read_text())
                 payload = spec['initial_payload']
-                self.assertNotIn(str(self.expected_results), payload)
+                self.assertIn(str(self.expected_results / 'HANDOFF.md'), payload)
+                self.assertIn('Use bash to update HANDOFF.md', payload)
                 self.assertNotIn('results folder', payload)
                 config = json.loads((Path(spec['env']['XDG_CONFIG_HOME']) / 'opencode/opencode.json').read_text())
                 self.assertEqual(config['permission']['external_directory'], 'deny')
                 self.assertEqual(spawned.data['results'], str(self.expected_results))
                 self.assertEqual(self.expected_results.stat().st_mode & 0o777, 0o700)
                 await self.drain(service)
+
+
+class SharedDeletionLockTests(StorageSupport, unittest.IsolatedAsyncioTestCase):
+    async def test_staged_temp_removal_does_not_wait_for_closed_copy_deletion(self):
+        from coordinator import workspaces
+        worker, _ = self.spawn()
+        self.store.worker_complete(worker['id'], {'success': True})
+        detached = self.base / ('.deleting-' + str(worker['id']))
+        (detached / 'tree').mkdir(parents=True)
+        (detached / 'tree' / 'build.log').write_text('scratch')
+        with self.store.transaction():
+            self.store.db.execute('INSERT OR IGNORE INTO worker_temp_state(worker) VALUES (?)', (worker['id'],))
+            self.store.db.execute('UPDATE worker_temp_state SET finished=0,pending=1,staged=? WHERE worker=?',
+                                  (json.dumps([str(detached)]), worker['id']))
+        storage = worker_storage.WorkerStorage(self.store)
+        self.addCleanup(storage.close)
+        with self.temp_scope():
+            async with workspaces._repository_lock(self.store.directory, 'closed-copy-deletion'):
+                await asyncio.wait_for(storage.cleanup(worker['id']), 10)
+        self.assertFalse(detached.exists())
+        self.assertEqual((storage.state(worker['id'])['staged'], storage.state(worker['id'])['pending']), ('[]', 0))

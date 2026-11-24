@@ -259,7 +259,7 @@ class OpenCodeManagedPreferencePathsTests(unittest.TestCase):
         user = pwd.getpwuid(os.geteuid()).pw_name or 'user'
         expected = (Path('/Library/Managed Preferences') / user / 'ai.opencode.managed.plist',
                     Path('/Library/Managed Preferences/ai.opencode.managed.plist'))
-        with patch('coordinator.opencode_runtime.sys.platform', 'darwin'):
+        with patch('coordinator.host_os.SYSTEM', 'darwin'):
             self.assertEqual(opencode_runtime.managed_preference_paths(), expected)
 
 

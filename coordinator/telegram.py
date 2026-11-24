@@ -16,12 +16,16 @@ import urllib.parse
 import urllib.request
 import uuid
 
+from . import extension
 from .formatting import html_link_entities, html_to_text, markdown_to_html
 
 logger = logging.getLogger(__name__)
 
 MAX_PHOTO_BYTES = 10 * 1024 * 1024
 MAX_DOCUMENT_BYTES = 50 * 1024 * 1024
+MAX_DOWNLOAD_BYTES = 20 * 1024 * 1024
+CLOUD_API = 'https://api.telegram.org'
+MIB = 1024 * 1024
 PHOTO_SUFFIXES = {'.jpg', '.jpeg', '.png', '.webp'}
 LONG_POLL_SECONDS = 20
 REQUEST_SECONDS = 40
@@ -82,11 +86,41 @@ class TelegramHTTPSHandler(urllib.request.HTTPSHandler):
 opener = urllib.request.build_opener(TelegramHTTPSHandler())
 
 
+def local_server(store):
+    """The add-on's own Telegram server, or None for the cloud API."""
+    return extension.active().telegram_server(store) if store is not None else None
+
+
+def local_api(store):
+    server = local_server(store)
+    return server.base(store) if server else None
+
+
+def document_limit(store):
+    server = local_server(store)
+    return server.LOCAL_BYTES if server else MAX_DOCUMENT_BYTES
+
+
+def download_limit(store):
+    server = local_server(store)
+    return server.LOCAL_BYTES if server else MAX_DOWNLOAD_BYTES
+
+
+def follow_server(store):
+    """Each Telegram server numbers updates on its own, so a saved offset is dropped when the server changes."""
+    server = local_api(store) or CLOUD_API
+    if (store.get('offset_server') or CLOUD_API) != server:
+        with store.db:
+            store.put('offset', 0)
+            store.put('offset_server', server)
+        logger.info('telegram server changed; update offset reset local=%s', server != CLOUD_API)
+
+
 def photo_path(path, size):
     return path.suffix.lower() in PHOTO_SUFFIXES and size <= MAX_PHOTO_BYTES
 
 
-def multipart_body(parameters, path, method, protected=None):
+def multipart_body(parameters, path, method, protected=None, document_bytes=MAX_DOCUMENT_BYTES):
     boundary = 'torii-' + uuid.uuid4().hex
     chunks = []
     for name, value in parameters.items():
@@ -94,10 +128,10 @@ def multipart_body(parameters, path, method, protected=None):
         chunks.extend((('--' + boundary + '\r\n').encode(),
                        ('Content-Disposition: form-data; name="' + name + '"\r\n\r\n').encode(),
                        encoded.encode(), b'\r\n'))
-    field = 'photo' if method == 'sendPhoto' else 'document'
+    field = {'sendPhoto': 'photo', 'sendVideo': 'video', 'sendAnimation': 'animation'}.get(method, 'document')
     filename = urllib.parse.quote(path.name, safe='')
     mime = mimetypes.guess_type(path.name)[0] or 'application/octet-stream'
-    limit = MAX_PHOTO_BYTES if method == 'sendPhoto' else MAX_DOCUMENT_BYTES
+    limit = MAX_PHOTO_BYTES if method == 'sendPhoto' else document_bytes
     descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
     with os.fdopen(descriptor, 'rb') as source:
         metadata = os.fstat(source.fileno())
@@ -142,8 +176,16 @@ class ImageUnavailable(Exception):
 
 
 class Telegram:
+    _api = CLOUD_API
+    _local = False
+    _document_bytes = MAX_DOCUMENT_BYTES
+    _server = None
+
     def __init__(self, token_file: Path, store=None):
         self._store = store
+        self._server = local_server(store)
+        if self._server:
+            self._api, self._local, self._document_bytes = self._server.base(store), True, self._server.LOCAL_BYTES
         self._token_file = token_file.resolve()
         self._token = token_file.read_text().strip()
         if not self._token:
@@ -155,7 +197,7 @@ class Telegram:
     def _request(self, method, data, content_type, timeout=REQUEST_SECONDS):
         started = time.monotonic()
         request = urllib.request.Request(
-            "https://api.telegram.org/bot" + self._token + "/" + method,
+            self._api + "/bot" + self._token + "/" + method,
             data=data, headers={"Content-Type": content_type})
         try:
             with opener.open(request, timeout=timeout) as response:
@@ -187,12 +229,13 @@ class Telegram:
             path = Path(image).resolve(strict=True)
             if protected.protected(path):
                 raise TelegramError('protected-image-path')
-            body, content_type = multipart_body(parameters, path, method, protected)
+            body, content_type = multipart_body(parameters, path, method, protected, self._document_bytes)
         except FileNotFoundError:
             raise ImageUnavailable() from None
         except OSError:
             raise TelegramError('image-read-failed') from None
-        return self._request(method, body, content_type)
+        timeout = REQUEST_SECONDS + len(body) // MIB if self._local else REQUEST_SECONDS
+        return self._request(method, body, content_type, timeout)
 
     async def call(self, method, **data):
         return await asyncio.to_thread(self._call, method, data, CALL_SECONDS.get(method, REQUEST_SECONDS))
@@ -276,7 +319,15 @@ class Telegram:
                 raise ImageUnavailable() from None
             except OSError:
                 raise TelegramError('image-read-failed') from None
-            method = 'sendPhoto' if not row.get('as_document') and photo_path(path, size) else 'sendDocument'
+            method = 'sendDocument'
+            if not row.get('as_document'):
+                if photo_path(path, size):
+                    method = 'sendPhoto'
+                elif path.suffix.lower() in {'.mp4', '.mov', '.m4v'}:
+                    method = 'sendVideo'
+                    parameters['supports_streaming'] = 'true'
+                elif path.suffix.lower() == '.gif':
+                    method = 'sendAnimation'
             try:
                 return await self.call_multipart(method, parameters, row['image'])
             except TelegramError as error:
@@ -285,6 +336,13 @@ class Telegram:
                 parameters = dict(parameters)
                 parameters.pop('parse_mode')
                 parameters.update(_plain_parameters(rendered, caption=True))
+                if method in ('sendPhoto', 'sendVideo', 'sendAnimation'):
+                    from . import problems
+                    if self._store is not None:
+                        problems.record(self._store, 'telegram', 'media-send-failed',
+                                        'method=%s telegram=%s' % (method, error.code))
+                    parameters.pop('supports_streaming', None)
+                    method = 'sendDocument'
                 return await self.call_multipart(method, parameters, row['image'])
         try:
             return await self.call("sendMessage", **parameters)
@@ -296,7 +354,8 @@ class Telegram:
             return await self.call("sendMessage", **parameters)
 
     def _download_file(self, file_id, max_bytes):
-        info = self._call("getFile", {"file_id": file_id})
+        info = self._call("getFile", {"file_id": file_id},
+                          REQUEST_SECONDS + max_bytes // MIB if self._local else REQUEST_SECONDS)
         if not isinstance(info, dict):
             raise TelegramError("invalid-file-path")
         path = info.get("file_path")
@@ -306,6 +365,8 @@ class Telegram:
                 raise TelegramError("invalid-file-path")
             if size > max_bytes:
                 raise TelegramError("file-too-large")
+        if self._local:
+            return self._read_local(path, max_bytes)
         if (not isinstance(path, str) or not path or re.search(r"[\x00-\x1f\x7f-\x9f\\]", path)
                 or path.startswith("/") or ".." in path.split("/")):
             raise TelegramError("invalid-file-path")
@@ -314,7 +375,7 @@ class Telegram:
             def redirect_request(self, request, fp, code, msg, headers, newurl):
                 return None
 
-        request = urllib.request.Request("https://api.telegram.org/file/bot" + self._token + "/"
+        request = urllib.request.Request(self._api + "/file/bot" + self._token + "/"
                                          + urllib.parse.quote(path, safe='/'))
         try:
             download_opener = urllib.request.build_opener(NoRedirect, TelegramHTTPSHandler())
@@ -327,6 +388,18 @@ class Telegram:
             raise TelegramError("file-download-timeout" if timed_out else "file-download-failed") from None
         if len(data) > max_bytes:
             raise TelegramError("file-too-large")
+        if not data:
+            raise TelegramError("empty-file-download")
+        return data
+
+    def _read_local(self, path, max_bytes):
+        try:
+            data = self._server.read_file(path, max_bytes)
+        except ValueError as error:
+            code = 'file-too-large' if str(error) == 'file-too-large' else 'invalid-file-path'
+            raise TelegramError(code) from None
+        except OSError:
+            raise TelegramError('file-download-failed') from None
         if not data:
             raise TelegramError("empty-file-download")
         return data

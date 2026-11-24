@@ -8,7 +8,9 @@ import uuid
 IDENTITIES = ('session_id', 'thread_id', 'threadId', 'id', 'uuid')
 DETAIL_LIMIT = 300
 TOKEN = re.compile(r'(?<!\d)\d{5,}:[A-Za-z0-9_-]{30,}'
-                   r'|\b(?:sk-|gh[pousr]_|github_pat_|xox[baprs]-)[A-Za-z0-9_-]+'
+                   r'|\bsk-[A-Za-z0-9_-]{20,}|\bgh[pousr]_[A-Za-z0-9_]{36,}'
+                   r'|\b(?:github_pat_|xox[baprs]-)[A-Za-z0-9_-]{16,}'
+                   r'|\b(?:glpat-|tskey-|AIza)[A-Za-z0-9_-]{16,}|\bnpm_[A-Za-z0-9]{36,}'
                    r'|\bAKIA[0-9A-Z]{16}\b|\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+')
 CREDENTIAL = re.compile(r'''(?i)\b((?:bearer|basic)\s+|'''
                         r'''(?:[a-z_-]*(?:token|password|secret)|api[_-]?key|authorization)["']?\s*[:=]\s*'''

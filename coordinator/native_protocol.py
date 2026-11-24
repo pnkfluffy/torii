@@ -455,12 +455,13 @@ class NativeProtocol:
             self.process.stdin.close()
 
     def outcome(self, wire_id, state):
-        message_id = self.wires.pop(wire_id, None)
+        message_id = self.wires.get(wire_id)
         if message_id is not None and self.control.on_outcome is not None:
             self.control.on_outcome(message_id, state)
+        self.wires.pop(wire_id, None)
+        self.unstarted.discard(wire_id)
 
     def started(self, wire_id):
-        self.unstarted.discard(wire_id)
         future = self.messages.get(wire_id)
         if future is not None and not future.done():
             future.set_result('received')
@@ -503,7 +504,6 @@ class NativeProtocol:
                     self.started(wire_id)
                 elif (event.get('state') in ('cancelled', 'completed', 'discarded', 'refused')
                       and wire_id in self.unstarted):
-                    self.unstarted.discard(wire_id)
                     self.outcome(wire_id, 'uncertain')
             if event.get('type') == 'system' and event.get('subtype') == 'background_tasks_changed':
                 tasks = list(event.get('tasks') or [])
@@ -550,6 +550,8 @@ class NativeProtocol:
             return None
         if not self.persistent and method in ('turn/started', 'item/started', 'item/completed', 'turn/completed'):
             turn_id = (params['turn']['id'] if method.startswith('turn/') else params.get('turnId'))
+            if method.startswith('item/') and turn_id in self._completed_turns:
+                return None
             if turn_id != self.turn_id:
                 recovering = (self.reattaching and getattr(self.process, 'history_damaged', False)
                               and self.turn_id is None and not self._completed_turns)

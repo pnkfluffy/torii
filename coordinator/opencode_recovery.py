@@ -61,7 +61,7 @@ def identity(store):
 
 def owner_cursor(store, key):
     return store.db.execute("SELECT coalesce(max(id),0) FROM messages WHERE topic=? AND kind IN ('owner','forwarded')",
-                            (key.split(':', 1)[1],)).fetchone()[0]
+                            (parent_state.key_topic(store, key),)).fetchone()[0]
 
 
 def confirm(session):
@@ -70,14 +70,14 @@ def confirm(session):
         return
     rows = [row['id'] for row in session.store.db.execute(
         "SELECT id FROM messages WHERE topic=? AND (delivered='uncertain' OR receipt='written')",
-        (session.key.split(':', 1)[1],))]
+        (parent_state.key_topic(session.store, session.key),))]
     seen = opencode_runtime.parent_receipts(session.root, session.session_id, rows, all_sessions=True) if rows else set()
     session.store.messages_confirm(seen, 'transcript')
 
 
 def unanswered(store, key, rows):
     from . import opencode_runtime
-    topic = key.split(':', 1)[1]
+    topic = parent_state.key_topic(store, key)
     uncertain = [row['id'] for row in store.db.execute(
         "SELECT id FROM messages WHERE topic=? AND delivered='uncertain'", (topic,))]
     if uncertain:
@@ -133,23 +133,23 @@ def failed(store, key, session_id, code, detail, rows, owner=None):
                 notice = previous.get('notice')
                 reused = store.db.execute("UPDATE messages SET text=?,delivered='pending',receipt=NULL,updated=? "
                                           "WHERE id=? AND topic=? AND kind='callback'",
-                                          (text, time.time(), notice, key.split(':', 1)[1])).rowcount
+                                          (text, time.time(), notice, parent_state.key_topic(store, key))).rowcount
                 if not reused:
-                    notice = store.message_save(key.split(':', 1)[1], 'callback', text)['id']
+                    notice = store.message_save(parent_state.key_topic(store, key), 'callback', text)['id']
                 current['notice'] = notice
                 store.put(key + '_lost_turns', {str(notice): seen})
                 store.db.executemany("UPDATE messages SET delivered='received',receipt='written',updated=? WHERE id=?",
                                      [(time.time(), row) for row in seen])
         save(store, key, current)
         if phase == 'paused':
-            store.enqueue_report(key.split(':', 1)[1],
+            store.enqueue_report(parent_state.key_topic(store, key),
                 'This chat is paused: its fresh catch-up failed (%s). '
                 'Torii will not retry it on its own. The selected OpenCode model and your saved messages remain. '
                 'After the host problem is fixed, send a new message to try one fresh catch-up. %s' % (code, detail))
 
 
 def catchup(store, key, current):
-    topic = key.split(':', 1)[1]
+    topic = parent_state.key_topic(store, key)
     rows = set(current['rows'])
     previews = []
     for row in store.db.execute('SELECT id,kind,text FROM messages WHERE topic=? ORDER BY id', (topic,)):

@@ -29,7 +29,7 @@ class OpenCodeParentTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
-        self.root = Path(temporary.name)
+        self.root = Path(temporary.name).resolve()
         self.addCleanup(stop_test_hosts, self.root)
         self.home = self.root / 'home'
         self.home.mkdir()
@@ -100,6 +100,37 @@ class OpenCodeParentTests(unittest.IsolatedAsyncioTestCase):
     def persisted(self, row):
         return dict(self.store.db.execute('SELECT * FROM messages WHERE id=?', (row['id'],)).fetchone())
 
+    async def test_reattach_delivers_changed_rules_with_next_message(self):
+        from unittest.mock import AsyncMock
+        from coordinator.policy import personal_path
+        session = await self.start()
+        host = session.host_id
+        await session.detach()
+        personal_path(self.store).write_text('- Updated rule\n')
+        session = await self.start()
+        self.assertEqual(session.host_id, host)
+        with patch.object(session, 'send', new_callable=AsyncMock, return_value='received') as send:
+            await Service(self.store, None, self.runner, self.cwd)._send_message(self.row(), 'next', session)
+        self.assertIn('Updated rule', send.await_args.args[1])
+
+    async def test_parent_uses_only_its_chat_mcp_and_scrubs_output(self):
+        value = 'DUMMY-OPENCODE-PARENT-HEADER'
+        entry = {'type': 'http', 'url': 'https://example.invalid/personal',
+                 'headers': {'Authorization': value}}
+        other = {'type': 'http', 'url': 'https://example.invalid/work', 'headers': {}}
+        (self.home / '.claude.json').write_text(json.dumps({'mcpServers': {'personal': entry, 'work': other}}))
+        self.store.put('chat_config:chat', {'mcp_servers': ['personal']})
+        self.store.put('chat_config:home', {'mcp_servers': ['work']})
+        session = await self.start()
+        config = json.loads((self.data / 'config/opencode/opencode.json').read_text())
+        self.assertEqual(config['mcp'], {'personal': {'type': 'remote', 'url': entry['url'],
+                                                    'headers': entry['headers'], 'oauth': False}})
+        self.assertEqual(config['permission']['personal_*'], 'allow')
+        host = session.process.directory
+        for path in host.iterdir():
+            if path.is_file():
+                self.assertNotIn(value, path.read_text(errors='replace'))
+
     async def test_launch_writes_config_without_builtins_or_key(self):
         session = await self.start()
         path = self.data / 'config/opencode/opencode.json'
@@ -143,7 +174,8 @@ class OpenCodeParentTests(unittest.IsolatedAsyncioTestCase):
         self.scenario(compaction=True, tool_calls=[{'sessionUpdate': 'tool_call', 'toolCallId': 'tool',
                                                    'title': 'torii_tasks_list', 'status': 'pending'}])
         session = await self.start()
-        for text in ('first', 'with a tool', 'after fake compaction'):
+        messages = ('first', 'with a tool', 'after fake compaction')
+        for text in messages:
             await self.send(session, self.row(text))
             await until(session.idle)
         config = json.loads((self.data / 'config/opencode/opencode.json').read_text())
@@ -152,8 +184,9 @@ class OpenCodeParentTests(unittest.IsolatedAsyncioTestCase):
                          'COORDINATOR_TEST_POLICY\nCurrent usage policy:\n' + chat_policy(self.store, self.session_key))
         prompts = self.calls('session/prompt')
         self.assertEqual(len(prompts), 3)
-        self.assertEqual([row['message']['params']['prompt'][0]['text'].splitlines()[-1] for row in prompts],
-                         ['first', 'with a tool', 'after fake compaction'])
+        self.assertEqual([row['message']['params']['prompt'][0]['text'] for row in prompts],
+                         ['[topic=chat name="chat" message=%d kind=owner] %s' % (number, text)
+                          for number, text in enumerate(messages, 1)])
         self.assertTrue(all('COORDINATOR_TEST_POLICY' not in json.dumps(row['message']) for row in prompts))
 
     async def test_torii_mcp_sent_on_new_and_load_with_topic(self):
@@ -590,13 +623,17 @@ class OpenCodeParentTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(opencode_runtime.parent_receipts(self.data, session.session_id, [row['id'] for row in wanted]),
                          {wanted[0]['id']})
 
-    async def test_home_chat_refused_and_invalid_native_id_refused(self):
-        with self.assertRaisesRegex(ValueError, 'home chat'):
-            await OpenCodeParentSession.start(self.store, self.runner, self.cwd, None, 'policy', topic='home')
+    async def test_home_chat_runs_on_opencode_and_invalid_native_id_refused(self):
+        self.store.put('coordinator_selection', {'provider': 'opencode', 'model': None, 'effort': None, 'revision': 1})
+        home = await parent.start(self.store, self.runner, self.cwd, 'ignored', 'policy', topic='home')
+        self.parents.append(home)
+        self.assertEqual((home.provider, home.key), ('opencode', 'coordinator'))
+        await home.stop()
+        calls = len(self.calls())
         self.store.put(self.session_key + '_session', 'invalid')
         with self.assertRaisesRegex(ValueError, 'session ID'):
             await OpenCodeParentSession.start(self.store, self.runner, self.cwd, None, 'policy', topic='chat')
-        self.assertEqual(self.calls(), [])
+        self.assertEqual(len(self.calls()), calls)
 
     async def test_reattach_missing_marker_uses_fresh_host_without_waiting_again(self):
         release = self.root / 'release'
@@ -707,7 +744,7 @@ class OpenCodeRestartReceiptTests(unittest.IsolatedAsyncioTestCase):
         self.chat.parents.append(session)
         return session
 
-    async def assert_busy_native_batch_boundaries(self, through_service, switch_off=False):
+    async def assert_busy_native_batch_boundaries(self, through_service):
         from collections import Counter
         from coordinator import opencode_recovery
         import re
@@ -717,7 +754,6 @@ class OpenCodeRestartReceiptTests(unittest.IsolatedAsyncioTestCase):
             self.chat.store.put('owner', 1)
             self.chat.store.put('group', 1)
             self.chat.store.put('mode', 'group')
-            self.chat.store.put('coordinator_intake_batching', True)
         session = await self.start()
         held = self.chat.row('held request')
         await self.service.feed_once()
@@ -739,8 +775,6 @@ class OpenCodeRestartReceiptTests(unittest.IsolatedAsyncioTestCase):
                 by_id = {row['id']: row for row in workers + [owner]}
                 for message_ids in (expected[:20], expected[20:]):
                     self.assertTrue(self.chat.store.message_batch_sending(message_ids))
-                if switch_off:
-                    self.chat.store.put('coordinator_intake_batching', False)
                 for message_ids in (expected[:20], expected[20:]):
                     prompts = [await self.service._prepare_message(by_id[message], session, batch=True)
                                for message in message_ids]
@@ -787,42 +821,6 @@ class OpenCodeRestartReceiptTests(unittest.IsolatedAsyncioTestCase):
     async def test_saved_batches_stay_separate_when_queued_directly_on_busy_parent(self):
         await self.assert_busy_native_batch_boundaries(False)
 
-    async def test_saved_batches_stay_separate_after_batching_is_switched_off(self):
-        await self.assert_busy_native_batch_boundaries(False, switch_off=True)
-
-    async def test_switch_off_unbatched_inputs_keep_native_queue_coalescing(self):
-        import re
-        release = self.chat.root / 'legacy-coalescing-release'
-        self.chat.scenario(release=str(release))
-        with self.chat.store.db:
-            self.chat.store.put('owner', 1)
-            self.chat.store.put('group', 1)
-            self.chat.store.put('mode', 'group')
-            self.chat.store.put('coordinator_intake_batching', False)
-        session = await self.start()
-        held = self.chat.row('held request')
-        await self.service.feed_once()
-        await asyncio.gather(*set(self.service.feed_tasks.values()))
-        await until(lambda: session.busy and len(self.chat.calls('session/prompt')) == 1)
-        rows = [self.chat.row('first queued result', kind='worker_result'),
-                self.chat.row('second queued result', kind='worker_result')]
-        try:
-            self.assertTrue(await self.service.feed_once())
-            await asyncio.gather(*set(self.service.feed_tasks.values()))
-            self.assertEqual(len(self.chat.calls('session/prompt')), 1)
-            self.assertEqual([self.chat.persisted(row)['batch_id'] for row in rows], [None, None])
-        finally:
-            release.touch()
-        await until(session.idle)
-        calls = [row['message'] for row in self.chat.calls('session/prompt')]
-        self.assertEqual(len(calls), 2)
-        prompt = calls[1]['params']['prompt'][0]['text']
-        self.assertEqual([int(row) for row in re.findall(r'\bmessage=(\d+) kind=', prompt)],
-                         [row['id'] for row in rows])
-        self.assertEqual(calls[1]['params']['_meta']['toriiSteers'], [str(row['id']) for row in rows])
-        self.assertEqual(opencode_runtime.parent_receipts(self.chat.data, session.session_id,
-                         [row['id'] for row in rows + [held]]), {row['id'] for row in rows + [held]})
-
     async def test_native_flood_answers_owner_next_prompt_and_receipts_every_row_once(self):
         from coordinator import opencode_recovery
         import re
@@ -832,7 +830,6 @@ class OpenCodeRestartReceiptTests(unittest.IsolatedAsyncioTestCase):
             self.chat.store.put('owner', 1)
             self.chat.store.put('group', 1)
             self.chat.store.put('mode', 'group')
-            self.chat.store.put('coordinator_intake_batching', True)
         session = await self.start()
         held = self.chat.row('held request')
         await self.service.feed_once()
@@ -927,7 +924,7 @@ class OpenCodeRestartReceiptTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.chat.calls('session/load')), 0 if reattach else 1)
         self.assertEqual(self.chat.persisted(row)['delivered'], 'received')
         self.assertEqual(self.chat.persisted(row)['receipt'], 'transcript')
-        self.assertIn('"count":0', self.restart_prompt())
+        self.assertNotIn('Uncertain message', self.restart_prompt())
         self.assertNotIn(row['text'], self.restart_prompt())
         self.assertEqual(len(self.chat.calls('session/prompt')), 1)
 

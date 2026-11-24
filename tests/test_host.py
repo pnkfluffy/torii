@@ -13,7 +13,7 @@ import unittest
 import uuid
 from unittest.mock import AsyncMock, Mock, patch
 
-from coordinator import parent_state
+from coordinator import host, parent_state
 from coordinator.host import HostClient, HostDied, alive
 from coordinator.native_protocol import RunControl
 from coordinator.providers import ProviderRunner
@@ -67,8 +67,10 @@ class HostCleanupTests(unittest.IsolatedAsyncioTestCase):
 
 class HostTestsSupport:
     async def asyncSetUp(self):
+        from tests.support import fake_codex_hook_trust
+        fake_codex_hook_trust(self)
         self.tmp = tempfile.TemporaryDirectory()
-        self.root = Path(self.tmp.name)
+        self.root = Path(self.tmp.name).resolve()
         self.addCleanup(self.tmp.cleanup)
         isolate_shared_mcp_home(self, self.root)
         self.addCleanup(stop_test_hosts, self.root)
@@ -130,6 +132,35 @@ else:
 
 
 class HostTests(HostTestsSupport, unittest.IsolatedAsyncioTestCase):
+    async def test_background_survivors_excludes_known_infrastructure(self):
+        processes = {
+            101: ('S', '/Path With Spaces/python3', '/Path With Spaces/python3 -m coordinator --state-dir /state mcp'),
+            102: ('S', '/usr/bin/ssh', 'ssh: /tmp/socket [mux]'),
+            103: ('S', '/usr/bin/ssh', 'ssh -o ControlMaster=auto example'),
+            104: ('S', '/opt/codex-code-mode-host', '/opt/codex-code-mode-host'),
+            105: ('S', '/opt/node_repl', '/opt/node_repl'),
+            106: ('S', '/usr/bin/ssh', 'ssh example'),
+            107: ('S', '/usr/bin/python3', '/usr/bin/python3 -m coordinator --state-dir /state other'),
+            108: ('S', '/usr/bin/python3', '/usr/bin/python3 -c work'),
+            109: ('Z', '/usr/bin/python3', '/usr/bin/python3 -c finished'),
+            110: ('S', '/opt/node', '/opt/node /path/node_repl'),
+            111: ('S', '/usr/bin/ssh', 'ssh -o ControlMaster=no example'),
+            112: ('S', '/usr/bin/python3', '/usr/bin/python3 -c unmatched\"'),
+        }
+        def run(args, **kwargs):
+            state, executable, command = processes[int(args[2])]
+            return Mock(stdout={'stat=': state, 'comm=': executable, 'command=': command}[args[-1]])
+        with patch('coordinator.host.ownership.group_members', AsyncMock(return_value=(
+                [(pid, ('identity', pid)) for pid in processes], False))), \
+                patch('coordinator.host.subprocess.run', side_effect=run):
+            survivors = await host.background_survivors(100, None, lambda value: value)
+        self.assertEqual([pid for pid, _ in survivors], [106, 107, 108, 111, 112])
+
+    async def test_background_survivors_handles_ownership_scan_failure(self):
+        with patch('coordinator.host.ownership.group_members', AsyncMock(return_value=([], False))), \
+                patch('coordinator.host.ownership.select', side_effect=OSError('Process identity changed during scan')):
+            self.assertEqual(await host.background_survivors(100, {'pid': 99, 'unique': 1}, lambda value: value), [])
+
     async def test_worker_instructions_do_not_choose_fake_action(self):
         runner = self.runner({'claude': str(self.binary)})
         for prompt in ('finish', 'finish and wait for cleanup'):
@@ -159,6 +190,7 @@ class HostTests(HostTestsSupport, unittest.IsolatedAsyncioTestCase):
         store = Store(self.state)
         self.addCleanup(store.close)
         self.add_named_account(store)
+        store.put('coordinator_home_topic', 'home')
         with ExitStack() as guards:
             for name in ('create_job', 'cleanup', 'report', 'bootout'):
                 guards.enter_context(patch.object(ownership, name, side_effect=AssertionError(name + ' used')))

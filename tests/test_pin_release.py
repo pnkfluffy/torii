@@ -1,6 +1,8 @@
 from pathlib import Path
 from coordinator import extension
+import os
 import plistlib
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -14,6 +16,9 @@ class PinReleaseTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name).resolve()
+        self.bin = self.root / 'bin'
+        self.bin.mkdir()
+        (self.bin / 'git').symlink_to(shutil.which('git'))
         self.home = self.root / 'checkout'
         (self.home / 'coordinator').mkdir(parents=True)
         (self.home / 'coordinator' / '__init__.py').write_text('')
@@ -49,7 +54,8 @@ class PinReleaseTests(unittest.TestCase):
 
     def pin(self, *args):
         return subprocess.run([sys.executable, str(SCRIPT), *args, '--state-dir', str(self.state),
-                               '--plist', str(self.plist)], capture_output=True, text=True)
+                               '--plist', str(self.plist)], capture_output=True, text=True,
+                              env=dict(os.environ, PATH=str(self.bin)))
 
     def test_creates_a_detached_release_and_prints_the_unapplied_launchd_change(self):
         done = self.pin(self.first[:10])

@@ -14,12 +14,14 @@ import urllib.error
 import uuid
 import zlib
 
+from coordinator import host_os
 from coordinator import media, transcription
-from coordinator.media import MAX_FILE_BYTES, free_path, prepare_attachments, safe_name
-from coordinator.policy import REPLY_FIRST
+from coordinator.media import free_path, prepare_attachments, safe_name
+from coordinator.telegram import MAX_DOWNLOAD_BYTES as MAX_FILE_BYTES
 from coordinator.telegram import Telegram, TelegramError
 from coordinator.service import Service
 from coordinator.store import Store
+from tests.support import sent_parts
 from tests.test_service import FakeSession, FakeTelegram
 from tests.test_store import update
 
@@ -194,7 +196,7 @@ class MediaTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(rows[0]['agent_path'], str(copy))
         self.assertEqual(self.api.downloads, ['doc-2'])
 
-    @unittest.skipUnless(sys.platform == 'darwin' and shutil.which('sips'), 'requires macOS sips')
+    @unittest.skipUnless(host_os.macos() and shutil.which('sips'), 'requires macOS sips')
     async def test_native_sips_makes_readable_agent_copies_for_bytes_and_dimensions(self):
         for number, width, height, size in ((2, 10, 10, 6 * 1024 * 1024), (3, 4000, 3000, 0)):
             with self.subTest(width=width, height=height, size=size):
@@ -324,10 +326,11 @@ class MediaTests(unittest.IsolatedAsyncioTestCase):
         await self.service.feed_once()
         for task in list(self.service.feed_tasks.values()):
             await task
-        self.assertEqual(len(self.session.sent), 3)
-        self.assertIn('First', self.session.sent[0][1])
-        self.assertIn('Second', self.session.sent[1][1])
-        self.assertEqual(self.session.sent[2][1], '[topic=-10042:4 name="Images" message=3 kind=owner] ' + REPLY_FIRST + 'Next')
+        parts = sent_parts(self.session)
+        self.assertEqual(len(parts), 3)
+        self.assertIn('First', parts[0])
+        self.assertIn('Second', parts[1])
+        self.assertEqual(parts[2], '[topic=-10042:4 name="Images" message=3 kind=owner] Next')
         self.assertEqual(self.api.downloads, ['large-2', 'large-3'])
 
     async def test_unsupported_content_and_download_failure_report_without_secret(self):
@@ -378,8 +381,9 @@ class MediaTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.reports(), [
             'An image is larger than 20 MB, the most Telegram lets a bot download. '
             'Your message text went to the coordinator without it. Send a smaller image.', IMAGE_NOTICE])
-        self.assertEqual(len(self.session.sent), 2)
-        for (_, prompt, *_rest), text, reason in zip(self.session.sent, ['First', 'Second'],
+        parts = sent_parts(self.session)
+        self.assertEqual(len(parts), 2)
+        for prompt, text, reason in zip(parts, ['First', 'Second'],
                                                     ['larger than 20 MB', 'download failed']):
             self.assertIn(text, prompt)
             self.assertIn('image (image/jpeg): ' + reason, prompt)
@@ -411,11 +415,12 @@ class MediaTests(unittest.IsolatedAsyncioTestCase):
         await self.service.feed_once()
         for task in list(self.service.feed_tasks.values()):
             await task
-        self.assertEqual(len(self.session.sent), 2)
-        self.assertIn('Compare', self.session.sent[0][1])
-        self.assertIn(IMAGE_NOTE, self.session.sent[0][1])
+        parts = sent_parts(self.session)
+        self.assertEqual(len(parts), 2)
+        self.assertIn('Compare', parts[0])
+        self.assertIn(IMAGE_NOTE, parts[0])
         path = self.store.db.execute('SELECT path FROM attachments WHERE message=3').fetchone()[0]
-        self.assertIn(path, self.session.sent[1][1])
+        self.assertIn(path, parts[1])
         self.assertEqual(self.reports(), [IMAGE_NOTICE])
 
     async def test_download_failure_log_never_contains_the_token_or_file_path(self):
@@ -541,49 +546,23 @@ class MediaTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(any('Voice notes require macOS 14' in text for text in self.reports()))
 
     async def test_missing_ffmpeg_refuses_the_note_with_a_clear_owner_notice(self):
-        with self.store.db:
-            self.store.put('transcription_model', 'parakeet')
         from unittest.mock import AsyncMock, Mock
         from coordinator import transcription
         process = Mock(returncode=0)
         process.communicate = AsyncMock(return_value=(b'/fake/python', b''))
         self.api.files['voice-2'] = b'fake audio'
         self.store.accept(update(2, '', voice={'file_id': 'voice-2', 'mime_type': 'audio/ogg'}))
-        with patch.object(transcription.platform, 'system', return_value='Darwin'), \
-                patch.object(transcription.platform, 'machine', return_value='arm64'), \
-                patch.object(transcription.platform, 'mac_ver', return_value=('27.0', (), 'arm64')), \
+        with patch.object(transcription.host_os.platform, 'system', return_value='Darwin'), \
+                patch.object(transcription.host_os.platform, 'machine', return_value='arm64'), \
+                patch.object(transcription.host_os.platform, 'mac_ver', return_value=('27.0', (), 'arm64')), \
                 patch.object(transcription.shutil, 'which', return_value=None), \
+                patch.object(media, 'default_backend', return_value='parakeet'), \
                 patch.object(transcription.asyncio, 'create_subprocess_exec', AsyncMock(return_value=process)) as launch, \
                 patch.object(transcription.os, 'killpg'):
             await self.feed()
         self.assertEqual(self.session.sent, [])
         self.assertTrue(any('ffmpeg is required for Parakeet voice transcription' in text for text in self.reports()))
         launch.assert_not_called()
-
-    async def test_undecodable_transcription_setting_falls_back_without_stopping_feed(self):
-        await self.assert_invalid_transcription_settings(('whisper',), 'whisper')
-
-    async def test_non_utf8_transcription_setting_falls_back_without_stopping_feed(self):
-        await self.assert_invalid_transcription_settings((b'\xff',), 'whisper')
-
-    async def test_unknown_and_wrong_case_transcription_settings_use_platform_default(self):
-        await self.assert_invalid_transcription_settings(
-            (json.dumps(value) for value in ('unknown', 'Whisper', 'PARAKEET', ['whisper'], None)), 'parakeet')
-
-    async def assert_invalid_transcription_settings(self, values, backend):
-        engine = AsyncMock(return_value='Fallback transcript')
-        with patch.object(media, 'default_backend', return_value=backend, create=True), \
-                patch.object(media, 'transcribe_audio', engine):
-            for number, value in enumerate(values, 2):
-                with self.subTest(value=value):
-                    with self.store.db:
-                        self.store.db.execute(
-                            "INSERT OR REPLACE INTO settings VALUES ('transcription_model', ?)", (value,))
-                    self.api.files['voice-%d' % number] = b'fake audio'
-                    self.store.accept(update(number, '', voice={'file_id': 'voice-%d' % number}))
-                    await self.feed()
-                    self.assertEqual(engine.call_args.kwargs['backend'], backend)
-                    self.assertIn('Fallback transcript', self.session.sent[-1][1])
 
     async def test_audio_notes_keep_later_messages_in_send_order(self):
         self.api.files = {'voice-2': b'first', 'voice-3': b'second'}
@@ -602,7 +581,7 @@ class MediaTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(self.session.sent, [])
             gate.set()
             await asyncio.gather(*self.service.feed_tasks.values())
-        prompts = [sent[1] for sent in self.session.sent]
+        prompts = sent_parts(self.session)
         self.assertIn('First transcript', prompts[0])
         self.assertIn('Second transcript', prompts[1])
         self.assertIn('Text after notes', prompts[2])
@@ -656,7 +635,7 @@ class MediaTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('TORII_TEST_REAL_TRANSCRIPTION', source)
 
     @unittest.skipUnless(os.environ.get('TORII_TEST_REAL_TRANSCRIPTION') == '1' and
-                         shutil.which('say') and os.uname().sysname == 'Darwin',
+                         shutil.which('say') and host_os.macos(),
                          'set TORII_TEST_REAL_TRANSCRIPTION=1 with say on macOS')
     async def test_real_transcription_command(self):
         path = self.root / 'synthetic.aiff'
@@ -742,13 +721,14 @@ class MediaTests(unittest.IsolatedAsyncioTestCase):
         for task in list(self.service.feed_tasks.values()):
             await task
         self.assertEqual(self.api.downloads, ['doc-2', 'doc-3'])
-        self.assertEqual(len(self.session.sent), 2)
-        self.assertIn('Compare these', self.session.sent[0][1])
-        self.assertIn('Read the attached file.', self.session.sent[1][1])
+        parts = sent_parts(self.session)
+        self.assertEqual(len(parts), 2)
+        self.assertIn('Compare these', parts[0])
+        self.assertIn('Read the attached file.', parts[1])
         paths = [Path(row[0]) for row in self.store.db.execute('SELECT path FROM attachments ORDER BY message')]
         self.assertEqual([path.read_bytes() for path in paths], [b'first', b'second'])
         self.assertNotEqual(paths[0].parent, paths[1].parent)
-        self.assertIn(str(paths[1]), self.session.sent[1][1])
+        self.assertIn(str(paths[1]), parts[1])
 
     def test_file_names_are_safe_basenames_that_keep_the_extension(self):
         cases = {'../../etc/passwd': 'passwd', '..\\evil\\run.sh': 'run.sh', '.env': 'env',
@@ -818,16 +798,13 @@ class PlatformVoiceHarness(unittest.IsolatedAsyncioTestCase):
         process.communicate = AsyncMock(return_value=(output, b''))
         return process
 
-    async def one_note(self, platform_name, model=None, ffmpeg='/fake/bin/ffmpeg'):
+    async def one_note(self, platform_name, ffmpeg='/fake/bin/ffmpeg'):
         system, machine, version = {**VOICE_PLATFORMS, **VOICE_INFORMATIONAL}[platform_name]
-        if model is not None:
-            with self.store.db:
-                self.store.put('transcription_model', model)
         self.api.files['voice-2'] = b'fake opus bytes'
         self.store.accept(update(2, '', voice={'file_id': 'voice-2', 'mime_type': 'audio/ogg', 'duration': 30}))
-        with patch.object(transcription.platform, 'system', return_value=system), \
-                patch.object(transcription.platform, 'machine', return_value=machine), \
-                patch.object(transcription.platform, 'mac_ver',
+        with patch.object(transcription.host_os.platform, 'system', return_value=system), \
+                patch.object(transcription.host_os.platform, 'machine', return_value=machine), \
+                patch.object(transcription.host_os.platform, 'mac_ver',
                              return_value=(version, ('', '', ''), machine if system == 'Darwin' else '')), \
                 patch.object(transcription.shutil, 'which', return_value=ffmpeg), \
                 patch.object(asyncio, 'create_subprocess_exec', side_effect=self.fake_exec), \
@@ -843,8 +820,8 @@ class PlatformVoiceHarness(unittest.IsolatedAsyncioTestCase):
         launched = [('transcribe ' + ' '.join(map(str, command[2:-1]))) if command[0] == '/fake/venv/python'
                     else 'setup ' + ' '.join(map(str, command[4:])).replace(str(self.root), '<state>')
                     for command in self.launched]
-        print('\nRESULT platform=%s model=%s ffmpeg=%s -> %s; subprocesses=%s' % (
-            platform_name, model or 'default', 'yes' if ffmpeg else 'no', outcome, launched), file=sys.stderr)
+        print('\nRESULT platform=%s ffmpeg=%s -> %s; subprocesses=%s' % (
+            platform_name, 'yes' if ffmpeg else 'no', outcome, launched), file=sys.stderr)
         return delivered, reports
 
 
@@ -852,42 +829,27 @@ class DefaultSetting(PlatformVoiceHarness):
     pass
 
 
-class WhisperSelected(PlatformVoiceHarness):
-    pass
-
-
-class WhisperWithoutFfmpeg(PlatformVoiceHarness):
-    pass
-
-
 class DefaultWithoutFfmpeg(PlatformVoiceHarness):
     pass
 
 
-def platform_voice_case(model, ffmpeg, name):
+def platform_voice_case(ffmpeg, name):
     async def test(self):
-        delivered, reports = await self.one_note(name, model=model, ffmpeg=ffmpeg)
-        self.assertTrue(delivered and TRANSCRIPT in delivered[0],
-                        'voice note refused on %s with model=%s: %r' % (name, model or 'default', reports))
-        expected = model or ('parakeet' if name in ('macos26_arm64', 'macos27_arm64') and ffmpeg else 'whisper')
+        delivered, reports = await self.one_note(name, ffmpeg=ffmpeg)
+        self.assertTrue(delivered and TRANSCRIPT in delivered[0], 'voice note refused on %s: %r' % (name, reports))
+        expected = 'parakeet' if name in ('macos26_arm64', 'macos27_arm64') and ffmpeg else 'whisper'
         self.assertEqual(self.launched[-1][-3:-1], ('--backend', expected))
     return test
 
 
 for _name in VOICE_PLATFORMS:
-    setattr(DefaultSetting, 'test_' + _name, platform_voice_case(None, '/fake/bin/ffmpeg', _name))
-    setattr(WhisperSelected, 'test_' + _name, platform_voice_case('whisper', '/fake/bin/ffmpeg', _name))
-    setattr(WhisperWithoutFfmpeg, 'test_' + _name, platform_voice_case('whisper', None, _name))
-    if _name.startswith('macos2'):
-        setattr(DefaultWithoutFfmpeg, 'test_' + _name, platform_voice_case(None, None, _name))
+    setattr(DefaultSetting, 'test_' + _name, platform_voice_case('/fake/bin/ffmpeg', _name))
+    setattr(DefaultWithoutFfmpeg, 'test_' + _name, platform_voice_case(None, _name))
 
 
 class IntelMacInformational(PlatformVoiceHarness):
     async def test_intel_mac_default_message(self):
         await self.one_note('macos15_intel')
-
-    async def test_intel_mac_whisper_message(self):
-        await self.one_note('macos15_intel', model='whisper')
 
 
 del PlatformVoiceHarness

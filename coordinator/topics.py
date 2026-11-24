@@ -55,7 +55,13 @@ def queue(store, ctx, op, params):
     if op == 'topic.create':
         if params.get('provider') == 'opencode':
             from .parent_state import opencode_pick_problem
-            problem = opencode_pick_problem(store, 'coordinator:new')
+            problem = opencode_pick_problem(store)
+            if problem:
+                raise Refused(problem)
+        if params.get('provider') == 'antigravity':
+            from .extension import optional
+            pick_problem = optional('antigravity_parent').pick_problem
+            problem = pick_problem(store)
             if problem:
                 raise Refused(problem)
         name = params['name']
@@ -64,9 +70,11 @@ def queue(store, ctx, op, params):
         if any(json.loads(row['params'])['name'].casefold() == name.casefold()
                for row in _requests(store, op)):
             raise Refused('A chat with that name is already being created.')
-        if 'delegation' in params:
-            from .controls import _chat_policy_text
-            params['delegation'] = _chat_policy_text(params['delegation'])
+        if 'rules' in params:
+            from .policy import _clean
+            raw = params['rules'].strip() + '\n'
+            if len(_clean(raw)) > 4000:
+                raise Refused('Keep chat rules to 4000 characters. HTML comments do not count.')
         params = dict(params, settings={})
     else:
         _check_close(store, params['topic'])
@@ -196,7 +204,7 @@ def _card(store, request, progress, prefix=''):
     params = json.loads(request['params'])
     snap = snapshot(store, params['topic'])
     revision = progress.get('revision', 0) + 1
-    jobs_heading = 'Open and waiting jobs to mark dropped:' if store.get('waits_enabled', False) else 'Open jobs to mark dropped:'
+    jobs_heading = 'Open and waiting jobs to mark dropped:'
     text = (prefix + 'Close "' + snap['name'] + '"?\nIts agent stops. The Telegram topic and all its messages '
             'will be deleted. This cannot be undone.\n\n' + jobs_heading + '\n' +
             ('\n'.join('#%s %s' % (job['number'], job['title']) for job in snap['jobs']) or 'None.') +
@@ -441,8 +449,12 @@ async def _create(service, request, params, progress):
                 settings[key + '_selection'] = {'provider': params['provider'],
                                                 'model': None if params['provider'] == 'opencode' else params.get('model'),
                                                 'effort': None if params['provider'] == 'opencode' else params.get('effort'), 'revision': 1}
-            if params.get('delegation'):
-                settings[key + '_delegation'] = {'text': params['delegation'], 'revision': 1}
+            if params.get('rules'):
+                from .policy import chat_path, atomic_rule_write
+                path = chat_path(store, progress['topic'])
+                path.parent.mkdir(parents=True, exist_ok=True)
+                if not path.exists():
+                    atomic_rule_write(path, params['rules'].strip() + '\n')
             store.link_created_topic(request['id'], progress['topic'], params['_chat'], progress['thread'],
                                      params['name'], progress['cwd'], settings, dict(progress, phase='linked'))
         elif phase == 'linked':
@@ -450,14 +462,10 @@ async def _create(service, request, params, progress):
             card = _status_card(store, progress['topic']).splitlines()
             agent = next(line for line in card if line.startswith('Chat agent:'))
             ready = params['name'] + ' is ready.\nProject folder: ' + progress['cwd'] + '\n' + agent + '.'
-            delegation = params.get('delegation')
-            if delegation:
-                ready += '\nDelegation updated.'
             with store.db:
                 store.enqueue_report(progress['topic'], ready)
                 _finish(store, request, progress, 'Chat created: topic=' + progress['topic'] +
                         '\nName: ' + params['name'] + '\nFolder: ' + progress['cwd'] + '\n' + agent + '.' +
-                        ('\nDelegation: own instructions (%d characters).' % len(delegation) if delegation else '') +
                         ('\nCreated by local program: ' + params['_from'] + '.' if params.get('_from') else ''))
             release_messages(store)
     except (Refused, OSError, subprocess.SubprocessError, TelegramError, sqlite3.Error) as error:
@@ -533,7 +541,7 @@ async def _close(service, request, params, progress):
         with store.db:
             _save(store, request, dict(progress, phase='stopped'))
     elif phase == 'stopped':
-        with store.db:
+        with store.transaction():
             dropped_jobs = [dict(row) for row in store.db.execute(
                 "SELECT id,number,title FROM tasks WHERE topic=? AND status IN ('open','waiting') ORDER BY number", (topic,))]
             now = time.time()
@@ -544,15 +552,19 @@ async def _close(service, request, params, progress):
             store.wait_hook('chat-close-failed', store.wait_close_topic, topic)
             if store.code_requests is not None:
                 store.code_requests.queue_chat_close(store, topic)
-            store.db.execute("UPDATE tasks SET status='dropped',updated=? WHERE topic=? AND status IN ('open','waiting')", (now, topic))
+            for job in store.db.execute("SELECT id FROM tasks WHERE topic=? AND status IN ('open','waiting')", (topic,)).fetchall():
+                store.task_row_write(job['id'], {'status': 'dropped', 'updated': now})
+            for job in store.db.execute("SELECT id FROM tasks WHERE topic=? AND status='proposed'", (topic,)).fetchall():
+                reason = 'Expired because the chat closed.'
+                store.task_note(job['id'], reason)
+                store.task_row_write(job['id'], {'status': 'expired', 'updated': now, 'reason': reason})
             for job in store.db.execute('SELECT id FROM tasks WHERE topic=?', (topic,)).fetchall():
                 store.host_logs_changed(task=job['id'])
             _save(store, request, dict(progress, phase='dropped', dropped_jobs=dropped_jobs))
-        if store.get('closed_copy_delete', False) is True or store.get('close_clears_space', False) is True:
-            from .workspaces import request_closed_copy_cleanup
-            for job in dropped_jobs:
-                with store.db:
-                    request_closed_copy_cleanup(store, job['id'])
+        from .close_saves import request
+        for job in dropped_jobs:
+            with store.db:
+                request(store, job['id'])
     elif phase == 'dropped':
         async with service.delivery_lock:
             with store.db:

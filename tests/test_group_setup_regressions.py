@@ -103,6 +103,8 @@ class GroupSetupRegressionTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_reinstall_live_home_preserves_pairing_and_topics(self):
         live_shape(self.store, self.root)
+        with self.store.db:
+            self.store.put('control_topic', HOME)
         before = self.snapshot()
         unexpected = Mock(side_effect=AssertionError('Already set up'))
         globals_ = INSTALLER['setup'].__globals__

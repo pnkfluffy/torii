@@ -5,12 +5,12 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from coordinator import control_api
 from coordinator.account_status import SAME_WINDOW_SECONDS, refresh_accounts
-from coordinator.accounts import (LIMIT_CONTINUATION, AccountBroker, account_label, discover_accounts,
-                                  listed_accounts, switch_threshold)
+from coordinator.accounts import (LIMIT_CONTINUATION, AccountBroker, account_block, account_label, account_pick,
+                                  discover_accounts, listed_accounts, switch_threshold)
 from coordinator.failures import TaskFailure
 from coordinator.providers import RunResult
 from coordinator.store import Store
@@ -56,6 +56,128 @@ class AccountTestsSupport:
         status[alias]['usage'][key] = {'utilization': utilization, 'resets_at': resets_at}
         with self.store.db:
             self.store.put('account_status', status)
+
+
+class ModelAwareAccountTests(AccountTestsSupport, unittest.IsolatedAsyncioTestCase):
+    async def test_selection_uses_model_and_owner_pick(self):
+        reset = time.time() + 3600
+        self.store.put('claude_account_pick', 'primary')
+        self.meter('primary', 'seven_day_fable', 99, reset)
+        for model in ('opus', 'sonnet', 'haiku', 'claude-opus-5-5'):
+            self.assertEqual(self.broker.select(model=model), 'primary')
+        for model in ('fable', 'claude-fable-5-2', 'native-default'):
+            self.assertEqual(self.broker.select(model=model), 'second')
+        self.assertIsNone(self.broker.earliest_reset(model='opus'))
+        self.assertEqual(self.broker.earliest_reset(model='fable'), reset)
+        self.meter('primary', 'seven_day', 99, reset)
+        for model in ('opus', 'fable', 'native-default'):
+            self.assertEqual(self.broker.select(model=model), 'second')
+
+    def third_account(self):
+        directory = self.root / 'third'
+        directory.mkdir()
+        now = time.time()
+        accounts = self.store.get('accounts')
+        accounts['third'] = {'config_dir': str(directory), 'enabled': True}
+        status = self.store.get('account_status')
+        status['third'] = {'identity': {'email': 'third@example.com', 'logged_in': True}, 'observed_at': now,
+                           'usage': {'seven_day': {'utilization': 10, 'resets_at': now + 600},
+                                     'seven_day_fable': {'utilization': 10, 'resets_at': now + 600}}}
+        with self.store.db:
+            self.store.put('accounts', accounts)
+            self.store.put('account_status', status)
+
+    async def test_per_model_picks_send_fable_and_other_models_to_their_accounts(self):
+        self.third_account()
+        self.assertEqual(self.broker.select(model='opus'), 'third')
+        self.store.put('claude_account_pick', {'fable': 'primary', 'other': 'second'})
+        for model in ('fable', 'claude-fable-5-2'):
+            self.assertEqual(self.broker.select(model=model), 'primary')
+        for model in ('opus', 'sonnet', 'claude-opus-5-5', 'claude-sonnet-5-5', 'native-default'):
+            self.assertEqual(self.broker.select(model=model), 'second')
+        self.meter('primary', 'seven_day_fable', 99, time.time() + 3600)
+        self.assertEqual(self.broker.select(model='fable'), 'third')
+        self.assertEqual(self.broker.select(model='opus'), 'second')
+        self.assertEqual(self.broker.selection_reason(self.store.get('accounts'), 'third', model='opus'),
+                         'reason=owner_pick')
+
+    async def test_old_single_pick_sends_every_model_to_one_account(self):
+        self.third_account()
+        self.store.put('claude_account_pick', 'second')
+        for model in ('fable', 'opus', 'sonnet', 'native-default'):
+            self.assertEqual(self.broker.select(model=model), 'second')
+
+    async def test_one_group_pick_leaves_other_group_automatic(self):
+        self.third_account()
+        self.store.put('claude_account_pick', {'fable': 'second', 'other': None})
+        self.assertEqual(self.broker.select(model='fable'), 'second')
+        self.assertEqual(self.broker.select(model='opus'), 'third')
+
+    async def test_fable_rate_limit_blocks_only_fable(self):
+        reset = time.time() + 3600
+        self.broker.record_rate_limit('primary', {'rateLimitType': 'seven_day_fable',
+                                                  'resetsAt': reset}, rejected=True)
+        self.assertEqual(self.broker.select(model='opus'), 'primary')
+        self.assertEqual(self.broker.select(model='fable'), 'second')
+        self.assertEqual(self.broker.select(model='native-default'), 'second')
+        self.assertIsNone(self.broker.earliest_reset(model='opus'))
+        self.assertEqual(self.broker.earliest_reset(model='fable'), reset)
+        self.broker.record_rate_limit('primary', {'rateLimitType': 'seven_day',
+                                                  'resetsAt': reset}, rejected=True)
+        self.assertEqual(self.broker.select(model='opus'), 'second')
+        self.assertEqual(self.broker.select(model='fable'), 'second')
+
+    async def test_worker_uses_requested_model(self):
+        self.meter('primary', 'seven_day_fable', 99, time.time() + 3600)
+        launched = []
+        async def run(provider, prompt, cwd, session_id, **options):
+            launched.append(options['account_alias'])
+            return RunResult(session_id, success=True)
+        for model in ('opus', 'fable', None):
+            await self.broker.run(run, 'claude', 'work', self.root, self.sid, fresh=True, model=model)
+        self.assertEqual(launched, ['primary', 'second', 'second'])
+
+    async def test_every_account_question_needs_a_model(self):
+        for ask in (lambda: self.broker.select(), lambda: self.broker.activate(),
+                    lambda: self.broker.earliest_reset(), lambda: self.broker.selection_order(),
+                    lambda: self.broker.account_state('primary'), lambda: self.broker.is_full('primary'),
+                    lambda: listed_accounts(self.store), lambda: account_pick(self.store),
+                    lambda: account_block(self.store, 'primary')):
+            with self.assertRaises(TypeError):
+                ask()
+
+    async def test_displays_keep_an_account_whose_fable_meter_alone_is_full(self):
+        from coordinator import controls, parent
+        from coordinator.setup_flow import setup_state
+        now = time.time()
+        for alias in ('primary', 'second'):
+            self.meter(alias, 'seven_day_fable', 100, now + 3600)
+            self.meter(alias, 'seven_day', 78, now + 7200)
+        with self.store.db:
+            self.store.put('worker_model', 'opus')
+        status = controls._status_card(self.store, None)
+        self.assertNotIn('all accounts limited', status)
+        self.assertIn('primary@example.com', status)
+        self.assertIn('Next account: primary@example.com',
+                      controls._current_claude(self.store, self.store.get('accounts')))
+        self.assertIn('primary@example.com (enabled) · next dispatch', controls._accounts(self.store))
+        card = controls._account_card(self.store, 'primary')
+        self.assertNotIn('Account state: limited', card)
+        self.assertIsNone(controls.blocked(self.store, 'primary'))
+        self.assertEqual(setup_state(self.store)['main'], 'claude')
+        with self.store.db:
+            self.store.put('worker_model', 'fable')
+        self.assertIn('all accounts limited', controls._status_card(self.store, None))
+        with self.store.db:
+            self.store.put('claude_account_pick', {'fable': 'second', 'other': 'primary'})
+            self.store.put('coordinator_model', 'claude-fable-5-2')
+            self.store.put('account_blocks', {'second': {'reason': 'quota', 'until': now + 60},
+                                              'primary': {'reason': 'quota', 'until': now + 60}})
+            self.store.put('coordinator_account_notice', {'key': ['claude']})
+        with patch('coordinator.account_status.refresh_accounts', new_callable=AsyncMock) as refresh:
+            await parent.retry_paused(self.store, 'coordinator_account')
+        self.assertEqual(refresh.await_args.kwargs['aliases'], ['second'])
+        self.assertIn('primary', self.store.get('account_blocks'))
 
 
 class HeldAccountTests(AccountTestsSupport, unittest.IsolatedAsyncioTestCase):
@@ -114,21 +236,21 @@ class HeldAccountTests(AccountTestsSupport, unittest.IsolatedAsyncioTestCase):
     async def test_threshold_and_other_holds_keep_cached_lower_readings(self):
         for reason in ('threshold', 'manual'):
             with self.subTest(reason=reason):
-                self.held(reason, used=98)
-                self.assertEqual(self.broker.select(), 'second')
+                self.held(reason, used=99)
+                self.assertEqual(self.broker.select(model='native-default'), 'second')
                 await self.refresh()
-                self.assertEqual(self.broker.select(), 'second')
-                self.assertEqual(self.store.get('account_status')['primary']['usage']['seven_day']['utilization'], 98)
+                self.assertEqual(self.broker.select(model='native-default'), 'second')
+                self.assertEqual(self.store.get('account_status')['primary']['usage']['seven_day']['utilization'], 99)
 
     async def test_cached_lower_reading_keeps_threshold_hold_and_runs_other_account(self):
         reset = self.store.get('account_status')['primary']['usage']['seven_day']['resets_at']
         with self.store.db:
             self.broker.record_rate_limit('primary', {'rateLimitType': 'seven_day',
-                                                     'utilization': .98, 'resetsAt': reset})
+                                                     'utilization': .99, 'resetsAt': reset})
         with patch('time.time', return_value=time.time() + 60):
             await self.refresh(used=96)
             self.assertEqual(self.broker.blocks()['primary']['reason'], 'threshold')
-            self.assertEqual(self.store.get('account_status')['primary']['usage']['seven_day']['utilization'], 98)
+            self.assertEqual(self.store.get('account_status')['primary']['usage']['seven_day']['utilization'], 99)
             await self.assert_next_run('second')
 
     async def test_cached_lower_reading_keeps_local_reserve_hold_and_runs_other_account(self):
@@ -148,13 +270,13 @@ class HeldAccountTests(AccountTestsSupport, unittest.IsolatedAsyncioTestCase):
         self.held()
         await self.refresh()
         await self.assert_next_run('primary')
-        for minute, used in ((10, 50), (20, 90), (30, 98)):
+        for minute, used in ((10, 50), (20, 90), (30, 99)):
             with patch('time.time', return_value=now + minute * 60):
                 await self.refresh(used=used)
         with patch('time.time', return_value=now + 35 * 60):
             await self.refresh(used=90)
-            self.assertEqual(self.broker.account_state('primary')['state'], 'limited')
-            self.assertEqual(self.store.get('account_status')['primary']['usage']['seven_day']['utilization'], 98)
+            self.assertEqual(self.broker.account_state('primary', 'native-default')['state'], 'limited')
+            self.assertEqual(self.store.get('account_status')['primary']['usage']['seven_day']['utilization'], 99)
             await self.assert_next_run('second')
 
     async def test_removed_reserve_clears_threshold_hold_after_quota_release(self):
@@ -169,11 +291,11 @@ class HeldAccountTests(AccountTestsSupport, unittest.IsolatedAsyncioTestCase):
             with patch('time.time', return_value=now + 25 * 60), self.store.db:
                 self.broker.record_rate_limit('primary', {'status': 'allowed_warning', 'rateLimitType': 'seven_day',
                                                          'utilization': .81, 'resetsAt': reset})
-            self.assertEqual(self.broker.account_state('primary')['state'], 'limited')
+            self.assertEqual(self.broker.account_state('primary', 'native-default')['state'], 'limited')
             reserve.clear()
             with patch('time.time', return_value=now + 30 * 60):
                 await self.refresh(used=81)
-                self.assertEqual(self.broker.select(), 'primary')
+                self.assertEqual(self.broker.select(model='native-default'), 'primary')
                 await self.assert_next_run('primary')
 
     async def test_untimed_threshold_clears_after_quota_release_and_new_window(self):
@@ -183,12 +305,12 @@ class HeldAccountTests(AccountTestsSupport, unittest.IsolatedAsyncioTestCase):
         await self.refresh()
         with patch('time.time', return_value=now + 25 * 60), self.store.db:
             self.broker.record_rate_limit('primary', {'status': 'allowed_warning', 'rateLimitType': 'seven_day',
-                                                     'utilization': .985})
-        self.assertEqual(self.broker.account_state('primary')['state'], 'limited')
+                                                     'utilization': .995})
+        self.assertEqual(self.broker.account_state('primary', 'native-default')['state'], 'limited')
         self.assertIsNone(self.broker.blocks()['primary']['until'])
         with patch('time.time', return_value=reset + 600):
             await self.refresh(used=5, reset=reset + 7 * 86400)
-            self.assertEqual(self.broker.select(), 'primary')
+            self.assertEqual(self.broker.select(model='native-default'), 'primary')
             await self.assert_next_run('primary')
 
     async def assert_quota_cached_weekly_stays_full(self, threshold, used, cached):
@@ -213,13 +335,13 @@ class HeldAccountTests(AccountTestsSupport, unittest.IsolatedAsyncioTestCase):
                 await self.assert_next_run('second')
 
     async def test_quota_cached_reading_keeps_weekly_threshold_after_five_hour_reset(self):
-        await self.assert_quota_cached_weekly_stays_full(.98, 98.5, 96)
+        await self.assert_quota_cached_weekly_stays_full(.99, 99.5, 96)
 
     async def test_quota_cached_reading_keeps_weekly_reserve_after_five_hour_reset(self):
         await self.assert_quota_cached_weekly_stays_full(.8, 81, 78)
 
     async def test_quota_release_trusts_only_the_named_window_and_keeps_other_cached_usage(self):
-        keys = ('five_hour', 'seven_day', 'seven_day_fable')
+        keys = ('seven_day', 'seven_day_fable')
         for named in (*keys, None):
             with self.subTest(named=named):
                 reset = time.time() + 3600
@@ -234,7 +356,7 @@ class HeldAccountTests(AccountTestsSupport, unittest.IsolatedAsyncioTestCase):
                     self.broker.record_rate_limit('primary', info, rejected=True)
                 await self.refresh(used=0, other=0)
                 usage = self.store.get('account_status')['primary']['usage']
-                self.assertEqual({key: window['utilization'] for key, window in usage.items()},
+                self.assertEqual({key: usage[key]['utilization'] for key in keys},
                                  {key: 0 if not named or key == named else 70 for key in keys})
                 await self.assert_next_run('primary')
 
@@ -248,7 +370,7 @@ class HeldAccountTests(AccountTestsSupport, unittest.IsolatedAsyncioTestCase):
         async def collect(account):
             return {'observed_at': time.time(), 'usage': {
                 key: {'utilization': 0, 'resets_at': time.time() + 1800}
-                for key in ('five_hour', 'seven_day', 'seven_day_fable')}}
+                for key in ('seven_day', 'seven_day_fable')}}
 
         await refresh_accounts(self.store, collect, aliases=['primary'])
         await self.assert_next_run('primary')
@@ -272,15 +394,15 @@ class HeldAccountTests(AccountTestsSupport, unittest.IsolatedAsyncioTestCase):
         result = await self.broker.run(run, 'claude', 'work', self.root, self.sid, fresh=True)
         self.assertTrue(result.success)
         self.assertEqual(launched, ['primary', 'second'])
-        self.assertEqual(self.broker.select(), 'second')
+        self.assertEqual(self.broker.select(model='native-default'), 'second')
         self.assertEqual(self.broker.blocks()['primary']['reason'], 'quota')
         self.broker = AccountBroker(self.store)
         await self.refresh()
-        self.assertEqual(self.broker.select(), 'second')
+        self.assertEqual(self.broker.select(model='native-default'), 'second')
         await self.refresh(other=1)
-        self.assertEqual(self.broker.select(), 'second')
+        self.assertEqual(self.broker.select(model='native-default'), 'second')
         await self.refresh(used=1)
-        self.assertEqual(self.broker.select(), 'primary')
+        self.assertEqual(self.broker.select(model='native-default'), 'primary')
 
     async def test_refused_reading_changes_reset_or_expires_at_refusal_reset(self):
         for change in ('reset', 'expiry'):
@@ -290,14 +412,14 @@ class HeldAccountTests(AccountTestsSupport, unittest.IsolatedAsyncioTestCase):
                 with self.store.db:
                     self.broker.record_rate_limit('primary', None, rejected=True)
                 await self.refresh()
-                self.assertEqual(self.broker.select(), 'second')
+                self.assertEqual(self.broker.select(model='native-default'), 'second')
                 if change == 'reset':
                     await self.refresh(reset=reset - SAME_WINDOW_SECONDS - 1)
                 else:
                     with patch('time.time', return_value=reset + 1):
                         await self.refresh()
-                        self.assertTrue(self.broker.available(self.store.get('accounts'), 'primary'))
-                self.assertEqual(self.broker.select(), 'primary')
+                        self.assertTrue(self.broker.available(self.store.get('accounts'), 'primary', model='native-default'))
+                self.assertEqual(self.broker.select(model='native-default'), 'primary')
 
     async def test_reset_drift_does_not_release_a_refused_reading_until_a_new_window(self):
         reset = self.held()
@@ -312,33 +434,11 @@ class HeldAccountTests(AccountTestsSupport, unittest.IsolatedAsyncioTestCase):
         await self.refresh(reset=reset + SAME_WINDOW_SECONDS + 1)
         await self.assert_next_run('primary')
 
-    async def test_five_hour_refusal_after_weekly_release_uses_its_own_reset(self):
-        weekly_reset = self.held()
-        await self.refresh()
-        five_reset = time.time() + 600
-        launched = []
-
-        async def run(provider, prompt, cwd, session_id, **options):
-            launched.append(options['account_alias'])
-            if options['account_alias'] == 'primary':
-                return RunResult(session_id, error='limit', quota_limited=True,
-                                 rate_limit_info={'rateLimitType': 'five_hour', 'resetsAt': five_reset},
-                                 transcript_path=str(self.transcript))
-            return RunResult(session_id, success=True)
-
-        result = await self.broker.run(run, 'claude', 'work', self.root, self.sid, fresh=True)
-        self.assertTrue(result.success)
-        self.assertEqual(launched, ['primary', 'second'])
-        self.assertLess(five_reset, weekly_reset)
-        self.assertEqual(self.broker.blocks()['primary']['until'], five_reset)
-        await self.refresh()
-        with patch('time.time', return_value=five_reset - 1):
-            self.assertIn('primary', self.broker.blocks())
-            await self.assert_next_run('second')
-        with patch('time.time', return_value=five_reset + 1):
-            await self.refresh()
-            self.assertNotIn('primary', self.broker.blocks())
-            await self.assert_next_run('primary')
+    async def test_five_hour_refusal_does_not_hold_or_switch(self):
+        self.broker.record_rate_limit('primary', {'rateLimitType': 'five_hour', 'utilization': 1,
+                                                  'resetsAt': time.time() + 600}, rejected=True)
+        self.assertNotIn('primary', self.broker.blocks())
+        self.assertEqual(self.broker.select(model='native-default'), 'primary')
 
     async def test_threshold_and_local_reserve_keep_holds_at_or_above_the_switch_point(self):
         for threshold, used in ((.98, 98), (.98, 100), (.8, 80), (.8, 81)):
@@ -346,7 +446,7 @@ class HeldAccountTests(AccountTestsSupport, unittest.IsolatedAsyncioTestCase):
                     'coordinator.accounts.temporary_local_switch_thresholds', return_value={'primary': threshold}):
                 self.held()
                 await self.refresh(used=used)
-                self.assertEqual(self.broker.select(), 'second')
+                self.assertEqual(self.broker.select(model='native-default'), 'second')
                 self.assertIn('primary', self.broker.blocks())
 
     async def test_error_with_under_limit_usage_keeps_timed_and_untimed_holds(self):
@@ -354,7 +454,7 @@ class HeldAccountTests(AccountTestsSupport, unittest.IsolatedAsyncioTestCase):
             with self.subTest(until=until):
                 self.held(until=until)
                 self.assertTrue(await self.refresh(error='usage_unavailable'))
-                self.assertEqual(self.broker.select(), 'second')
+                self.assertEqual(self.broker.select(model='native-default'), 'second')
                 self.assertIn('primary', self.broker.blocks())
 
 
@@ -365,7 +465,7 @@ class AccountTests(AccountTestsSupport, unittest.IsolatedAsyncioTestCase):
         self.meter('primary', 'seven_day', 100, reset)
         with self.store.db:
             self.broker.hold('primary', reset, 'quota')
-        self.assertEqual(self.broker.select(), 'second')
+        self.assertEqual(self.broker.select(model='native-default'), 'second')
 
         async def collect(account):
             return {'observed_at': time.time(), 'usage': {
@@ -373,7 +473,7 @@ class AccountTests(AccountTestsSupport, unittest.IsolatedAsyncioTestCase):
                 self.store.get('account_status')['primary']['usage'].items()}}
 
         await refresh_accounts(self.store, collect, aliases=['primary'])
-        self.assertEqual(self.broker.select(), 'primary')
+        self.assertEqual(self.broker.select(model='native-default'), 'primary')
         launched = []
 
         async def run(provider, prompt, cwd, session_id, **options):
@@ -390,12 +490,12 @@ class AccountTests(AccountTestsSupport, unittest.IsolatedAsyncioTestCase):
 
     async def test_documented_local_overrides_without_thresholds_keep_default(self):
         override = self.root / 'local-overrides.json'
-        override.write_text(json.dumps({'shared_mcp_servers': []}))
+        override.write_text(json.dumps({'unrelated_setting': []}))
         with patch('coordinator.accounts.LOCAL_OVERRIDES_PATH', override), \
                 patch.object(logging.getLogger('coordinator.accounts'), 'warning') as warning:
             for _ in range(50):
-                self.assertEqual(switch_threshold(self.store, 'primary'), .98)
-                self.assertEqual(self.broker.select(), 'primary')
+                self.assertEqual(switch_threshold(self.store, 'primary'), .99)
+                self.assertEqual(self.broker.select(model='native-default'), 'primary')
         warning.assert_not_called()
 
     async def test_invalid_local_overrides_warn_once_per_distinct_error_during_selection(self):
@@ -407,23 +507,23 @@ class AccountTests(AccountTestsSupport, unittest.IsolatedAsyncioTestCase):
                                     ('{broken', 3), ('null', 4)):
                 override.write_text(contents)
                 for _ in range(50):
-                    self.assertEqual(self.broker.select(), 'primary')
+                    self.assertEqual(self.broker.select(model='native-default'), 'primary')
                 self.assertEqual(warning.call_count, count)
             self.assertTrue(all(call.args[0] == 'invalid local account overrides: %s'
                                 for call in warning.call_args_list))
 
     async def test_valid_local_overrides_apply_during_repeated_selection_and_file_changes(self):
         override = self.root / 'local-overrides.json'
-        self.meter('primary', 'five_hour', 90, time.time() + 300)
+        self.meter('primary', 'seven_day', 90, time.time() + 300)
         with patch('coordinator.accounts.LOCAL_OVERRIDES_PATH', override), \
                 patch.object(logging.getLogger('coordinator.accounts'), 'warning') as warning:
             for threshold, selected in ((.8, 'second'), (.95, 'primary')):
-                override.write_text(json.dumps({'shared_mcp_servers': [],
+                override.write_text(json.dumps({'unrelated_setting': [],
                                                 'account_switch_thresholds': {'primary': threshold}}))
                 for _ in range(50):
                     self.assertEqual(switch_threshold(self.store, 'primary'), threshold)
-                    self.assertEqual(switch_threshold(self.store, 'second'), .98)
-                    self.assertEqual(self.broker.select(), selected)
+                    self.assertEqual(switch_threshold(self.store, 'second'), .99)
+                    self.assertEqual(self.broker.select(model='native-default'), selected)
         warning.assert_not_called()
 
     async def test_owner_pick_prefers_available_account_and_returns_after_each_pause(self):
@@ -440,9 +540,9 @@ class AccountTests(AccountTestsSupport, unittest.IsolatedAsyncioTestCase):
         for cause in ('limited', 'held', 'reserve', 'signed_out', 'disabled'):
             with self.subTest(cause=cause), patch('coordinator.accounts.temporary_local_switch_thresholds',
                     return_value={'second': .8} if cause == 'reserve' else {}):
-                self.assertEqual(self.broker.select(), 'second')
+                self.assertEqual(self.broker.select(model='native-default'), 'second')
                 if cause in ('limited', 'reserve'):
-                    self.meter('second', 'five_hour', 98 if cause == 'limited' else 81, time.time() + 1800)
+                    self.meter('second', 'seven_day', 99 if cause == 'limited' else 81, time.time() + 1800)
                 elif cause == 'held':
                     self.broker.hold('second', time.time() + 1800, 'quota')
                 elif cause == 'signed_out':
@@ -453,12 +553,12 @@ class AccountTests(AccountTestsSupport, unittest.IsolatedAsyncioTestCase):
                     accounts = self.store.get('accounts')
                     accounts['second']['enabled'] = False
                     self.store.put('accounts', accounts)
-                self.assertEqual(self.broker.select(), 'primary')
+                self.assertEqual(self.broker.select(model='native-default'), 'primary')
                 self.store.put('accounts', profiles)
                 self.store.put('account_status', baseline)
                 self.store.put('account_blocks', {})
-                self.assertEqual(self.broker.select(), 'second')
-        self.assertEqual(self.broker.select(attempted={'second'}), 'primary')
+                self.assertEqual(self.broker.select(model='native-default'), 'second')
+        self.assertEqual(self.broker.select(attempted={'second'}, model='native-default'), 'primary')
 
     async def test_workers_use_pick_and_finish_on_their_original_account(self):
         launched = []
@@ -470,7 +570,7 @@ class AccountTests(AccountTestsSupport, unittest.IsolatedAsyncioTestCase):
         result = await self.broker.run(run, 'claude', 'work', self.root, self.sid, fresh=True)
         self.assertTrue(result.success)
         self.assertEqual(launched, ['second'])
-        self.assertEqual(self.broker.select(), 'primary')
+        self.assertEqual(self.broker.select(model='native-default'), 'primary')
 
     async def test_pick_usage_switches_silently_to_a_spare_account(self):
         self.store.db.execute("INSERT INTO topics(id,chat,thread,name,cwd,enabled) VALUES ('home',1,1,'Home','',1)")
@@ -480,64 +580,64 @@ class AccountTests(AccountTestsSupport, unittest.IsolatedAsyncioTestCase):
             return [row['text'] for row in self.store.db.execute('SELECT text FROM outbox ORDER BY id')]
         reset = time.time() + 3600
         self.broker.record_rate_limit('second', {'rateLimitType': 'five_hour', 'utilization': .98, 'resetsAt': reset})
-        self.broker.activate()
+        self.broker.activate(model='native-default')
         self.assertEqual(notices(), [])
         self.store.put('account_blocks', {})
         self.meter('second', 'five_hour', 1, reset)
         for meter in ('seven_day', 'seven_day_fable'):
-            self.broker.record_rate_limit('second', {'rateLimitType': meter, 'utilization': .98, 'resetsAt': reset})
-            self.broker.activate()
-            self.broker.activate()
+            self.broker.record_rate_limit('second', {'rateLimitType': meter, 'utilization': .99, 'resetsAt': reset})
+            self.broker.activate(model='native-default')
+            self.broker.activate(model='native-default')
             self.assertEqual(notices(), [])
-            self.assertEqual(self.broker.select(), 'primary')
+            self.assertEqual(self.broker.select(model='native-default'), 'primary')
             if meter == 'seven_day':
                 self.broker.record_rate_limit('second', {'rateLimitType': 'seven_day_fable',
-                    'utilization': .98, 'resetsAt': reset})
-                self.broker.activate()
+                    'utilization': .99, 'resetsAt': reset})
+                self.broker.activate(model='native-default')
                 self.assertEqual(notices(), [])
                 self.meter('second', 'seven_day_fable', 1, reset)
             self.store.put('account_blocks', {})
             self.meter('second', meter, 1, reset)
-            self.broker.activate()
-        self.assertEqual(self.broker.select(), 'second')
+            self.broker.activate(model='native-default')
+        self.assertEqual(self.broker.select(model='native-default'), 'second')
 
     async def test_local_threshold_override_is_optional_and_alias_scoped(self):
         override = self.root / 'local-overrides.json'
         with patch('coordinator.accounts.LOCAL_OVERRIDES_PATH', override):
-            self.assertEqual(switch_threshold(self.store, 'orbit'), .98)
+            self.assertEqual(switch_threshold(self.store, 'orbit'), .99)
             override.write_text(json.dumps({'account_switch_thresholds': {'orbit': .8}}))
             self.assertEqual(switch_threshold(self.store, 'orbit'), .8)
-            self.assertEqual(switch_threshold(self.store, 'primary'), .98)
+            self.assertEqual(switch_threshold(self.store, 'primary'), .99)
             override.write_text('{broken')
             with self.assertLogs('coordinator.accounts', level='WARNING'):
-                self.assertEqual(switch_threshold(self.store, 'orbit'), .98)
+                self.assertEqual(switch_threshold(self.store, 'orbit'), .99)
             override.write_text(json.dumps({'account_switch_thresholds': {'orbit': True}}))
             with self.assertLogs('coordinator.accounts', level='WARNING'):
-                self.assertEqual(switch_threshold(self.store, 'orbit'), .98)
+                self.assertEqual(switch_threshold(self.store, 'orbit'), .99)
 
     async def test_retry_skip_and_empty_selection_logs_name_the_actual_cause(self):
         accounts = self.store.get('accounts')
         with self.store.db:
             self.store.put('active_account', 'primary')
-        self.assertEqual(self.broker.selection_reason(accounts, 'primary', {'primary'}), 'reason=attempted')
+        self.assertEqual(self.broker.selection_reason(accounts, 'primary', {'primary'}, model='native-default'), 'reason=attempted')
         with self.assertLogs('coordinator.accounts', level='INFO') as logs:
-            self.assertEqual(self.broker.activate(accounts, {'primary'}), 'second')
+            self.assertEqual(self.broker.activate(accounts, {'primary'}, model='native-default'), 'second')
         self.assertIn('reason=attempted', logs.output[0])
         with self.store.db:
             self.store.put('active_account', 'primary')
         now = time.time()
         for alias in accounts:
-            self.meter(alias, 'seven_day', 98, now + 120)
+            self.meter(alias, 'seven_day', 99, now + 120)
             self.meter(alias, 'five_hour', 10, now + 120)
             self.meter(alias, 'seven_day_fable', 10, now + 120)
         with self.assertLogs('coordinator.accounts', level='INFO') as logs:
-            self.assertIsNone(self.broker.activate(accounts))
+            self.assertIsNone(self.broker.activate(accounts, model='native-default'))
         self.assertIn('no eligible account from=primary@example.com', logs.output[0])
         self.assertNotIn('to=None', logs.output[0])
         for alias in accounts:
             self.meter(alias, 'seven_day', 10, now + 120)
         with self.assertLogs('coordinator.accounts', level='INFO') as logs:
-            self.assertEqual(self.broker.activate(accounts), 'primary')
+            self.assertEqual(self.broker.activate(accounts, model='native-default'), 'primary')
         self.assertIn('reason=account_available', logs.output[0])
 
     async def test_local_threshold_changes_fullness_selection_and_reset_for_each_window(self):
@@ -552,16 +652,39 @@ class AccountTests(AccountTestsSupport, unittest.IsolatedAsyncioTestCase):
             self.store.put('account_status', status)
         now = time.time()
         with patch('coordinator.accounts.LOCAL_OVERRIDES_PATH', override):
-            for window in ('five_hour', 'seven_day', 'seven_day_fable'):
+            for window in ('seven_day',):
                 self.meter('orbit', window, 80, now + 300)
                 self.meter('primary', window, 80, now + 200)
-                self.assertTrue(self.broker.is_full('orbit'), window)
-                self.assertFalse(self.broker.is_full('primary'), window)
-                self.assertFalse(self.broker.available(accounts, 'orbit'), window)
-                self.assertNotEqual(self.broker.select(accounts), 'orbit')
-                self.assertEqual(self.broker.earliest_reset({'orbit': accounts['orbit']}), now + 300)
+                self.assertTrue(self.broker.is_full('orbit', 'native-default'), window)
+                self.assertFalse(self.broker.is_full('primary', 'native-default'), window)
+                self.assertFalse(self.broker.available(accounts, 'orbit', model='native-default'), window)
+                self.assertNotEqual(self.broker.select(accounts, model='native-default'), 'orbit')
+                self.assertEqual(self.broker.earliest_reset({'orbit': accounts['orbit']}, model='native-default'), now + 300)
                 self.meter('orbit', window, 10, now + 300)
                 self.meter('primary', window, 10, now + 200)
+            self.meter('orbit', 'seven_day_fable', 85, now + 300)
+            self.assertFalse(self.broker.is_full('orbit', 'native-default'))
+            self.meter('orbit', 'seven_day_fable', 99, now + 300)
+            self.assertTrue(self.broker.is_full('orbit', 'native-default'))
+
+    async def test_reserve_applies_only_to_the_all_model_meter(self):
+        override = self.root / 'local-overrides.json'
+        override.write_text(json.dumps({'account_switch_thresholds': {'primary': .8}}))
+        accounts = self.store.get('accounts')
+        now = time.time()
+        with patch('coordinator.accounts.LOCAL_OVERRIDES_PATH', override):
+            self.assertEqual(switch_threshold(self.store, 'primary', 'seven_day_fable'), .99)
+            self.assertEqual(switch_threshold(self.store, 'primary', 'seven_day'), .8)
+            self.meter('primary', 'seven_day_fable', 85, now + 300)
+            self.meter('primary', 'seven_day', 60, now + 300)
+            for model in ('fable', 'opus'):
+                self.assertEqual(self.broker.account_state('primary', model)['state'], 'available', model)
+            self.meter('primary', 'seven_day', 81, now + 300)
+            for model in ('fable', 'opus'):
+                self.assertEqual(self.broker.account_state('primary', model)['state'], 'limited', model)
+            self.meter('second', 'seven_day_fable', 85, now + 300)
+            self.meter('second', 'seven_day', 85, now + 300)
+            self.assertEqual(self.broker.account_state('second', 'fable')['state'], 'available')
 
     async def test_removing_override_releases_threshold_block_and_reserve_label(self):
         from coordinator.control_ui import _accounts_view
@@ -569,14 +692,14 @@ class AccountTests(AccountTestsSupport, unittest.IsolatedAsyncioTestCase):
         override = self.root / 'local-overrides.json'
         override.write_text(json.dumps({'account_switch_thresholds': {'primary': .8}}))
         with patch('coordinator.accounts.LOCAL_OVERRIDES_PATH', override):
-            self.meter('primary', 'five_hour', 80, time.time() + 300)
-            self.broker.record_rate_limit('primary', {'rateLimitType': 'five_hour',
+            self.meter('primary', 'seven_day', 80, time.time() + 300)
+            self.broker.record_rate_limit('primary', {'rateLimitType': 'seven_day',
                                                        'utilization': .8, 'resetsAt': time.time() + 300})
             self.assertIn('reserve 20%', _accounts_view(self.store, 0)[0])
             self.assertIn('reserve 20% (local override)', _accounts(self.store))
-            self.assertTrue(self.broker.is_full('primary'))
+            self.assertTrue(self.broker.is_full('primary', 'native-default'))
             override.unlink()
-            self.assertFalse(self.broker.is_full('primary'))
+            self.assertFalse(self.broker.is_full('primary', 'native-default'))
             self.assertNotIn('reserve', _accounts_view(self.store, 0)[0])
 
     async def test_quota_worker_resumes_same_session_on_second_account(self):
@@ -586,7 +709,7 @@ class AccountTests(AccountTestsSupport, unittest.IsolatedAsyncioTestCase):
             calls.append((provider, prompt, sid, options.copy()))
             if len(calls) == 1:
                 return RunResult(sid, pid=42, quota_limited=True,
-                                 rate_limit_info={'status': 'rejected', 'rateLimitType': 'five_hour',
+                                 rate_limit_info={'status': 'rejected', 'rateLimitType': 'seven_day',
                                                   'resetsAt': time.time() + 3600},
                                  transcript_path=str(self.transcript))
             return RunResult(sid, success=True, transcript_path=str(self.transcript))
@@ -653,26 +776,26 @@ class AccountTests(AccountTestsSupport, unittest.IsolatedAsyncioTestCase):
             result = await self.broker.run(run, 'claude', 'work', self.root, self.sid, fresh=False)
         self.assertEqual(result.failure_code, 'transcript_missing')
 
-    async def test_a_warning_below_98_percent_records_usage_without_blocking(self):
+    async def test_a_warning_below_99_percent_records_usage_without_blocking(self):
         async def run(provider, prompt, cwd, sid, **options):
             return RunResult(sid, success=True, rate_limit_info={
                 'status': 'allowed_warning', 'rateLimitType': 'seven_day', 'utilization': .8})
         await self.broker.run(run, 'claude', 'work', self.root, self.sid, fresh=False)
         self.assertEqual(self.store.get('account_status')['primary']['usage']['seven_day']['utilization'], 80)
         self.assertEqual(self.store.get('account_blocks', {}), {})
-        self.assertEqual(self.broker.select(), 'primary')
+        self.assertEqual(self.broker.select(model='native-default'), 'primary')
 
-    async def test_a_stream_five_hour_reading_at_98_percent_excludes_the_account(self):
+    async def test_old_five_hour_readings_do_not_exclude_an_account(self):
+        self.meter('primary', 'five_hour', 100, time.time() + 1800)
         self.broker.record_rate_limit('primary', {'status': 'allowed_warning', 'rateLimitType': 'five_hour',
                                                   'utilization': .98, 'resetsAt': time.time() + 1800})
-        self.assertEqual(self.store.get('account_status')['primary']['usage']['five_hour']['utilization'], 98)
-        self.assertEqual(self.broker.select(), 'second')
+        self.assertEqual(self.broker.select(model='native-default'), 'primary')
 
     async def test_expired_blocks_are_pruned_and_committed_on_read(self):
         with self.store.db:
             self.store.put('account_blocks', {'primary': {'until': time.time() - 5},
                                               'second': {'until': time.time() + 600}})
-        self.assertEqual(self.broker.select(), 'primary')
+        self.assertEqual(self.broker.select(model='native-default'), 'primary')
         self.assertFalse(self.store.db.in_transaction)
         self.assertEqual(list(self.store.get('account_blocks')), ['second'])
 
@@ -688,16 +811,12 @@ class AccountTests(AccountTestsSupport, unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(self.store.get('marker'))
         self.assertEqual(self.store.get('account_blocks'), expired)
 
-    async def test_legacy_home_transcript_resumes_after_its_placeholder_is_dropped(self):
+    async def test_legacy_home_transcript_resumes(self):
         home = self.root / 'home'
         legacy = home / '.claude' / 'projects' / 'old-project' / (self.sid + '.jsonl')
         legacy.parent.mkdir(parents=True)
         legacy.write_text('{}\n')
         self.transcript.unlink()
-        with self.store.db:
-            self.store.put('accounts', {'home-login-needs-name': {'config_dir': str(home / '.claude'),
-                                                                  'enabled': False, 'needs_name': True},
-                                        **self.store.get('accounts')})
         discover_accounts(self.store, self.root / 'missing')
         calls = []
 
@@ -730,7 +849,7 @@ class AccountTests(AccountTestsSupport, unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result.success)
         self.assertEqual(sorted(calls), ['primary', 'second'])
         self.assertEqual(sorted(self.store.get('account_blocks')), ['primary', 'second'])
-        self.assertIsNone(self.broker.select())
+        self.assertIsNone(self.broker.select(model='native-default'))
 
     async def test_a_single_model_weekly_warning_leaves_the_three_meters_alone(self):
         for limit_type in ('seven_day_opus', 'seven_day_sonnet', 'overage'):
@@ -738,32 +857,32 @@ class AccountTests(AccountTestsSupport, unittest.IsolatedAsyncioTestCase):
                 self.broker.record_rate_limit('primary', {'status': 'allowed_warning', 'rateLimitType': limit_type,
                                                           'utilization': .96, 'resetsAt': time.time() + 5 * 86400})
             usage = self.store.get('account_status')['primary']['usage']
-            self.assertEqual([usage[key]['utilization'] for key in ('five_hour', 'seven_day', 'seven_day_fable')],
-                             [10, 10, 10], limit_type)
-            self.assertEqual(self.broker.select(), 'primary', limit_type)
+            self.assertEqual([usage[key]['utilization'] for key in ('seven_day', 'seven_day_fable')],
+                             [10, 10], limit_type)
+            self.assertEqual(self.broker.select(model='native-default'), 'primary', limit_type)
         with self.store.db:
             self.broker.record_rate_limit('primary', {'status': 'rejected', 'rateLimitType': 'seven_day_opus'}, True)
-        self.assertEqual(self.broker.select(), 'second')
+        self.assertEqual(self.broker.select(model='native-default'), 'second')
 
-    async def test_a_fable_weekly_warning_at_98_percent_fills_the_fable_meter(self):
+    async def test_a_fable_weekly_warning_at_99_percent_fills_the_fable_meter(self):
         with self.store.db:
             self.broker.record_rate_limit('primary', {'status': 'allowed_warning',
                                                       'rateLimitType': 'seven_day_overage_included',
-                                                      'utilization': .98, 'resetsAt': time.time() + 3 * 86400})
-        self.assertEqual(self.store.get('account_status')['primary']['usage']['seven_day_fable']['utilization'], 98)
-        self.assertTrue(self.broker.is_full('primary'))
-        self.assertEqual(self.broker.select(), 'second')
+                                                      'utilization': .99, 'resetsAt': time.time() + 3 * 86400})
+        self.assertEqual(self.store.get('account_status')['primary']['usage']['seven_day_fable']['utilization'], 99)
+        self.assertTrue(self.broker.is_full('primary', 'native-default'))
+        self.assertEqual(self.broker.select(model='native-default'), 'second')
 
     async def test_the_first_event_of_a_new_window_does_not_bring_back_the_old_reading(self):
         now = time.time()
-        self.meter('primary', 'five_hour', 97, now - 10)
-        self.assertEqual(self.broker.select(), 'primary')
+        self.meter('primary', 'seven_day', 97, now - 10)
+        self.assertFalse(self.broker.is_full('primary', 'native-default'))
         with self.store.db:
-            self.broker.record_rate_limit('primary', {'status': 'allowed', 'rateLimitType': 'five_hour',
+            self.broker.record_rate_limit('primary', {'status': 'allowed', 'rateLimitType': 'seven_day',
                                                       'resetsAt': int(now) + 5 * 3600})
-        self.assertEqual(self.store.get('account_status')['primary']['usage']['five_hour'],
+        self.assertEqual(self.store.get('account_status')['primary']['usage']['seven_day'],
                          {'resets_at': int(now) + 5 * 3600})
-        self.assertFalse(self.broker.is_full('primary'))
+        self.assertFalse(self.broker.is_full('primary', 'native-default'))
 
     async def test_rejection_without_reset_time_holds_through_the_next_usage_check(self):
         with self.store.db:
@@ -772,46 +891,48 @@ class AccountTests(AccountTestsSupport, unittest.IsolatedAsyncioTestCase):
         status['primary']['observed_at'] = time.time() + 1
         with self.store.db:
             self.store.put('account_status', status)
-        self.assertEqual(self.broker.select(), 'second')
+        self.assertEqual(self.broker.select(model='native-default'), 'second')
         later = time.time() + AccountBroker.REJECTION_HOLD_SECONDS + 1
         with patch('coordinator.accounts.time.time', return_value=later):
-            self.assertEqual(self.broker.select(), 'primary')
+            self.assertEqual(self.broker.select(model='native-default'), 'primary')
 
     async def test_threshold_block_without_reset_clears_on_a_newer_usage_check(self):
         with self.store.db:
-            self.broker.record_rate_limit('primary', {'status': 'allowed_warning', 'utilization': .98})
-        self.assertEqual(self.broker.select(), 'second')
+            self.broker.record_rate_limit('primary', {'status': 'allowed_warning', 'utilization': .99})
+        self.assertEqual(self.broker.select(model='native-default'), 'second')
         status = self.store.get('account_status')
         status['primary']['observed_at'] = time.time() + 1
         status['primary']['usage']['seven_day']['utilization'] = 20
         with self.store.db:
             self.store.put('account_status', status)
-        self.assertEqual(self.broker.select(), 'primary')
+        self.assertEqual(self.broker.select(model='native-default'), 'primary')
 
-    async def test_any_meter_at_98_percent_excludes_account_and_97_stays_eligible(self):
+    async def test_any_meter_at_99_percent_excludes_account_and_98_stays_eligible(self):
         resets_at = time.time() + 120
-        for key in ('five_hour', 'seven_day', 'seven_day_fable'):
+        for key in ('seven_day', 'seven_day_fable'):
             self.meter('primary', key, 97, resets_at)
-            self.assertEqual(self.broker.select(), 'primary', key)
+            self.assertEqual(self.broker.select(model='native-default'), 'primary', key)
             self.meter('primary', key, 98, resets_at)
-            self.assertEqual(self.broker.select(), 'second', key)
-            self.assertEqual(self.broker.account_state('primary')['state'], 'limited', key)
+            self.assertEqual(self.broker.select(model='native-default'), 'primary', key)
+            self.meter('primary', key, 99, resets_at)
+            self.assertEqual(self.broker.select(model='native-default'), 'second', key)
+            self.assertEqual(self.broker.account_state('primary', 'native-default')['state'], 'limited', key)
             self.meter('primary', key, 10, resets_at)
 
     async def test_a_full_meter_whose_reset_has_passed_does_not_block(self):
-        for key in ('five_hour', 'seven_day', 'seven_day_fable'):
+        for key in ('seven_day', 'seven_day_fable'):
             self.meter('primary', key, 99, time.time() - 1)
-        self.assertEqual(self.broker.account_state('primary'), {'state': 'available'})
-        self.assertTrue(self.broker.available(self.store.get('accounts'), 'primary'))
+        self.assertEqual(self.broker.account_state('primary', 'native-default'), {'state': 'available'})
+        self.assertTrue(self.broker.available(self.store.get('accounts'), 'primary', model='native-default'))
 
     async def test_earliest_reset_is_the_soonest_account_to_clear_all_its_limits(self):
         now = time.time()
-        self.meter('primary', 'seven_day', 98, now + 300)
-        self.meter('second', 'five_hour', 98, now + 200)
+        self.meter('primary', 'seven_day', 99, now + 300)
+        self.meter('second', 'seven_day', 99, now + 200)
         with self.store.db:
             self.store.put('account_blocks', {'primary': {'until': now + 100, 'reason': 'quota'}})
-        self.assertIsNone(self.broker.select())
-        self.assertEqual(self.broker.earliest_reset(), now + 200)
+        self.assertIsNone(self.broker.select(model='native-default'))
+        self.assertEqual(self.broker.earliest_reset(model='native-default'), now + 200)
 
     async def test_restart_discovery_ignores_live_like_unregistered_hidden_folder(self):
         root = self.root / 'hidden-profiles'
@@ -931,7 +1052,7 @@ class AccountTests(AccountTestsSupport, unittest.IsolatedAsyncioTestCase):
         now = time.time()
         self.meter('primary', 'seven_day', 40, now - 60)
         self.meter('second', 'seven_day', 40, now + 2 * 86400)
-        self.assertEqual(self.broker.select(), 'second')
+        self.assertEqual(self.broker.select(model='native-default'), 'second')
 
     async def test_selection_uses_soonest_all_model_weekly_reset(self):
         status = self.store.get('account_status')
@@ -940,80 +1061,77 @@ class AccountTests(AccountTestsSupport, unittest.IsolatedAsyncioTestCase):
         status['second']['usage']['seven_day']['resets_at'] = now + 1000
         with self.store.db:
             self.store.put('account_status', status)
-        self.assertEqual(self.broker.select(), 'second')
+        self.assertEqual(self.broker.select(model='native-default'), 'second')
 
     async def test_stale_usage_still_chooses_by_last_known_meters_and_disabled_never_starts(self):
         status = self.store.get('account_status')
         for alias in ('primary', 'second'):
             status[alias]['observed_at'] = time.time() - 3600
-        status['primary']['usage']['seven_day']['utilization'] = 98
+        status['primary']['usage']['seven_day']['utilization'] = 99
         with self.store.db:
             self.store.put('account_status', status)
-        self.assertEqual(self.broker.account_state('primary')['state'], 'limited')
-        self.assertEqual(self.broker.account_state('second')['state'], 'stale')
-        self.assertEqual(self.broker.select(), 'second')
+        self.assertEqual(self.broker.account_state('primary', 'native-default')['state'], 'limited')
+        self.assertEqual(self.broker.account_state('second', 'native-default')['state'], 'stale')
+        self.assertEqual(self.broker.select(model='native-default'), 'second')
         with self.store.db:
             accounts = self.store.get('accounts')
             accounts['second']['enabled'] = False
             self.store.put('accounts', accounts)
-        self.assertIsNone(self.broker.select())
-        self.assertEqual(self.broker.earliest_reset(), status['primary']['usage']['seven_day']['resets_at'])
+        self.assertIsNone(self.broker.select(model='native-default'))
+        self.assertEqual(self.broker.earliest_reset(model='native-default'), status['primary']['usage']['seven_day']['resets_at'])
 
     async def test_earliest_reset_survives_an_account_whose_usage_was_reset(self):
         from coordinator.controls import op_account_reset
         status = self.store.get('account_status')
-        status['second']['usage']['five_hour']['utilization'] = 100
+        status['second']['usage']['seven_day']['utilization'] = 100
         with self.store.db:
             self.store.put('account_status', status)
             op_account_reset(self.store, None, 'primary')
-        self.assertEqual(self.broker.select(), 'primary')
-        self.assertEqual(self.broker.earliest_reset(), status['second']['usage']['five_hour']['resets_at'])
+        self.assertEqual(self.broker.select(model='native-default'), 'primary')
+        self.assertEqual(self.broker.earliest_reset(model='native-default'), status['second']['usage']['seven_day']['resets_at'])
 
     async def test_signed_out_default_accounts_are_dropped(self):
         with self.store.db:
             self.store.put('accounts', {'default': {'config_dir': str(self.root), 'enabled': True},
-                                        'home-login-needs-name': {'config_dir': str(self.root), 'enabled': False},
                                         **self.store.get('accounts')})
             self.store.put('account_status', {'default': {'identity': {'logged_in': False}},
-                                              'home-login-needs-name': {'identity': {'logged_in': False}},
                                               **self.store.get('account_status')})
             self.store.put('active_account', 'primary')
         discover_accounts(self.store, self.root / 'missing')
         self.assertNotIn('default', self.store.get('accounts'))
-        self.assertNotIn('home-login-needs-name', self.store.get('accounts'))
         self.assertNotIn('default', self.store.get('account_status'))
 
     def test_activate_reselects_free_accounts_and_logs_only_changes(self):
         with self.store.db:
             self.store.put('active_account', 'second')
         with self.assertLogs('coordinator.accounts', level='INFO') as logs:
-            self.assertEqual(self.broker.activate(), 'primary')
-            self.assertEqual(self.broker.activate(), 'primary')
+            self.assertEqual(self.broker.activate(model='native-default'), 'primary')
+            self.assertEqual(self.broker.activate(model='native-default'), 'primary')
         self.assertEqual(len(logs.output), 1)
         self.assertIn('from=second@example.com to=primary@example.com reason=sooner_reset', logs.output[0])
-        self.assertEqual(listed_accounts(self.store)[1], 'primary')
+        self.assertEqual(listed_accounts(self.store, 'native-default')[1], 'primary')
         with patch.object(self.store, 'put', wraps=self.store.put) as put:
-            self.assertEqual(self.broker.activate(), 'primary')
+            self.assertEqual(self.broker.activate(model='native-default'), 'primary')
         put.assert_not_called()
 
     def test_each_meter_crossing_is_logged_once_and_rotation_explains_it(self):
-        self.broker.activate()
+        self.broker.activate(model='native-default')
         reset = time.time() + 3600
         with self.assertLogs('coordinator.accounts', level='INFO') as logs:
-            for meter in ('five_hour', 'seven_day', 'seven_day_fable'):
-                for used in (97, 98):
+            for meter in ('seven_day', 'seven_day_fable'):
+                for used in (98, 99):
                     self.broker.record_usage('primary', {meter: {'utilization': used, 'resets_at': reset}})
-            self.assertEqual(self.broker.activate(), 'second')
+            self.assertEqual(self.broker.activate(model='native-default'), 'second')
         crossings = [line for line in logs.output if 'switch point crossed' in line]
-        self.assertEqual(len(crossings), 3)
-        for meter in ('five_hour', 'seven_day', 'seven_day_fable'):
+        self.assertEqual(len(crossings), 2)
+        for meter in ('seven_day', 'seven_day_fable'):
             self.assertEqual(sum('meter=' + meter + ' ' in line for line in crossings), 1)
-        self.assertIn('reason=five_hour used_pct=98 switch_point_pct=98.0 reset=', logs.output[-1])
+        self.assertIn('reason=seven_day used_pct=99 switch_point_pct=99.0 reset=', logs.output[-1])
         self.assertTrue(all('account=primary@example.com' in line for line in crossings))
 
     def test_native_rate_limit_crossing_and_hold_are_logged_once(self):
         reset = time.time() + 3600
-        info = {'rateLimitType': 'five_hour', 'utilization': .98, 'resetsAt': reset}
+        info = {'rateLimitType': 'seven_day', 'utilization': .99, 'resetsAt': reset}
         with self.assertLogs('coordinator.accounts', level='INFO') as logs:
             self.broker.record_rate_limit('primary', info)
             self.broker.record_rate_limit('primary', info)
@@ -1023,11 +1141,11 @@ class AccountTests(AccountTestsSupport, unittest.IsolatedAsyncioTestCase):
     async def test_poll_and_native_rate_limit_share_crossing_detection(self):
         reset = time.time() + 3600
         async def collect(account):
-            return {'usage': {'seven_day': {'utilization': 98, 'resets_at': reset}}}
+            return {'usage': {'seven_day': {'utilization': 99, 'resets_at': reset}}}
         with self.assertLogs('coordinator.accounts', level='INFO') as logs:
             await refresh_accounts(self.store, collect, aliases=['primary'])
             await refresh_accounts(self.store, collect, aliases=['primary'])
-            self.broker.record_rate_limit('primary', {'rateLimitType': 'seven_day', 'utilization': .98, 'resetsAt': reset})
+            self.broker.record_rate_limit('primary', {'rateLimitType': 'seven_day', 'utilization': .99, 'resetsAt': reset})
         self.assertEqual(sum('switch point crossed' in line for line in logs.output), 1)
 
     def test_activate_logs_hold_disabled_and_signed_out_reasons(self):
@@ -1043,17 +1161,17 @@ class AccountTests(AccountTestsSupport, unittest.IsolatedAsyncioTestCase):
                     self.store.put('active_account', 'primary')
                     self.store.put('account_blocks', {'primary': {'reason': 'quota', 'until': time.time() + 600}} if reason == 'hold' else {})
                 with self.assertLogs('coordinator.accounts', level='INFO') as logs:
-                    self.assertEqual(self.broker.activate(), 'second')
+                    self.assertEqual(self.broker.activate(model='native-default'), 'second')
                 self.assertIn('reason=' + reason, logs.output[0])
                 if reason == 'hold':
                     self.assertIn('hold_reason=quota until=', logs.output[0])
 
     async def test_discovery_reselects_the_soonest_account(self):
-        self.assertEqual(self.broker.select(), 'primary')
+        self.assertEqual(self.broker.select(model='native-default'), 'primary')
         with self.store.db:
             self.store.put('active_account', 'second')
         discover_accounts(self.store, self.root / 'missing')
-        self.assertEqual(AccountBroker(self.store).activate(), 'primary')
+        self.assertEqual(AccountBroker(self.store).activate(model='native-default'), 'primary')
 
     async def test_accounts_display_email_and_an_unreadable_identity_is_not_listed(self):
         status = self.store.get('account_status')
@@ -1061,7 +1179,7 @@ class AccountTests(AccountTestsSupport, unittest.IsolatedAsyncioTestCase):
         with self.store.db:
             self.store.put('account_status', status)
         self.assertEqual(account_label(self.store, 'primary'), 'primary@example.com')
-        self.assertNotIn('second', listed_accounts(self.store)[0])
+        self.assertNotIn('second', listed_accounts(self.store, 'native-default')[0])
 
     async def test_a_profile_without_a_signed_in_login_is_not_listed_or_chosen(self):
         spare = self.root / 'spare'
@@ -1075,8 +1193,8 @@ class AccountTests(AccountTestsSupport, unittest.IsolatedAsyncioTestCase):
             status['second']['identity'] = {'logged_in': False}
             status['second']['error'] = 'login_required'
             self.store.put('account_status', status)
-        self.assertEqual(listed_accounts(self.store), (['primary'], None))
-        self.assertIsNone(self.broker.select())
+        self.assertEqual(listed_accounts(self.store, 'native-default'), (['primary'], None))
+        self.assertIsNone(self.broker.select(model='native-default'))
 
     def test_every_claude_environment_names_the_profile_and_drops_service_and_login_variables(self):
         leaked = {'CLAUDE_CONFIG_DIR': '/home-login', 'CMUX_SOCKET_PATH': 'x', 'CODEX_THREAD_ID': 'x',

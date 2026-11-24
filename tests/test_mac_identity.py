@@ -7,7 +7,6 @@ import os
 from pathlib import Path
 import plistlib
 import runpy
-import sys
 import tempfile
 from types import SimpleNamespace
 import unittest
@@ -20,18 +19,11 @@ UNCHANGED = ('scripts/pin-release.py', 'coordinator/transcribe.py',
 
 
 def mac_outputs():
-    from coordinator import health, policy, providers, service
+    from coordinator import health, host_os, providers, service
     with ExitStack() as stack:
-        if 'coordinator.host_os' in sys.modules:
-            stack.enter_context(patch('coordinator.host_os.SYSTEM', 'darwin'))
-        stack.enter_context(patch('sys.platform', 'darwin'))
+        stack.enter_context(patch.object(host_os, 'SYSTEM', 'darwin'))
         stack.enter_context(patch('pwd.getpwuid', return_value=SimpleNamespace(pw_dir='/fixture/home', pw_name='owner')))
-        values = runpy.run_path(str(ROOT / 'coordinator/policy.py'), run_name='coordinator._capture')['COORDINATOR_POLICY']
-        deletion = runpy.run_path(str(ROOT / 'coordinator/policy.py'), run_name='coordinator._capture')['DELETION_POLICY']
-        with patch.object(policy, 'DELETION_POLICY', deletion), \
-                patch('pathlib.Path.is_file', return_value=False):
-            worker = runpy.run_path(str(ROOT / 'coordinator/workers.py'), run_name='coordinator._capture')['WORKER_POLICY']
-        output = {'coordinator_policy': values, 'worker_policy': worker}
+        output = {}
         with tempfile.TemporaryDirectory() as temporary:
             home = Path(temporary)
             def normalize(value):
@@ -43,8 +35,7 @@ def mac_outputs():
                 with patch('pathlib.Path.home', return_value=home), patch('sys.executable', '/fixture/python'), \
                      patch('sys.argv', ['install-service.py']), patch('os.getuid', return_value=501), \
                      patch.dict(os.environ, {}, clear=True), \
-                     patch.dict(installer['main'].__globals__, unload=lambda *args: None,
-                                wait_for_start=lambda *args: None), \
+                     patch.object(host_os, 'unload_launchd'), patch.object(host_os, 'wait_for_launchd_start'), \
                      patch('subprocess.run') as run, redirect_stdout(printed):
                     installer['main']()
                 output['installer_stdout'] = normalize(printed.getvalue())
@@ -68,8 +59,8 @@ def mac_outputs():
                     ('vm_stat',): 'page size of 4096 bytes\nPages free: 1048576.\nPages inactive: 1048576.\n',
                     ('memory_pressure', '-Q'): 'System-wide memory free percentage: 36%',
                     ('sysctl', '-n', 'vm.swapusage'): 'used = 256.00M'}.get(args, '')
-        with patch.object(health, '_command', side_effect=command), \
-             patch.object(health.os, 'getloadavg', return_value=(2.5, 1, 1)):
+        with patch.object(host_os, '_probe_output', side_effect=command), \
+             patch.object(host_os.os, 'getloadavg', return_value=(2.5, 1, 1)):
             pressure = health.system_pressure('/state')
         output['health'] = health.format_health([], [], pressure, 'No accounts')
         with patch('subprocess.run', return_value=SimpleNamespace(stdout='{ sec = 123, usec = 456 }')) as run:

@@ -3,16 +3,20 @@
 import asyncio
 import json
 import logging
+import shutil
 import sqlite3
+import time
 import uuid
 
 from . import problems
 from .accounts import AccountBroker
 from .host import HostClient
-from .policy import PARENT_EFFORT, default_coordinator_model
+from .policy import COORDINATOR_MODEL, PARENT_EFFORT
 
 
 logger = logging.getLogger(__name__)
+FAILED_START_SECONDS = 900
+FAILED_START_MAX_SECONDS = 24 * 3600
 RESTART_TASKS = 50
 RESTART_TASK_TITLE = 200
 RESTART_WORKERS = 30
@@ -25,20 +29,20 @@ LOST_TURN = ('Your last turn stopped before it finished. These messages are alre
              'and have no reply: %s. Check what you already did for them, then answer them.')
 
 
+def key_topic(store, key):
+    """The chat topic of a parent session key."""
+    return (store.get('coordinator_session_topic') or store.get('coordinator_home_topic')
+            if key == 'coordinator' else key.split(':', 1)[1])
+
+
 def topic_enabled(store, key):
-    topic = (store.get('coordinator_session_topic') or store.get('coordinator_home_topic')
-             if key == 'coordinator' else key.split(':', 1)[1])
+    topic = key_topic(store, key)
     config = store.topic(topic) if topic else None
     return topic is None or topic == store.get('coordinator_home_topic') or bool(config and config['enabled'])
 
 
-def opencode_pick_problem(store, key):
+def opencode_pick_problem(store):
     from . import opencode_accounts
-    if key is None:
-        return 'Pick OpenCode for one chat with topic.'
-    if key == 'coordinator' or (key.startswith('coordinator:') and key.split(':', 1)[1] in (
-            store.get('coordinator_home_topic'), store.get('coordinator_session_topic'))):
-        return 'The home chat stays on Claude or ChatGPT.'
     if store.get('opencode_enabled') is not True:
         return 'OpenCode is off. Turn on delegation.opencode first.'
     if opencode_accounts.active(store) is None:
@@ -49,12 +53,23 @@ def opencode_pick_problem(store, key):
 def effective_agent(store, key='coordinator', provider=None, model=None):
     pick = store.get(key + '_selection')
     selection = pick or store.get('parent_selection') or {}
-    provider = provider or selection.get('provider') or ('claude' if AccountBroker(store).select() else 'codex')
+    provider = provider or selection.get('provider') or ('claude' if AccountBroker(store).select(model=effective_agent(store, key, 'claude', model)['model']) else 'codex')
     matched = selection if selection.get('provider') == provider else {}
-    setting, default = (('coordinator_model', default_coordinator_model(store)) if provider == 'claude'
-                        else ('codex_model', 'gpt-6.1-sol'))
+    setting, default = (('coordinator_model', COORDINATOR_MODEL) if provider == 'claude'
+                        else ('codex_model', 'gpt-6.2-sol'))
     selected_model = matched.get('model') or model or store.get(setting) or default
+    if provider == 'antigravity':
+        from .extension import optional
+        DEFAULT_MODEL = optional('antigravity_accounts').DEFAULT_MODEL
+        selected_model = matched.get('model') or DEFAULT_MODEL
     effort = matched.get('effort') or store.get(provider + '_parent_effort') or PARENT_EFFORT
+    if provider in ('claude', 'codex'):
+        from .loadout import effective, topic_for_key
+        defaults = effective(store, topic_for_key(store, key), base={
+            'coordinators.' + provider + '.model': selected_model,
+            'coordinators.' + provider + '.effort': effort})[0]['coordinators'][provider]
+        selected_model = defaults['model']
+        effort = defaults['effort']
     if provider == 'opencode':
         from . import opencode_accounts
         selected_model = (opencode_accounts.accounts(store).get(opencode_accounts.active(store)) or {}).get('model')
@@ -64,26 +79,99 @@ def effective_agent(store, key='coordinator', provider=None, model=None):
             'picked': bool(pick), 'selection': selection}
 
 
+def failed_start(store, key, provider):
+    """Count this chat's picked agent as out for a while after it did not start.
+
+    The wait doubles with each failure in a row, up to a day.
+    """
+    with store.db:
+        failed = store.get(key + '_start_failed') or {}
+        count = failed.get('count', 1) + 1 if failed.get('provider') == provider and not failed.get('missing') else 1
+        store.put(key + '_start_failed', {'provider': provider, 'count': count, 'until': time.time() + min(
+            FAILED_START_SECONDS * 2 ** (count - 1), FAILED_START_MAX_SECONDS)})
+
+
+def missing_cli(store, key, provider, binary):
+    """Count this chat's picked agent as out while its CLI is missing."""
+    failed = {'provider': provider, 'until': 0, 'missing': binary}
+    if store.get(key + '_start_failed') != failed:
+        with store.db:
+            store.put(key + '_start_failed', failed)
+
+
+def provider_out(store, key, provider, accounts=None, model=None):
+    """Whether a provider cannot run this chat now. A ChatGPT pick that is signed out is not out:
+    the chat waits for the owner."""
+    failed = store.get(key + '_start_failed') or {}
+    if failed.get('provider') == provider and (failed.get('until', 0) > time.time() or
+                                               failed.get('missing') and not shutil.which(failed['missing'])):
+        return True
+    if provider == 'claude':
+        return (accounts or AccountBroker(store)).select(
+            model=effective_agent(store, key, 'claude', model)['model']) is None
+    if provider == 'antigravity':
+        from .extension import optional
+        return optional('antigravity_parent').out(store, key)
+    if provider == 'opencode':
+        from . import opencode_runtime
+        from .session import AccountsUnavailable
+        try:
+            opencode_runtime.parent_ready(store)
+        except AccountsUnavailable:
+            return True
+        return False
+    if provider == 'codex':
+        from .codex_accounts import CodexBroker
+        codex = CodexBroker(store)
+        return (codex.signed_in(codex.active()) or key == 'coordinator') and codex.parent_account() is None
+    return False
+
+
+def providers(store, key):
+    """The providers that may run this chat, in order: its selection, then the general route list.
+
+    A chat moves to the next of them while its own provider is out. On each provider it runs
+    that provider's chat-agent model and thinking. A chat with a plugin on skips Antigravity.
+    """
+    from . import moves
+    from .claude_settings import plugin_switches
+    from .extension import optional
+    own = effective_agent(store, key)['selection'].get('provider') or 'claude'
+    topic = key_topic(store, key)
+    order = [own]
+    for entry in moves.chain(store, {'provider': own, 'model': None, 'topic': topic}):
+        name = entry['provider']
+        if name not in order and not (name == 'antigravity' and (
+                optional('antigravity_parent') is None or any(plugin_switches(store, topic).values()))):
+            order.append(name)
+    return order
+
+
 def selection_changed(session):
     agent = effective_agent(session.store, session.key, model=session.model)
     selected = agent['selection']
     host = session.store.get(session.key + '_host') or {}
     if host.get('picked', False) != agent['picked']:
         return True
-    if not selected:
-        return False
     provider = host.get('provider', 'claude')
+    if not selected:
+        return provider != 'claude' and not provider_out(session.store, session.key, 'claude')
     if provider == 'opencode':
         from . import opencode_accounts
         if host.get('account') != opencode_accounts.active(session.store):
             return True
-    if selected['provider'] == 'claude' and provider == 'codex' and AccountBroker(session.store).select() is None:
-        return False
+    if (provider != selected['provider'] and provider_out(session.store, session.key, selected['provider'])
+            and provider in providers(session.store, session.key)):
+        backup = effective_agent(session.store, session.key, provider, session.model)
+        if not agent['picked']:
+            return backup['model'] != session.model
+        return (backup['model'] != session.model or backup['effort'] != host.get('effort') or
+                agent['revision'] != session.store.get(session.key + '_selection_revision'))
     if agent['picked']:
         return (agent['provider'] != provider or agent['model'] != session.model or
                 agent['effort'] != host.get('effort') or
                 agent['revision'] != session.store.get(session.key + '_selection_revision'))
-    return selected['provider'] != provider or selected['model'] != session.model
+    return agent['provider'] != provider or agent['model'] != session.model
 
 
 async def retire(session):
@@ -92,7 +180,7 @@ async def retire(session):
         await session.process.request('close_stdin')
     except Exception as error:
         problems.record(session.store, 'coordinator', 'parent-selection-pending',
-                        'Native input close failed: ' + type(error).__name__, level=logging.ERROR)
+                        'Native input close failed: ' + type(error).__name__, level=logging.ERROR, every=3600)
 
 
 async def monitor(self):
@@ -198,8 +286,9 @@ async def attach(session, saved_host, fingerprint):
     session.account_alias = saved_host['account']
     session.model = saved_host['model']
     session.outdated = saved_host.get('fingerprint') != fingerprint
-    seq = session.store.get(session.key + '_host_seq', 0)
-    session.process = HostClient.attach(directory, last_seq=seq, on_seq=session._event_consumed)
+    key = session.key + '_host_seq'
+    seq = max(session.store.get(key, 0), session.store.consumed.get(key, 0))
+    session.process = HostClient.attach(directory, last_seq=seq, on_seq=session.store.consumer(key))
     past, later = [], []
     try:
         past = list(session.process.history(seq))
@@ -231,12 +320,13 @@ async def launch(session, spec, fingerprint, private=None):
         session.store.put(session.key + '_host', host)
         session.store.put(session.key + '_selection_revision', agent['revision'])
         session.store.put(session.key + '_host_seq', 0)
+        session.store.consumed.pop(session.key + '_host_seq', None)
         session.store.put(session.key + '_turn', None)
     from .session_storage import launch_parent
     launch_parent(session, spec)
     directory = session.runner.state_dir / 'hosts' / session.host_id
     session.process = await HostClient.launch(
-        directory, spec, on_seq=session._event_consumed, private=private, record_failure=True)
+        directory, spec, on_seq=session.store.consumer(session.key + '_host_seq'), private=private, record_failure=True)
     return True
 
 
@@ -316,15 +406,46 @@ def jobs_summary(store, open_tasks, limit=RESTART_NOTICE_CHARS):
 
 
 def restarted_prompt(open_tasks, uncertain_messages=None, store=None):
-    uncertain = uncertain_summary(uncertain_messages or [])
-    encoded = json.dumps(uncertain, separators=(',', ':'), sort_keys=True)
-    while len(encoded) > RESTART_MESSAGE_CHARS and uncertain['shown']:
-        uncertain['shown'].pop()
-        uncertain['not_shown'] += 1
-        encoded = json.dumps(uncertain, separators=(',', ':'), sort_keys=True)
-    prefix = 'The service restarted. Open jobs: '
-    suffix = ('. Messages with uncertain delivery (newest %d at most, text cut to %d characters): ' %
-              (RESTART_MESSAGES, RESTART_MESSAGE_HEAD) + encoded +
-              '. Inspect current state before acting. Do not repeat completed work. '
-              'Use tasks.get for job notes, and tasks.list and workers.list for the rest.')
-    return prefix + jobs_summary(store, open_tasks, RESTART_NOTICE_CHARS - len(prefix) - len(suffix)) + suffix
+    summary = json.loads(jobs_summary(store, open_tasks))
+    jobs = {row['id']: row for row in open_tasks}
+    def label(job):
+        topic = store.topic(job['topic'])
+        return 'Job %s (#%s, %s [%s])' % (job['id'], job['number'], topic['name'], job['topic'])
+    lines = ['The service restarted. Open jobs:']
+    for worker in summary['live_workers']:
+        lines.append('Worker %s: %s, %s, %s' % (worker['id'], label(jobs[worker['task']]), worker['provider'], worker['status']))
+    if summary['live_workers_not_shown']:
+        lines.append('%d live workers not shown.' % summary['live_workers_not_shown'])
+    for job in summary['shown']:
+        line = '%s: %s' % (label(job), job['title'])
+        if job['finished']:
+            result = job['finished']
+            line += ' | Worker %s: %s %s' % (result['id'], result['failure_code'] or ('succeeded' if result['success'] else 'failed'), result['text'].replace('\n', ' '))
+        lines.append(line)
+    if summary['not_shown']:
+        lines.append('%d open jobs not shown.' % summary['not_shown'])
+    guidance = 'Inspect current state before acting. Do not repeat completed work. Use tasks.get for job notes, and tasks.list and workers.list for the rest.'
+    messages = []
+    for row in uncertain_messages or []:
+        row = dict(row)
+        if row['kind'] == 'worker_result':
+            try:
+                result = json.loads(row['text'])
+                row['text'] = 'Worker %s: %s %s' % (result.get('worker'), result.get('status'), result.get('text', ''))
+            except (ValueError, AttributeError):
+                pass
+        messages.append(row)
+    uncertain = uncertain_summary(messages)
+    for row in uncertain['shown']:
+        text = row['text']
+        lines.append('Uncertain message %s (%s): %s' % (row['id'], row['kind'], text.replace('\n', ' ')))
+    if uncertain['not_shown']:
+        lines.append('%d uncertain messages not shown.' % uncertain['not_shown'])
+    kept = []
+    for line in lines:
+        candidate = '\n'.join(kept + [line, 'Some entries omitted.', guidance])
+        if len(candidate) > RESTART_NOTICE_CHARS:
+            kept.append('Some entries omitted.')
+            break
+        kept.append(line)
+    return '\n'.join(kept + [guidance])[:RESTART_NOTICE_CHARS]

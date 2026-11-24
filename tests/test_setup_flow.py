@@ -4,10 +4,10 @@ import tempfile
 import unittest
 from unittest.mock import AsyncMock, patch
 
-from coordinator.policy import REPLY_FIRST
 from coordinator.service import Service
 from coordinator.setup_flow import setup_state, setup_status, tick
 from coordinator.store import Store
+from tests.support import plain
 from tests.test_group_setup import CHAT, HOME, GroupTelegram, pair_group
 from tests.test_service import FakeRunner, FakeSession
 
@@ -91,7 +91,7 @@ class SetupFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(await self.service.feed_once())
         await asyncio.gather(*self.service.feed_tasks.values())
         self.factory.assert_awaited_once()
-        self.assertEqual(self.factory.return_value.sent[0][1].split('] ', 1)[1], REPLY_FIRST + 'work')
+        self.assertEqual(plain(self.factory.return_value.sent[0][1]).split('] ', 1)[1], 'work')
         self.assertIsNone(self.store.get('execution'))
 
     def test_setup_status_card_is_stable_and_controls_are_shared(self):

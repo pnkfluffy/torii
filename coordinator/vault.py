@@ -243,6 +243,9 @@ class FileVault:
     def names(self):
         return sorted(self._load())
 
+    def scrub_values(self):
+        return tuple(self._load().values())
+
 
 def vault_from_environment(state_dir):
     """Build the service vault and remove the key variables so no child process inherits them."""

@@ -3,6 +3,7 @@ import time
 from unittest.mock import patch
 
 from coordinator import control_api
+from coordinator.extension import optional
 from coordinator.formatting import markdown_to_html
 from coordinator.health import _plain
 from coordinator.store import Store
@@ -14,29 +15,113 @@ TOPIC = '-10042:4'
 
 
 class ControlUITests(OnboardingFixture):
-    def test_claude_pick_buttons_mark_pick_allow_paused_recheck_and_clear_to_automatic(self):
+    def setUp(self):
+        super().setUp()
+        hidden = patch('coordinator.control_ui.optional', lambda name: None if name == 'routing' else optional(name))
+        hidden.start()
+        self.addCleanup(hidden.stop)
+
+    def test_accounts_buttons_only_add_or_remove_and_picks_show_as_words(self):
         self.account('personal', 'personal@example.com')
         self.account('work', 'work@example.com')
         self.account('team', 'team@example.com', enabled=False)
         self.account('signed-out', 'signed-out@example.com', signed_in=False)
+        self.codex('chatgpt-work', 'work@example.com', resets_available=2)
         self.send(2, '/accounts')
-        self.assertIn('Use work@example.com for Claude', self.labels())
-        self.assertNotIn('Use personal@example.com for Claude', self.labels())
-        self.assertNotIn('Use team@example.com for Claude', self.labels())
-        self.assertNotIn('Use signed-out@example.com for Claude', self.labels())
-        self.click(3, 'Use work@example.com for Claude')
-        self.assertEqual(self.store.get('claude_account_pick'), 'work')
-        self.assertIn('work@example.com: 100% · ? · ? · next · picked', self.latest()['text'])
-        self.assertIn('Automatic', self.labels())
-        self.block('work')
+        self.assertEqual(self.labels(), ['Remove personal (Claude)', 'Turn on team (Claude)', 'Remove work (Claude)',
+                                         'Sign in signed-out (Claude)', 'Remove work (ChatGPT)',
+                                         'Add Claude', 'Add ChatGPT', 'Models ›'])
+        self.assertEqual(self.action('Remove work (ChatGPT)'), {'view': 'remove:chatgpt-work'})
+        with self.store.db:
+            self.assertTrue(control_api.call(self.store, 'account.use', {'alias': 'work', 'models': 'fable'}).ok)
+            self.assertTrue(control_api.call(self.store, 'accounts.codex_auto', {'enabled': False}).ok)
         self.show('accounts:0')
-        self.assertIn('Use work@example.com for Claude', self.labels())
-        self.click(4, 'Use work@example.com for Claude')
-        self.assertEqual(self.store.get('claude_pick_refresh')['topic'], TOPIC)
-        self.click(5, 'Automatic')
-        self.assertIsNone(self.store.get('claude_account_pick'))
-        self.assertNotIn('· picked', self.latest()['text'])
+        self.assertIn('Fable: work@example.com · Other models: automatic\n', self.latest()['text'])
+        self.assertIn('ChatGPT** · auto-switch off', self.latest()['text'])
+        self.assertIn('2 resets', self.latest()['text'])
         self.assertNotIn('Automatic', self.labels())
+        self.assertFalse(any(label.startswith(('Use ', 'Fable', 'Others', 'Reset ', 'Turn on ChatGPT', 'Turn off'))
+                             for label in self.labels()))
+        with self.store.db:
+            self.assertTrue(control_api.call(self.store, 'accounts.claude_auto', {}).ok)
+        self.show('accounts:0')
+        self.assertIn('(left: week · Fable)\nAutomatic\n', self.latest()['text'])
+
+    def test_short_names_tell_shared_email_names_apart(self):
+        from coordinator.control_ui import _short_names
+        self.assertEqual(_short_names({'a': 'sam@alpha.example', 'b': 'sam@beta.test',
+                                       'c': 'samuel@mail.example', 'd': 'robin@alpha.example', 'e': 'plain-alias'}),
+                         {'a': 'sam · alpha', 'b': 'sam · beta', 'c': 'samuel', 'd': 'robin', 'e': 'plain-alias'})
+        self.assertEqual(_short_names({'a': 'me@mail.example', 'b': 'me@mail.test', 'c': 'me@mail.test'}),
+                         {'a': 'me · mail.example', 'b': 'me · mail.test (b)', 'c': 'me · mail.test (c)'})
+
+    def test_remove_asks_first_and_removes_a_signed_in_account(self):
+        self.account('personal', 'personal@example.com')
+        self.account('work', 'work@example.com')
+        with self.store.db:
+            self.assertTrue(control_api.call(self.store, 'account.use', {'alias': 'work'}).ok)
+        self.send(2, '/accounts')
+        self.click(3, 'Remove work (Claude)')
+        self.assertEqual(self.latest()['text'], 'Remove work@example.com from Torii? New work moves to your other '
+                                                "accounts. Its folder stays on this Mac and Torii won't re-add it on "
+                                                'its own.')
+        self.assertEqual(self.labels(), ['Remove', 'Back'])
+        self.click(4, 'Remove')
+        self.assertTrue(self.latest()['text'].startswith('Removed work@example.com.\n\n**Accounts**'))
+        self.assertNotIn('work', self.store.get('accounts'))
+        self.assertIsNone(self.store.get('claude_account_pick'))
+        self.assertTrue((self.root / 'work').is_dir())
+
+    def test_one_antigravity_add_button_uses_the_default_browser(self):
+        with self.store.db:
+            self.store.put('antigravity_enabled', True)
+        self.show('accounts:0')
+        self.assertEqual(self.labels(), ['Add Claude', 'Add ChatGPT', 'Add Antigravity', 'Models ›'])
+        self.assertEqual(self.action('Add Antigravity')['params'], {'provider': 'antigravity'})
+
+    def test_accounts_lines_match_health_with_week_reset_and_credits(self):
+        from coordinator.health import _codex, _subscription
+        now = time.time()
+        self.account('personal', 'personal@example.com', usage={
+            'seven_day': {'utilization': 64, 'resets_at': now + 3 * 86400 + 16 * 3600 + 30},
+            'seven_day_fable': {'utilization': 41, 'resets_at': now + 86400}})
+        self.codex('dave', usage={'seven_day': {'utilization': 100, 'resets_at': now + 25 * 3600 + 30}},
+                   credits={'has_credits': True, 'balance': '23456'})
+        with patch('time.time', return_value=now):
+            self.send(2, '/accounts')
+            text = self.latest()['text']
+            claude, codex = _subscription(self.store).split('\n')[1], _codex(self.store).split('\n')[1]
+        self.assertEqual(claude, '🟢 personal@example.com: 36% · 59%, week resets in 3d 16h')
+        self.assertEqual(codex, '🟢 dave@example.com: 0%, week resets in 1d 1h · 23k credits')
+        self.assertIn('\n' + claude + '\n', text)
+        self.assertIn('\n' + codex, text)
+
+    def test_fable_only_limit_keeps_account_available(self):
+        now = time.time()
+        self.account('personal', 'personal@example.com', usage={
+            'seven_day': {'utilization': 91, 'resets_at': now + 7200},
+            'seven_day_fable': {'utilization': 99, 'resets_at': now + 3600}})
+        self.send(2, '/accounts')
+        text = self.latest()['text']
+        self.assertIn('🟢 personal@example.com: 9% · 1%, week resets in 1h 59m, Fable paused, back in 0h 59m', text)
+        self.assertNotIn('· next', text)
+        self.assertNotIn('No Claude account can take work now.', text)
+
+    def test_active_marker_shows_only_when_a_provider_has_several_accounts(self):
+        from coordinator import control_ui, health
+        usage = {'seven_day': {'utilization': 10, 'resets_at': time.time() + 86400}}
+        self.account('work', 'work@example.com', usage=usage)
+        self.codex('dave', 'dave@example.com')
+        text = control_ui._accounts_view(self.store, 0)[0]
+        for marker in ('· active', '· next'):
+            self.assertNotIn(marker, text)
+        self.assertNotIn('· active', health._codex(self.store))
+        self.account('home', 'home@example.com', usage=usage)
+        self.codex('erin', 'erin@example.com')
+        text = control_ui._accounts_view(self.store, 0)[0]
+        self.assertEqual(text.count('· next'), 1, text)
+        self.assertEqual(text.count('· active'), 1, text)
+        self.assertEqual(health._codex(self.store).count('· active'), 1)
 
     def test_removing_claude_pick_does_not_pick_a_new_account_with_reused_alias(self):
         from coordinator.accounts import AccountBroker
@@ -46,15 +131,14 @@ class ControlUITests(OnboardingFixture):
                      usage={'seven_day': {'utilization': 10, 'resets_at': now + 3600}})
         self.account('fixture-2', 'fixture@b.example',
                      usage={'seven_day': {'utilization': 10, 'resets_at': now + 5 * 86400}})
-        self.send(2, '/accounts')
-        self.click(3, 'Use fixture@b.example for Claude')
-        self.assertEqual(self.store.get('claude_account_pick'), 'fixture-2')
-        self.assertEqual(AccountBroker(self.store).select(), 'fixture-2')
+        with self.store.db:
+            self.assertTrue(control_api.call(self.store, 'account.use', {'alias': 'fixture-2'}).ok)
+        self.assertEqual(self.store.get('claude_account_pick'), {'fable': 'fixture-2', 'other': 'fixture-2'})
+        self.assertEqual(AccountBroker(self.store).select(model='native-default'), 'fixture-2')
         status = self.store.get('account_status')
         status['fixture-2']['identity']['logged_in'] = False
         with self.store.db:
             self.store.put('account_status', status)
-            self.store.put('claude_pick_weekly_notice', 'fixture-2')
             removed = control_api.call(self.store, 'account.remove', {'alias': 'fixture-2'})
         self.assertTrue(removed.ok, removed.text)
         directory = self.root / '.torii-0a1b2c3d'
@@ -63,27 +147,26 @@ class ControlUITests(OnboardingFixture):
             alias = register_claude_account(self.store, directory, {'email': 'fixture@c.example'})
         self.show('accounts:0')
         self.assertEqual(alias, 'fixture-2')
-        self.assertEqual(AccountBroker(self.store).select(), 'fixture')
+        self.assertEqual(AccountBroker(self.store).select(model='native-default'), 'fixture')
         self.assertIsNone(self.store.get('claude_account_pick'))
         self.assertIsNone(self.store.get('claude_pick_refresh'))
-        self.assertIsNone(self.store.get('claude_pick_weekly_notice'))
         self.assertIn('fixture@c.example', self.latest()['text'])
-        self.assertNotIn('· picked', self.latest()['text'])
+        self.assertIn('(left: week · Fable)\nAutomatic\n', self.latest()['text'])
         self.assertNotIn('Automatic', self.labels())
 
-    def test_claude_pick_actions_page_and_long_account_labels_fit(self):
+    def test_account_buttons_page_and_long_account_labels_fit(self):
         for number in range(20):
             self.account('a%02d' % number, ('a%02d' % number) + 'x' * 150 + '@example.com')
         self.show('accounts:0')
-        first = [action['params']['alias'] for action in self.store.get('control_ui:' + TOPIC)['actions']
-                 if action.get('op') == 'account.use']
-        self.assertEqual(first, ['a%02d' % number for number in range(1, 9)])
+        first = [action['view'] for action in self.store.get('control_ui:' + TOPIC)['actions']
+                 if action.get('view', '').startswith('remove:')]
+        self.assertEqual(first, ['remove:a%02d' % number for number in range(0, 12)])
         self.assertLessEqual(len(self.latest()['text']), 4000)
         self.assertTrue(all(len(label) <= 40 for label in self.labels()))
         self.click(3, 'Next ›')
-        second = [action['params']['alias'] for action in self.store.get('control_ui:' + TOPIC)['actions']
-                  if action.get('op') == 'account.use']
-        self.assertEqual(second, ['a%02d' % number for number in range(9, 17)])
+        second = [action['view'] for action in self.store.get('control_ui:' + TOPIC)['actions']
+                  if action.get('view', '').startswith('remove:')]
+        self.assertEqual(second, ['remove:a%02d' % number for number in range(12, 20)])
 
     def latest(self):
         row = dict(self.store.db.execute('SELECT * FROM outbox ORDER BY id DESC LIMIT 1').fetchone())
@@ -226,7 +309,7 @@ class ControlUITests(OnboardingFixture):
         self.store = Store(self.root / 'state')
         self.click(6, 'Cancel sign-in')
         self.assertEqual(self.store.get('account_signin')['state'], 'cancelled')
-        self.click(8, 'Models & Codex ›')
+        self.click(8, 'Models ›')
         self.click(9, 'Worker model')
         self.click(10, 'Custom model')
         card = self.deliver()
@@ -269,40 +352,37 @@ class ControlUITests(OnboardingFixture):
                         'chat': {'id': -10042, 'type': 'supergroup'}}}})
         self.assertEqual(outcome, 'stale_callback')
 
-    def test_settings_merges_models_and_codex(self):
+    def test_models_view_keeps_only_model_settings_and_policy(self):
         self.send(2, '/accounts')
-        self.click(3, 'Models & Codex ›')
+        self.click(3, 'Models ›')
         self.assertEqual(self.latest()['text'], '\n'.join([
-            '**Models & Codex**', 'Worker model: opus', 'Codex model: Codex CLI default',
-            'Coordinator model: service default', 'Codex: on', 'Updates from Telegram: off',
+            '**Models**', 'Worker model: opus', 'Codex model: Codex CLI default',
+            'Coordinator model: service default', 'Codex: on',
             'Worker and Codex changes apply to future dispatches. The coordinator change applies at its next launch.']))
-        self.assertEqual(self.labels(), ['Worker model', 'Codex model', 'Coordinator model', 'Turn Codex off',
-                                         'Turn Telegram updates on', 'Usage policy', 'Back'])
-        self.assertEqual([[button['text'] for button in row]
-                          for row in self.latest()['markup']['inline_keyboard'][:3]],
-                         [['Worker model'], ['Codex model'], ['Coordinator model']])
+        self.assertEqual(self.labels(), ['Worker model', 'Codex model', 'Coordinator model', 'Usage policy', 'Back'])
         self.assertEqual(self.action('Back'), {'view': 'accounts:0'})
-        self.assertEqual(self.action('Turn Codex off'),
-                         {'op': 'delegation.codex', 'params': {'enabled': False}, 'page': 'settings'})
-        self.assertEqual(self.click(4, 'Turn Codex off'), 'control_callback')
-        self.assertIs(self.store.get('codex_enabled'), False)
+        with self.store.db:
+            self.assertTrue(control_api.call(self.store, 'delegation.codex', {'enabled': False}).ok)
+            self.assertTrue(control_api.call(self.store, 'service.updates', {'enabled': True}).ok)
+        self.show('settings')
         self.assertIn('Codex: off', self.latest()['text'])
-        self.assertIn('Turn Codex on', self.labels())
+        self.assertEqual(self.labels(), ['Worker model', 'Codex model', 'Coordinator model', 'Usage policy', 'Back'])
         self.click(5, 'Usage policy')
+        self.assertEqual(self.labels(), ['Back'])
         self.assertEqual(self.action('Back'), {'view': 'settings'})
         self.click(6, 'Back')
         self.click(7, 'Worker model')
         self.assertEqual(self.action('Back'), {'view': 'settings'})
         self.click(8, 'Opus 5.5')
         self.assertEqual(self.store.get('worker_model'), 'claude-opus-5-5')
-        self.assertIn('**Models & Codex**\nWorker model: claude-opus-5-5', self.latest()['text'])
+        self.assertIn('**Models**\nWorker model: claude-opus-5-5', self.latest()['text'])
         self.click(9, 'Back')
         self.assertTrue(self.latest()['text'].startswith('**Accounts**'))
 
     def test_old_models_and_delegation_views_render_settings(self):
         for name in ('models', 'delegation'):
             self.assertTrue(self.show(name))
-            self.assertTrue(self.latest()['text'].startswith('**Models & Codex**'))
+            self.assertTrue(self.latest()['text'].startswith('**Models**'))
             self.assertEqual(self.store.get('control_ui:' + TOPIC)['where'], 'settings')
 
     def opencode_account(self, alias='host', model='example-host/example-model', use=True):
@@ -334,8 +414,7 @@ class ControlUITests(OnboardingFixture):
         lines = text.split('\n')
         self.assertEqual(lines[lines.index('Codex: on') + 1],
                          'OpenCode workers: off · account host · model example-host/example-model · host api.example.test')
-        self.assertEqual(self.labels(), ['Worker model', 'Codex model', 'Coordinator model', 'Turn Codex off',
-                                         'Turn Telegram updates on', 'Usage policy', 'Back'])
+        self.assertEqual(self.labels(), ['Worker model', 'Codex model', 'Coordinator model', 'Usage policy', 'Back'])
 
     def test_settings_shows_example_workers_on(self):
         with self.store.db:
@@ -367,40 +446,53 @@ class ControlUITests(OnboardingFixture):
                       % (_plain('example_host'), _plain('host/example_model*')), text)
         self.assertIn('account example\\_host · model host/example\\_model\\*', text)
 
-    def test_usage_policy_edit_and_long_view(self):
+    def test_personal_rules_show_the_whole_policy_without_source_comments(self):
         self.bind_topic()
+        from coordinator.policy import personal_path
+        policy = personal_path(self.store)
+        lines = ['- Rule %03d keeps this line readable for the owner. <!-- owner %d -->' % (number, number)
+                 for number in range(120)]
+        policy.write_text('# Rules\n\n<!-- source note -->\n\n\n' + '\n'.join(lines) + '\n')
         self.show('settings')
         self.click(4, 'Usage policy')
-        self.click(5, 'Edit')
-        self.assertEqual(self.action('Cancel'), {'view': 'policy'})
-        card = self.deliver()
-        self.send(6, 'Use one worker.', reply_to_message={'message_id': card['telegram_message']})
-        self.assertEqual((self.store.directory / 'USAGE.md').read_text(), 'Use one worker.')
-        self.assertIn('Usage policy\nUse one worker.', self.latest()['text'])
-        (self.store.directory / 'USAGE.md').write_text('a' * 5000)
-        self.show('policy', prefix='Saved')
-        self.assertLessEqual(len(self.latest()['text']), 4096)
-        self.assertTrue(self.latest()['text'].endswith('…'))
+        parts = [dict(row) for row in self.store.db.execute(
+            "SELECT text, reply_markup FROM outbox WHERE id>(SELECT MAX(id) FROM outbox WHERE text LIKE '**Models**%')"
+            ' ORDER BY id')]
+        self.assertGreater(len(parts), 1)
+        self.assertTrue(all(len(part['text']) <= 4096 for part in parts))
+        shown = '\n'.join(part['text'] for part in parts)
+        self.assertTrue(shown.startswith('Personal rules\n# Rules\n\n- Rule 000'))
+        self.assertNotIn('<!--', shown)
+        self.assertNotIn('owner 5', shown)
+        for number in range(120):
+            self.assertIn('Rule %03d keeps this line readable for the owner.' % number, shown)
+        self.assertIsNone(parts[0]['reply_markup'])
+        self.assertIn('Back', parts[-1]['reply_markup'])
 
-    def test_policy_form_passes_plain_messages_as_work(self):
+    def test_personal_rules_show_as_read_only_without_source_comments(self):
         self.bind_topic()
-        policy = self.store.directory / 'USAGE.md'
-        policy.write_text('Keep the existing policy.')
-        self.show('policy')
-        self.click(3, 'Edit')
+        (self.store.directory / 'personal.md').write_text('Use short sentences. <!-- source note -->\n')
+        self.assertTrue(self.show('policy'))
+        self.assertEqual(self.latest()['text'], 'Personal rules\nUse short sentences.')
+        self.assertEqual(self.labels(), ['Back'])
+
+    def test_model_form_passes_plain_messages_as_work(self):
+        self.bind_topic()
+        self.show('model:worker')
+        self.click(3, 'Custom model')
         card = self.deliver()
         state = self.store.get('control_ui:' + TOPIC)
         replies = [{'reply_to_message': {'message_id': 4, 'forum_topic_created': {'name': 'test'}}}, {}]
         for number, extra in enumerate(replies, 5):
             with self.subTest(reply=extra):
                 self.assertEqual(self.send(number, 'Please update the README.', **extra)[0], 'queued')
-                self.assertEqual(policy.read_text(), 'Keep the existing policy.')
+                self.assertIsNone(self.store.get('worker_model'))
                 self.assertEqual(self.store.get('control_ui:' + TOPIC), state)
         self.assertEqual([message['text'] for message in self.store.messages_pending()],
                          ['Please update the README.'] * 2)
-        self.assertEqual(self.send(7, 'Use one worker.',
-                                   reply_to_message={'message_id': card['telegram_message']})[0], 'control')
-        self.assertEqual(policy.read_text(), 'Use one worker.')
+        self.assertEqual(self.send(7, 'my-model', reply_to_message={'message_id': card['telegram_message']})[0],
+                         'control')
+        self.assertEqual(self.store.get('worker_model'), 'my-model')
         self.assertIsNone(self.store.get('control_ui:' + TOPIC)['pending'])
 
     def test_retired_primary_button_is_refused_cleanly(self):
@@ -422,15 +514,16 @@ class ControlUITests(OnboardingFixture):
     def test_codex_model_presets_and_other_choices(self):
         self.show('settings')
         self.click(4, 'Codex model')
-        self.assertEqual(self.labels(), ['GPT-6.1 Sol (default)', 'GPT-6 Luna', 'GPT-6 Astra',
-                                         'Custom model', 'Codex cli default', 'Back'])
-        for number, (label, model) in enumerate((('GPT-6.1 Sol (default)', 'gpt-6.1-sol'),
+        self.assertEqual(self.labels(), ['GPT-6.2 Sol (default)', 'GPT-6 Luna', 'GPT-6 Astra', 'GPT-6.2 Astra',
+                                         'Custom model', 'Codex CLI default', 'Back'])
+        for number, (label, model) in enumerate((('GPT-6.2 Sol (default)', 'gpt-6.2-sol'),
                                                   ('GPT-6 Luna', 'gpt-6-luna'),
-                                                  ('GPT-6 Astra', 'gpt-6-astra')), 5):
+                                                  ('GPT-6 Astra', 'gpt-6-astra'),
+                                                  ('GPT-6.2 Astra', 'gpt-6.2-astra')), 5):
             self.click(number, label)
             self.assertEqual(self.store.get('codex_model'), model)
             self.click(number + 10, 'Codex model')
-        self.click(18, 'Codex cli default')
+        self.click(19, 'Codex CLI default')
         self.assertIsNone(self.store.get('codex_model'))
 
     def test_open_jobs_lists_the_open_jobs_of_this_topic(self):
@@ -571,7 +664,7 @@ class ControlUITests(OnboardingFixture):
         self.send(2, '/accounts')
         card = self.deliver()
         message = 1000 + card['id']
-        taps = [(3, 'Models & Codex ›'), (4, 'Coordinator model'), (5, 'Back'), (6, 'Back'), (7, 'Models & Codex ›')]
+        taps = [(3, 'Models ›'), (4, 'Coordinator model'), (5, 'Back'), (6, 'Back'), (7, 'Models ›')]
         for number, label in taps:
             self.assertEqual(self.click(number, label, row=card), 'control_callback')
             page = self.latest()
@@ -620,58 +713,56 @@ class ControlUITests(OnboardingFixture):
         with patch('coordinator.accounts.temporary_local_switch_thresholds', return_value={'team': 0.9}):
             self.send(2, '/accounts')
         self.assertEqual(self.latest()['text'], '\n'.join([
-            '**Accounts** · Claude switches at 98% used; Codex switches at 95% used with auto-switch',
+            '**Accounts** · Claude switches at 99% used; Codex switches at 99% used with auto-switch',
             '',
-            '**Claude** (left: 5h · week · Fable)',
-            '🟢 personal@example.com: 62% · 40% · 88% · next',
-            '🔴 team@example.com: 0% · 31% · 70%, back in 2h 10m · reserve 10%',
+            '**Claude** (left: week · Fable)',
+            'Automatic',
+            '🟢 personal@example.com: 40% · 88% · next',
+            '🔴 team@example.com: 31% · 70%, back in 2h 10m · reserve 10%',
             '⚪ work@example.com: signed out',
             '',
-            '**ChatGPT** · auto-switch on (left: 5h · week)',
-            '🟢 chatgpt-personal@example.com: 80% · 55% · active · 2 resets, first expires in 12d',
+            '**ChatGPT** · auto-switch on (left: week)',
+            '🟢 chatgpt-personal@example.com: 55% · active · 2 resets banked, first expires in 12d · ? credits',
             '⚪ chatgpt-team: signed out',
             '',
             'Sign-in open: ChatGPT, waiting for the device code.']))
-        self.assertEqual(self.labels(), ['Sign in work@example.com', 'Sign in chatgpt-team', 'Use team@example.com for Claude', 'Reset chatgpt-personal@example.com (2)',
-                                         'Cancel sign-in', 'Turn off ChatGPT auto-switch',
-                                         'Models & Codex ›'])
-        self.assertEqual(self.action('Sign in work@example.com'), {'view': 'account:work'})
-        self.assertEqual(self.action('Reset chatgpt-personal@example.com (2)'), {'view': 'reset:chatgpt-personal'})
+        self.assertEqual(self.labels(), ['Remove personal (Claude)', 'Remove team (Claude)', 'Sign in work (Claude)',
+                                         'Remove chatgpt-personal (ChatGPT)', 'Sign in chatgpt-team (ChatGPT)',
+                                         'Cancel sign-in', 'Models ›'])
+        self.assertEqual(self.action('Sign in work (Claude)'), {'view': 'account:work'})
+        self.assertEqual(self.action('Remove chatgpt-personal (ChatGPT)'), {'view': 'remove:chatgpt-personal'})
         self.assertEqual(self.action('Cancel sign-in'),
                          {'op': 'account.signin_cancel', 'params': {}, 'page': 'accounts:0'})
-        self.assertEqual(self.action('Turn off ChatGPT auto-switch'),
-                         {'op': 'accounts.codex_auto', 'params': {'enabled': False}, 'page': 'accounts:0'})
         self.assertEqual(self.store.get('control_ui:' + TOPIC)['where'], 'accounts:0')
 
     def test_full_claude_account_has_no_reset_button(self):
-        self.account('alice', 'alice@example.com', usage={'five_hour': {'utilization': 100}})
+        self.account('alice', 'alice@example.com', usage={'seven_day': {'utilization': 100}})
         self.send(2, '/accounts')
         self.assertIn('🔴 alice@example.com: 0%', self.latest()['text'])
         self.assertNotIn('Claude reset ↗', self.labels())
 
-    def test_chatgpt_use_rows_appear_only_with_auto_switch_off(self):
+    def test_chatgpt_pick_and_auto_switch_work_by_text_only(self):
         self.codex('dave')
         self.codex('frank', 'frank@example.com')
         with self.store.db:
             self.store.put('codex_active_account', 'dave')
         self.show('accounts:0')
-        self.assertIn('**ChatGPT** · auto-switch off (left: 5h · week)', self.latest()['text'])
-        self.assertIn('🟢 dave@example.com: 80% · 55% · active', self.latest()['text'])
-        self.assertEqual(self.labels(), ['Use frank@example.com for ChatGPT', 'Add Claude', 'Add ChatGPT',
-                                         'Turn on ChatGPT auto-switch', 'Models & Codex ›'])
-        self.assertEqual(self.click(3, 'Use frank@example.com for ChatGPT'), 'control_callback')
+        self.assertIn('**ChatGPT** · auto-switch off (left: week)', self.latest()['text'])
+        self.assertIn('🟢 dave@example.com: 55% · active', self.latest()['text'])
+        self.assertEqual(self.labels(), ['Remove dave (ChatGPT)', 'Remove frank (ChatGPT)', 'Add Claude', 'Add ChatGPT',
+                                         'Models ›'])
+        with self.store.db:
+            self.assertTrue(control_api.call(self.store, 'account.use', {'alias': 'frank'}).ok)
+            self.assertTrue(control_api.call(self.store, 'accounts.codex_auto', {'enabled': True}).ok)
+        self.show('accounts:0')
         self.assertEqual(self.store.get('codex_active_account'), 'frank')
-        self.assertIn('Use dave@example.com for ChatGPT', self.labels())
-        self.click(4, 'Turn on ChatGPT auto-switch')
-        self.assertIs(self.store.get('codex_auto_switch'), True)
-        self.assertNotIn('Use dave@example.com for ChatGPT', self.labels())
-        self.assertIn('Turn off ChatGPT auto-switch', self.labels())
+        self.assertIn('**ChatGPT** · auto-switch on', self.latest()['text'])
 
     def test_accounts_empty_state(self):
         self.send(2, '/accounts')
         self.assertEqual(self.latest()['text'], '**Accounts**\nNo accounts yet. Add one to start work. '
                                                 'Project setup works before sign-in.')
-        self.assertEqual(self.labels(), ['Add Claude', 'Add ChatGPT', 'Models & Codex ›'])
+        self.assertEqual(self.labels(), ['Add Claude', 'Add ChatGPT', 'Models ›'])
         self.assertEqual(self.action('Add ChatGPT'),
                          {'op': 'account.add', 'params': {'provider': 'codex'}, 'page': 'accounts:0'})
 
@@ -682,9 +773,9 @@ class ControlUITests(OnboardingFixture):
         self.show('accounts:0')
         text = self.latest()['text']
         self.assertIn('⚫ spare@example.com: off', text)
-        self.assertIn('🔴 work@example.com: 100% · ? · ?, back in 1h 0m', text)
+        self.assertIn('🔴 work@example.com: ? · ?, back in 1h 0m', text)
         self.assertTrue(text.endswith('\n\nNo Claude account can take work now.'))
-        self.assertEqual(self.labels()[0], 'Turn on spare@example.com')
+        self.assertEqual(self.labels()[:2], ['Turn on spare (Claude)', 'Remove work (Claude)'])
 
     def test_shared_claude_login_is_tagged(self):
         self.account('work', 'same@example.com')
@@ -692,25 +783,26 @@ class ControlUITests(OnboardingFixture):
         self.show('accounts:0')
         self.assertIn('⚪ same@example.com: signed out · same login as same@example.com', self.latest()['text'])
 
-    def test_accounts_paginate_repair_rows_at_nine(self):
-        for number in range(9):
+    def test_accounts_paginate_account_rows_at_thirteen(self):
+        for number in range(13):
             self.account('gone%d' % number, 'gone%d@example.com' % number, signed_in=False)
         self.send(2, '/accounts')
-        self.assertEqual(self.labels(), ['Sign in gone%d@example.com' % number for number in range(8)]
-                         + ['Add Claude', 'Add ChatGPT', 'Models & Codex ›', 'Next ›'])
+        order = sorted(range(13), key=lambda number: 'gone%d@example.com' % number)
+        self.assertEqual(self.labels(), ['Sign in gone%d (Claude)' % number for number in order[:12]]
+                         + ['Add Claude', 'Add ChatGPT', 'Models ›', 'Next ›'])
         self.click(3, 'Next ›')
-        self.assertEqual(self.labels(), ['Sign in gone8@example.com', 'Add Claude', 'Add ChatGPT',
-                                         'Models & Codex ›', '‹ Previous'])
+        self.assertEqual(self.labels(), ['Sign in gone%d (Claude)' % order[12], 'Add Claude', 'Add ChatGPT', 'Models ›',
+                                         '‹ Previous'])
         self.assertEqual(self.store.get('control_ui:' + TOPIC)['where'], 'accounts:1')
         self.click(4, 'Add Claude')
         self.assertEqual(self.store.get('control_ui:' + TOPIC)['where'], 'accounts:1')
 
     def test_long_button_labels_are_clipped(self):
-        self.account('long', 'a-very-long-mailbox-name-for-testing@example.com', signed_in=False)
+        self.account('long', 'a-very-long-mailbox-name-for-testing-labels@example.com', signed_in=False)
         self.show('accounts:0')
         label = self.labels()[0]
         self.assertEqual(len(label), 40)
-        self.assertTrue(label.startswith('Sign in a-very-long') and label.endswith('…'))
+        self.assertTrue(label.startswith('Sign in a-very-long') and label.endswith('… (Claude)'))
 
     def test_sixty_accounts_clip_on_whole_lines(self):
         for number in range(60):
@@ -727,7 +819,7 @@ class ControlUITests(OnboardingFixture):
         self.account('work', 'work@example.com')
         self.account('carol', 'carol@example.com', signed_in=False)
         self.show('accounts:0')
-        self.click(3, 'Sign in carol@example.com')
+        self.click(3, 'Sign in carol (Claude)')
         self.assertEqual(self.latest()['text'], 'carol@example.com (Claude) is signed out.\n'
                                                 'Sign in with the same Claude account to bring it back. '
                                                 'Its alias, history and settings stay.\n'
@@ -741,71 +833,33 @@ class ControlUITests(OnboardingFixture):
                                                 "uses it. Its folder stays on this Mac and Torii won't re-add it on "
                                                 'its own.')
         self.assertEqual(self.labels(), ['Remove', 'Back'])
-        self.assertEqual(self.action('Back'), {'view': 'account:carol'})
+        self.assertEqual(self.action('Back'), {'view': 'accounts:0'})
         self.assertEqual(self.click(5, 'Remove'), 'control_callback')
         self.assertTrue(self.latest()['text'].startswith('Removed carol@example.com.\n\n**Accounts**'))
         self.assertNotIn('carol', self.store.get('accounts'))
         self.assertIn(str((self.root / 'carol').resolve()), self.store.get('account_dirs_removed'))
         self.assertTrue((self.root / 'carol').is_dir())
-        self.assertFalse(self.show('remove:work'))
         self.assertFalse(self.show('account:work'))
 
     def test_off_account_card_turns_it_on(self):
         self.codex('dave', enabled=False)
         self.show('accounts:0')
         self.assertIn('⚫ dave@example.com: off', self.latest()['text'])
-        self.click(3, 'Turn on dave@example.com')
+        self.click(3, 'Turn on dave (ChatGPT)')
         self.assertEqual(self.latest()['text'],
                          "dave@example.com (ChatGPT) is signed in but turned off, so Torii doesn't use it.")
         self.assertEqual(self.labels(), ['Turn on', 'Back'])
-        self.assertFalse(self.show('remove:dave'))
         self.show('account:dave')
         self.click(4, 'Turn on')
         self.assertIs(self.store.get('codex_accounts')['dave']['enabled'], True)
         self.assertIn('🟢 dave@example.com', self.latest()['text'])
 
-    def test_reset_confirm_when_the_rule_is_met(self):
-        now = time.time()
-        self.codex('dave', usage={'five_hour': {'utilization': 97, 'resets_at': now + 3600 + 12 * 60 + 30},
-                                  'seven_day': {'utilization': 60}},
-                   resets_available=2, reset_expires=now + 12 * 86400 + 30)
-        with self.store.db:
-            self.store.put('codex_auto_switch', True)
+    def test_banked_resets_show_as_text_without_a_button(self):
+        self.codex('dave', usage_allowed=False, resets_available=2)
         self.show('accounts:0')
-        self.click(3, 'Reset dave@example.com (2)')
-        self.assertEqual(self.latest()['text'], 'Spend 1 of 2 banked resets on dave@example.com?\n'
-                                                'Now: 5h 3% left · week 40% left. Limited, back in 1h 12m.\n'
-                                                "It refills the 5-hour and weekly limits right away. It can't be "
-                                                'undone.\nTorii spends the one that expires first (in 12d).')
-        self.assertEqual(self.labels(), ['Spend reset', 'Back'])
-        self.assertEqual(self.action('Back'), {'view': 'accounts:0'})
-        self.assertEqual(self.click(4, 'Spend reset'), 'control_callback')
-        self.assertTrue(self.latest()['text'].startswith(
-            'Banked reset queued. Torii will send the result here.\n\n**Accounts**'))
-        request = self.store.db.execute('SELECT op,params FROM service_requests').fetchone()
-        self.assertEqual((request['op'], json.loads(request['params'])['alias']), ('account.codex_reset', 'dave'))
-
-    def test_reset_confirm_without_expiry_lets_codex_pick(self):
-        self.codex('dave', usage_allowed=False, resets_available=1)
-        self.show('reset:dave')
-        self.assertTrue(self.latest()['text'].startswith('Spend 1 of 1 banked reset on dave@example.com?'))
-        self.assertTrue(self.latest()['text'].endswith('\nCodex picks which one.'))
-
-    def test_reset_view_explains_when_no_reset_is_needed(self):
-        self.codex('dave', usage={'five_hour': {'utilization': 38}, 'seven_day': {'utilization': 60}},
-                   resets_available=2)
-        self.show('reset:dave')
-        self.assertEqual(self.latest()['text'], "dave@example.com doesn't need a reset yet: 5h 62% left · week 40% "
-                                                'left.\nTorii spends a banked reset only when the account is limited '
-                                                'or a meter is at 95% or more. Your 2 resets stay banked.')
-        self.assertEqual(self.labels(), ['Back'])
-
-    def test_reset_view_is_stale_without_a_banked_reset(self):
-        self.codex('dave', resets_available=0)
-        self.codex('frank', 'frank@example.com', signed_in=False, resets_available=2)
-        self.account('work')
-        for name in ('reset:dave', 'reset:frank', 'reset:work', 'reset:nobody'):
-            self.assertFalse(self.show(name), name)
+        self.assertIn('· 2 resets', self.latest()['text'])
+        self.assertFalse(any(label.startswith('Reset') for label in self.labels()))
+        self.assertFalse(self.show('reset:dave'))
 
     def test_typed_commands_with_arguments_render_the_top_card_with_a_hint(self):
         from coordinator.control_ui import NO_ARGUMENTS, control_report
@@ -813,7 +867,7 @@ class ControlUITests(OnboardingFixture):
         with self.store.db:
             control_report(self.store, TOPIC, 'ignored', '/accounts', ['show', 'work'], 2)
         self.assertTrue(self.latest()['text'].startswith(
-            NO_ARGUMENTS + '\n\n**Accounts** · Claude switches at 98% used; Codex switches at 95% used with auto-switch'))
+            NO_ARGUMENTS + '\n\n**Accounts** · Claude switches at 99% used; Codex switches at 99% used with auto-switch'))
         with self.store.db:
             control_report(self.store, TOPIC, 'ignored', '/secrets', ['rotate', 'DEPLOY_KEY'], 3)
         self.assertTrue(self.latest()['text'].startswith(NO_ARGUMENTS + '\n\n**Secrets**'))
@@ -829,6 +883,33 @@ class ControlUITests(OnboardingFixture):
         self.assertTrue(self.latest()['text'].startswith(NO_ARGUMENTS + '\n\n'))
         self.assertNotIn('ignored', self.latest()['text'])
         self.assertEqual(self.labels(), ['Accounts'])
+
+    def test_help_always_shows_both_balance_sections_without_blockquotes(self):
+        from coordinator.health import _codex, _subscription
+        number = 2
+        for configured in (False, True):
+            if configured:
+                self.account('work', 'work@example.com', usage={'seven_day': {'utilization': 12}})
+                self.store.put('codex_accounts', {'gpt': {'config_dir': str(self.root), 'enabled': True}})
+                self.store.put('codex_account_status', {'gpt': {
+                    'identity': {'email': 'gpt@example.com', 'logged_in': True},
+                    'observed_at': time.time(), 'usage': {'seven_day': {'utilization': 23}}}})
+            for command in ('/help', '/help me'):
+                with self.subTest(configured=configured, command=command):
+                    self.send(number, command)
+                    number += 1
+                    text = self.latest()['text']
+                    self.assertIn(_subscription(self.store), text)
+                    self.assertIn(_codex(self.store) or '**ChatGPT left** (week)\nNo accounts', text)
+                    self.assertEqual(text.count('**Subscriptions left**'), 1)
+                    self.assertEqual(text.count('**ChatGPT left**'), 1)
+                    self.assertIn('/waiting - ', text)
+                    rendered = markdown_to_html(text)
+                    self.assertNotIn('<blockquote', rendered)
+                    self.assertNotIn('<details', rendered)
+                    if configured:
+                        self.assertIn('work@example.com: 88%', rendered)
+                        self.assertIn('gpt@example.com: 77%', rendered)
 
     def test_health_card_links_accounts(self):
         self.send(2, '/health')
@@ -1005,7 +1086,7 @@ class ControlUITests(OnboardingFixture):
             jobs.append({'id': job['id'], 'topic': TOPIC, 'channel': 'Test', 'number': 102 + index})
             with self.store.db:
                 self.store.db.execute('UPDATE tasks SET number=? WHERE id=?', (102 + index, job['id']))
-                spawned = control_api.call(self.store, 'workers.spawn', {'task': job['id'], 'provider': 'claude',
+                spawned = control_api.call(self.store, 'workers.spawn', {'task': job['id'], 'kind': 'design',
                     'prompt': 'Use key'}, topic=TOPIC, source='mcp')
                 self.assertTrue(spawned.ok, spawned.text)
                 record_use(self.store, [(envelope, 'DEPLOY_KEY')], spawned.data['worker'])
@@ -1140,7 +1221,7 @@ class ControlUITests(OnboardingFixture):
             self.account('gone%02d' % number, 'gone-%02d-%s@example.com' % (number, 'y' * 50), signed_in=False)
         with self.store.db:
             self.store.put('codex_auto_switch', False)
-        names = ['accounts:0', 'accounts:1', 'account:work', 'remove:work', 'account:chatgpt-team', 'reset:chatgpt-personal',
+        names = ['accounts:0', 'accounts:1', 'account:work', 'remove:work', 'account:chatgpt-team', 'remove:chatgpt-personal',
                  'settings', 'model:worker', 'model:codex', 'model:coordinator', 'policy', 'project', 'jobs',
                  'secrets:0', 'secret:DEPLOY_KEY', 'secret:NPM_TOKEN', 'secret:STRIPE_KEY', 'revoke:DEPLOY_KEY']
         for name in names:

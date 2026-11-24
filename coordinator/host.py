@@ -7,18 +7,68 @@ import json
 import logging
 import os
 from pathlib import Path
+import re
 import signal
 import socket
 import subprocess
 import sys
 import time
 
-from . import extension, native_ids, process_ownership as ownership
+from . import extension, host_os, native_ids, process_ownership as ownership
 from .scrub import Scrubber
 
 
 HOST_TIMEOUT = 10
+BACKGROUND_INFRASTRUCTURE = ('ssh', 'codex-code-mode-host', 'node_repl', 'node', 'python')
 _launchers = []
+
+
+async def background_survivors(child_pid, owner, scrub):
+    members = set()
+    try:
+        group, _ = await ownership.group_members(child_pid)
+        members.update(pid for pid, _ in group if pid != child_pid)
+    except OSError:
+        pass
+    if owner is not None:
+        try:
+            owned = await asyncio.to_thread(ownership.select, owner, (owner['pid'], owner['unique']))
+            members.update(item.pid for item in owned if item.pid != child_pid)
+        except OSError:
+            pass
+    found = []
+    for pid in sorted(members):
+        try:
+            values = []
+            for field in ('stat=', 'comm=', 'command='):
+                output = await asyncio.to_thread(subprocess.run, ['/bin/ps', '-p', str(pid), '-o', field],
+                                                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                                 text=True, timeout=2, check=True)
+                values.append(output.stdout.strip())
+            state, executable, command = values
+            if state.startswith('Z'):
+                continue
+            name = Path(executable).name.lower()
+            if name in BACKGROUND_INFRASTRUCTURE or name.startswith('python'):
+                if name in ('codex-code-mode-host', 'node_repl'):
+                    continue
+                if name == 'node' and re.search(r'(?:^|[ /])node_repl(?:\s|$)', command):
+                    continue
+                if name == 'ssh' and ('[mux]' in command or re.search(
+                        r'(?:^|\s)(?:-M(?:\s|$)|-o\s*ControlMaster(?:=|\s+)(?:yes|auto|ask|autoask)(?:\s|$))',
+                        command, re.IGNORECASE)):
+                    continue
+                if name.startswith('python') and re.search(
+                        r'(?:^|\s)-m\s+coordinator\s+--state-dir\s+.+?\s+mcp(?:\s|$)', command):
+                    continue
+                if extension.active().background_infrastructure(name, command):
+                    continue
+        except (OSError, ValueError, subprocess.SubprocessError):
+            found.append((pid, '[command unavailable]'))
+            continue
+        if command:
+            found.append((pid, scrub(' '.join(command.split()))[:160]))
+    return found
 
 
 class SessionBusy(RuntimeError):
@@ -91,7 +141,7 @@ def _write(path, value):
 
 
 def _socket_path(directory):
-    alias = Path('/tmp') / ('torii-' + hashlib.sha256(str(directory.resolve()).encode()).hexdigest()[:16])
+    alias = host_os.short_socket_directory() / ('torii-' + hashlib.sha256(str(directory.resolve()).encode()).hexdigest()[:16])
     return alias, alias / 'sock'
 
 
@@ -303,6 +353,11 @@ class HostClient:
         return json.loads(path.read_text())['returncode'] if path.exists() else None
 
     @property
+    def background_killed(self):
+        path = self.directory / 'exit.json'
+        return json.loads(path.read_text()).get('background_killed') if path.exists() else None
+
+    @property
     def child_pid(self):
         path = self.directory / 'child.pid'
         return int(path.read_text()) if path.exists() else None
@@ -450,6 +505,8 @@ class HostClient:
         raise RuntimeError('Provider host socket is unavailable')
 
     async def request(self, op, **fields):
+        if op in ('write', 'private_write', 'redacted_write') and hasattr(self.on_seq, 'flush'):
+            self.on_seq.flush()
         _, socket_path = _socket_path(self.directory)
         reader, writer = await asyncio.open_unix_connection(str(socket_path))
         try:
@@ -710,6 +767,10 @@ class HostStdin:
             self.buffer = bytearray(tail)
             await self.client.request('write', line=line.decode())
 
+    async def redacted(self, line, journal):
+        """Write line to the child and journal the redacted form in its place."""
+        await self.client.request('redacted_write', line=line, journal=journal)
+
     async def private(self, event, secrets=None):
         """Write a line that is never journaled. Its secrets are scrubbed from later output, because
         Claude echoes the control responses it receives."""
@@ -743,7 +804,7 @@ async def _serve(directory, private):
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
-            if spec['provider'] != 'opencode':
+            if spec['provider'] not in ('opencode', 'antigravity'):
                 raise
             os.close(fd)
             for held in locks:
@@ -805,12 +866,16 @@ async def _serve(directory, private):
     write_lock = asyncio.Lock()
     write_seq = 0
     stopping = None
+    group_signalled = False
 
     async def stop_child():
+        nonlocal group_signalled
         try:
             os.killpg(child.pid, signal.SIGTERM)
         except (ProcessLookupError, PermissionError):
             return
+        if spec.get('report_background_killed') and stopping is None:
+            group_signalled = True
         deadline = time.monotonic() + spec.get('stop_timeout', 5)
         while time.monotonic() < deadline:
             try:
@@ -843,11 +908,13 @@ async def _serve(directory, private):
                     if not isinstance(request, dict):
                         raise ValueError('Host request must be an object')
                     op = request.get('op')
-                    if (op == 'write' and isinstance(request.get('line'), str)
-                            and '\n' not in request['line'] and '\r' not in request['line']):
+                    journal = request.get('journal', request.get('line')) if op == 'redacted_write' else request.get('line')
+                    if (op in ('write', 'redacted_write') and all(
+                            isinstance(value, str) and '\n' not in value and '\r' not in value
+                            for value in (request.get('line'), journal))):
                         async with write_lock:
                             write_seq += 1
-                            writes.write(json.dumps({'seq': write_seq, 'line': request['line']}) + '\n')
+                            writes.write(json.dumps({'seq': write_seq, 'line': journal}) + '\n')
                             writes.flush()
                             child.stdin.write((request['line'] + '\n').encode())
                             await child.stdin.drain()
@@ -885,9 +952,10 @@ async def _serve(directory, private):
     seq = 0
     cleanup = None
     native_lock = any(name.startswith(spec['provider'] + '-') for name in spec.get('locks', []))
+    owned = owner is not None or spec.get('group_owned') is True
     try:
         while True:
-            if owner is None:
+            if not owned and not spec.get('report_background_killed'):
                 line = await child.stdout.readline()
             else:
                 reading = asyncio.create_task(child.stdout.readline())
@@ -895,10 +963,17 @@ async def _serve(directory, private):
                     while not reading.done():
                         await asyncio.wait((reading,), timeout=.05)
                         if (not reading.done() and child.returncode is not None and
-                                (stopping is not None or spec['provider'] not in ('claude', 'codex'))):
+                                (owned or stopping is not None or spec.get('report_background_killed') or
+                                 spec['provider'] not in ('claude', 'codex'))):
                             reading.cancel()
                             break
-                    line = b'' if reading.cancelled() or not reading.done() else reading.result()
+                    if not reading.done():
+                        await asyncio.gather(reading, return_exceptions=True)
+                    if reading.cancelled():
+                        size = len(child.stdout._buffer)
+                        line = await child.stdout.read(size) if size else b''
+                    else:
+                        line = reading.result()
                 finally:
                     if not reading.done():
                         reading.cancel()
@@ -918,10 +993,8 @@ async def _serve(directory, private):
                         session_id = event.get('thread_id')
                         if event.get('method') == 'thread/started':
                             session_id = (event.get('params') or {}).get('thread', {}).get('id')
-                    elif provider == 'opencode' and 'id' in event and 'method' not in event:
+                    elif provider in ('opencode', 'antigravity') and 'id' in event and 'method' not in event:
                         session_id = (event.get('result') or {}).get('sessionId')
-                    elif provider == 'muse' and event.get('id') == 'torii-open' and 'method' not in event:
-                        session_id = ((event.get('result') or {}).get('session') or {}).get('sessionId')
                     if native_ids.valid(provider, session_id):
                         lock = directory.parent.parent / 'locks' / (provider + '-' + session_id + '.lock')
                         lock.parent.mkdir(mode=0o700, exist_ok=True)
@@ -937,7 +1010,23 @@ async def _serve(directory, private):
                             native_lock = True
                 except (ValueError, TypeError, AttributeError):
                     pass
-        if owner is None:
+        survivors = []
+        group_survivors = set()
+        if spec.get('report_background_killed') and stopping is None:
+            deadline = time.monotonic() + 5
+            while child.returncode is None and time.monotonic() < deadline:
+                await asyncio.sleep(.05)
+            if child.returncode is not None:
+                _write(directory / 'child-exited.json', True)
+                await asyncio.sleep(2)
+                survivors = await background_survivors(child.pid, owner, scrub)
+                for pid, _ in survivors:
+                    try:
+                        if os.getpgid(pid) == child.pid:
+                            group_survivors.add(pid)
+                    except ProcessLookupError:
+                        pass
+        if owner is None and not spec.get('report_background_killed'):
             await child.wait()
         if stopping:
             await stopping
@@ -947,6 +1036,8 @@ async def _serve(directory, private):
             cleanup = await asyncio.to_thread(ownership.cleanup, directory, (owner['pid'], owner['unique']))
             if cleanup['status'] == 'ok':
                 await child.wait()
+        if owner is None and spec.get('report_background_killed'):
+            await child.wait()
         if copy_stderr is not None:
             if cleanup is not None and cleanup['status'] != 'ok':
                 copy_stderr.cancel()
@@ -967,6 +1058,14 @@ async def _serve(directory, private):
         if alias.is_symlink() and alias.resolve() == directory:
             alias.unlink()
     result = {'returncode': child.returncode if child.returncode is not None else 1, 'time': time.time()}
+    if spec.get('report_background_killed') and survivors:
+        record = ownership.read_owner(directory) if owner is not None else None
+        killed = set(record.get('killed_pids', [])) if record else set()
+        if group_signalled:
+            killed.update(group_survivors)
+        lines = ['%s %s' % (pid, command) for pid, command in survivors if pid in killed]
+        if lines:
+            result['background_killed'] = '\n'.join(lines)[:2000]
     if cleanup is not None:
         result['cleanup'] = ownership.exit_cleanup(cleanup)
     _write(directory / 'exit.json', result)

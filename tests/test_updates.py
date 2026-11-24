@@ -86,7 +86,7 @@ class CardTests(unittest.TestCase):
 class TemporaryStore(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
-        self.root = Path(self.temporary.name)
+        self.root = Path(self.temporary.name).resolve()
         self.store = Store(self.root / 'state')
         self.local_npm_patch = patch.object(updates.watch, 'local_npm', return_value='/opt/homebrew/bin/npm', create=True)
         self.local_npm_patch.start()
@@ -449,7 +449,7 @@ class CheckoutTests(unittest.TestCase):
     def setUp(self):
         self.stores = []
         self.temporary = tempfile.TemporaryDirectory()
-        self.root = Path(self.temporary.name)
+        self.root = Path(self.temporary.name).resolve()
         self.remote = self.root / 'remote.git'
         self.source = self.root / 'source'
         self.live = self.root / 'checkout'
@@ -870,17 +870,28 @@ class CheckoutTests(unittest.TestCase):
         self.assertEqual(self.git(self.live, 'rev-parse', 'HEAD'), self.old)
         install.assert_not_called()
 
-    def test_prepare_refuses_moved_remote_then_updates(self):
+    def test_prepare_accepts_moved_remote_and_keeps_offered_commit(self):
         self.target = self.unverified_target()
         store, updater = self.preparation_record()
         (self.source / 'next').write_text('another upstream change\n')
         self.commit('remote moved')
         self.git(self.source, 'push', 'origin', 'main')
-        self.assert_preparation_refused(store, updater,
-            'origin/main changed since this card. Run /update again. Nothing changed.')
-        self.retry_preparation(store, target=self.git(self.source, 'rev-parse', 'HEAD'))
         self.assert_prepares_without_verification(store, updater)
-        self.assertFalse((store.directory / 'update-checks').exists())
+        record = store.get(updates.KEY)
+        self.assertEqual(record['target'], self.target)
+        self.git(self.live, 'merge', '--ff-only', record['target'])
+        self.assertEqual(self.git(self.live, 'rev-parse', 'HEAD'), self.target)
+
+    def test_prepare_refuses_force_pushed_remote(self):
+        self.target = self.unverified_target()
+        store, updater = self.preparation_record()
+        self.git(self.source, 'reset', '--hard', self.old)
+        (self.source / 'replacement').write_text('replacement upstream change\n')
+        self.commit('replacement remote history')
+        self.git(self.source, 'push', '--force', 'origin', 'main')
+        self.assert_preparation_refused(store, updater,
+            'origin/main no longer contains the offered commit. Run /update again. Nothing changed.')
+        self.assertEqual(self.git(self.live, 'rev-parse', 'HEAD'), self.old)
 
     def test_prepare_refuses_dirty_checkout_then_updates(self):
         self.target = self.unverified_target()
@@ -965,8 +976,13 @@ import sys
 import time
 if sys.argv[1] == 'control':
     Path(sys.argv[2]).write_text('restart')
+    deadline = time.monotonic() + 60
+    while not Path(sys.argv[3]).exists() and time.monotonic() < deadline:
+        time.sleep(0.02)
+    if not Path(sys.argv[3]).exists():
+        sys.exit(1)
 else:
-    deadline = time.monotonic() + 10
+    deadline = time.monotonic() + 60
     while not Path(sys.argv[3]).exists() and time.monotonic() < deadline:
         time.sleep(0.02)
     with sqlite3.connect(sys.argv[2], timeout=5) as db:
@@ -978,11 +994,13 @@ else:
             commit=subprocess.check_output(['git', '-C', record['root'], 'rev-parse', 'HEAD'], text=True).strip(),
             restart_started=record.get('restart_started'))
         db.execute("UPDATE settings SET value=? WHERE key='telegram_update_v1'", (json.dumps(record),))
-    time.sleep(10)
+    Path(sys.argv[4]).touch()
+    time.sleep(60)
 ''')
-        old_service = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(15)'])
+        old_service = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])
+        ready = self.root / 'health-ready'
         new_service = subprocess.Popen([sys.executable, str(script), 'service',
-                                       str(store.directory / 'state.sqlite'), str(marker)])
+                                       str(store.directory / 'state.sqlite'), str(marker), str(ready)])
         watchdog = None
         try:
             with store.db:
@@ -992,13 +1010,14 @@ else:
                     restart_started=updates.time.time() - 51, restart_from=dict(pid=old_service.pid,
                     process=updates.watch.process_identity(old_service.pid)), health=None))
             watchdog = subprocess.Popen([sys.executable, str(updates.ROOT / 'scripts/update-watchdog.py'),
-                str(store.directory / 'state.sqlite'), 'real', '--restart-timeout', '0.2',
-                '--service-control', json.dumps([sys.executable, str(script), 'control', str(marker)])],
+                str(store.directory / 'state.sqlite'), 'real', '--restart-timeout', '1',
+                '--service-control', json.dumps([sys.executable, str(script), 'control', str(marker), str(ready)])],
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-            output = watchdog.communicate(timeout=3)
+            output = watchdog.communicate(timeout=90)
             self.assertEqual(watchdog.returncode, 0, output)
             record = store.get(updates.KEY)
-            self.assertEqual(record['phase'], 'rolled_back')
+            self.assertEqual(record['phase'], 'rolled_back', record)
+            self.assertEqual(record['result'], 'Update failed: healthy restart deadline expired.')
             self.assertEqual(record['health']['pid'], new_service.pid)
             self.assertEqual(self.git(self.live, 'rev-parse', 'HEAD'), self.old)
         finally:
@@ -1424,9 +1443,9 @@ class IdentityTests(TemporaryStore):
 
     def test_claude_launch_fingerprint_changes_without_setting(self):
         link, manifest, prefix = self.package('claude')
-        before = CoordinatorSession._launch_inputs(self.store, 'model', 'prompt', None, binary=str(link)).fingerprint
+        before = CoordinatorSession._launch_inputs(self.store, 'model', 'prompt', None, binary=str(link), topic='home').fingerprint
         manifest.write_text(json.dumps(dict(name=cli_identity.PACKAGES['claude'], version='2.0.0')))
-        after = CoordinatorSession._launch_inputs(self.store, 'model', 'prompt', None, binary=str(link)).fingerprint
+        after = CoordinatorSession._launch_inputs(self.store, 'model', 'prompt', None, binary=str(link), topic='home').fingerprint
         self.assertNotEqual(before, after)
         self.assertIsNone(self.store.get('telegram_updates_enabled'))
 
@@ -1470,7 +1489,7 @@ class WatchdogSafetyTests(TemporaryStore):
             updates.watch.write(self.store.db, 'test', health=dict(pid=333, process='back',
                 commit='a' * 40, restart_started=current.get('restart_started')))
             return ''
-        with patch.object(updates.watch, 'host_os', SimpleNamespace(linux=lambda: True), create=True):
+        with patch.object(updates.watch.host_os, 'SYSTEM', 'linux'):
             with patch.object(updates.watch, 'command', side_effect=command), patch.object(
                     updates.watch, 'rollback_code', return_value='Torii restored.'):
                 with patch.object(updates.watch, 'process_identity', side_effect=self.identity):

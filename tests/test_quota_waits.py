@@ -34,7 +34,7 @@ for line in sys.stdin:
     print(json.dumps({**json.loads(line),'isReplay':True}),flush=True)
     if home.name in ('primary','first') and not (Path(__file__).parent/'rejected').exists():
         print(json.dumps({'type':'rate_limit_event','session_id':sid,'rate_limit_info':
-            {'status':'rejected','resetsAt':int(time.time())+3600,'rateLimitType':'five_hour'}}),flush=True)
+            {'status':'rejected','resetsAt':int(time.time())+3600,'rateLimitType':'seven_day'}}),flush=True)
         (Path(__file__).parent/'rejected').write_text('1')
         time.sleep(120)
         sys.exit(1)
@@ -97,7 +97,7 @@ class QuotaWaitTests(unittest.IsolatedAsyncioTestCase):
             async def run(self, provider, prompt, cwd, session, **options):
                 calls.append(prompt)
                 return RunResult(session, quota_limited=True, transcript_path=str(transcript),
-                                 rate_limit_info={'status': 'rejected', 'rateLimitType': 'five_hour',
+                                 rate_limit_info={'status': 'rejected', 'rateLimitType': 'seven_day',
                                                   'resetsAt': reset})
 
         service = Service(self.store, None, Runner(), self.root)
@@ -132,7 +132,7 @@ class QuotaWaitTests(unittest.IsolatedAsyncioTestCase):
                 if len(calls) == 1:
                     store.task_update(task['id'], status='done')
                     return RunResult(session, quota_limited=True, transcript_path=str(transcript),
-                                     rate_limit_info={'status': 'rejected', 'rateLimitType': 'five_hour',
+                                     rate_limit_info={'status': 'rejected', 'rateLimitType': 'seven_day',
                                                       'resetsAt': time.time() + 3600})
                 return RunResult(session, success=True, transcript_path=str(transcript))
 
@@ -156,7 +156,7 @@ class QuotaWaitTests(unittest.IsolatedAsyncioTestCase):
         worker = self.worker()
         await service.workers_once()
         await until((self.root / 'rejected').exists, 'the fake claude to emit a rejected rate limit')
-        await until(lambda: service.workers.get(worker['id'])['last_seq'] >= 3, 'the rejection to be consumed')
+        await until(lambda: self.store.consumed_flush() or service.workers.get(worker['id'])['last_seq'] >= 3, 'the rejection to be consumed')
         self.assertEqual(service.workers.get(worker['id'])['status'], 'running')
         stop = self.store.service_request('workers.stop', {'worker': worker['id']})
         await asyncio.wait_for(service.controls_once(), 30)
@@ -211,11 +211,9 @@ class WaitNoticeTests(unittest.IsolatedAsyncioTestCase):
                                         for alias in ('a', 'b')})
             self.store.put('account_status', {
                 'a': {'identity': {'email': 'a@example.com', 'logged_in': True}, 'observed_at': self.now,
-                      'usage': {'five_hour': {'utilization': 100, 'resets_at': self.reset_a},
-                                'seven_day': {'utilization': 40, 'resets_at': self.now + 86400.187197}}},
+                      'usage': {'seven_day': {'utilization': 100, 'resets_at': self.reset_a}}},
                 'b': {'identity': {'email': 'b@example.com', 'logged_in': True}, 'observed_at': self.now,
-                      'usage': {'five_hour': {'utilization': 100, 'resets_at': self.now + 7200.253114},
-                                'seven_day': {'utilization': 40, 'resets_at': self.now + 90000.253137}}}})
+                      'usage': {'seven_day': {'utilization': 100, 'resets_at': self.now + 7200.253114}}}})
             self.store.db.execute('''INSERT INTO topics(id,chat,thread,name,cwd,enabled)
                 VALUES (?,?,?,?,?,1)''', ('home', -100, 1, 'Home', str(self.root)))
             self.store.put('coordinator_home_topic', 'home')
@@ -245,7 +243,7 @@ class WaitNoticeTests(unittest.IsolatedAsyncioTestCase):
                     'identity': snapshots[alias]['identity'], 'usage': usage}
 
         await refresh_accounts(self.store, later_check)
-        self.assertEqual(self.store.get('account_status')['a']['usage']['five_hour']['resets_at'],
+        self.assertEqual(self.store.get('account_status')['a']['usage']['seven_day']['resets_at'],
                          self.reset_a + 0.4)
         with patch('coordinator.service.time.time', return_value=self.reset_a + 0.01):
             await self.service.feed_once()
@@ -358,7 +356,7 @@ class OpenCodeQuotaWaitTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.store.get(self.chat.session_key + '_selection_notice')['text'],
                          "This chat is paused: OpenCode subscription account one is out of usage until " +
                          time.strftime('%Y-%m-%d %H:%M %Z', time.localtime(reset)) +
-                         ". I'll continue at the reset. Torii does not move this chat to another agent. Your messages are saved.")
+                         ". I'll continue at the reset. No other agent of its queue can take it now. Your messages are saved.")
 
         def refresh(alias):
             return dict(snapshot, observed_at=reset + 1)
@@ -573,7 +571,6 @@ class OpenCodeQuotaWaitTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_owner_credit_retry_with_batched_intake(self):
         failed, block = await self.credit_pause()
-        self.store.put('coordinator_intake_batching', True)
         self.chat.scenario()
         owner = self.chat.row('Continue with the saved requests.')
         for _ in range(3):
@@ -729,13 +726,19 @@ class OpenCodeQuotaWaitTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsInstance(original['key'][2], float)
         for recheck in range(3):
             previous = self.store.get('opencode_account_blocks')['one']['until']
+            release = self.chat.root / ('recheck-release-%d' % recheck)
+            self.chat.scenario(http_error=402, error_message='synthetic rejection',
+                               response_body='synthetic rejection', error_release=str(release))
             with patch('coordinator.service.time.time', return_value=previous + 1):
                 opencode_runtime.record_parent_block(self.store, 'one', 'out_of_credit')
                 resumed = await self.service.start_session('chat')
                 self.assertIsNotNone(resumed)
                 self.chat.parents.append(resumed)
-                await self.chat.send(resumed, self.chat.row('scheduled credit retry %d' % recheck))
-                await resumed.wait_closed()
+                try:
+                    await self.chat.send(resumed, self.chat.row('scheduled credit retry %d' % recheck))
+                finally:
+                    release.touch()
+                await settle(resumed.wait_closed())
                 self.assertIsNone(await self.service.start_session('chat'))
         self.assertEqual(len(self.chat.calls('initialize')), 4)
         self.assertEqual(len(self.chat.calls('session/prompt')), 4)

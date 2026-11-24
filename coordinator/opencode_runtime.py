@@ -1,23 +1,20 @@
 """Isolated OpenCode workers on the pinned ACP adapter."""
 
-import asyncio
 from email.utils import parsedate_to_datetime
 import hashlib
 import json
 import math
 import os
-import pwd
 import re
 import shutil
 import sqlite3
 import stat
-import sys
 import time
 import uuid
 from pathlib import Path
 import tempfile
 
-from . import native_ids
+from . import host_os, native_ids
 from .acp_protocol import AcpAdapter
 from .control_api import Refused
 
@@ -48,11 +45,7 @@ def environment(root, base):
 
 
 def managed_preference_paths():
-    if sys.platform != 'darwin':
-        return ()
-    directory = Path('/Library/Managed Preferences')
-    user = pwd.getpwuid(os.getuid()).pw_name or 'user'
-    return (directory / user / 'ai.opencode.managed.plist', directory / 'ai.opencode.managed.plist')
+    return host_os.managed_preference_paths('ai.opencode.managed')
 
 
 def managed_config_clear():
@@ -183,7 +176,7 @@ def parent_environment(root, base):
     return environment(root, base)
 
 
-def parent_config(account, key_path, cwd, instructions_path):
+def parent_config(account, key_path, cwd, instructions_path, mcp_entries=None):
     model = account['model']
     subscription = account.get('provider') == 'opencode-go'
     provider = 'opencode-go' if subscription else 'torii-host'
@@ -193,15 +186,19 @@ def parent_config(account, key_path, cwd, instructions_path):
             'limit': {'context': account['context'], 'output': account['output']},
             'cost': {'input': account['price_in'], 'cache_read': account['price_cached'], 'output': account['price_out']}}})
         profile['options']['baseURL'] = account['base_url']
-    return {'share': 'disabled', 'autoupdate': False, 'enabled_providers': [provider],
+    config = {'share': 'disabled', 'autoupdate': False, 'enabled_providers': [provider],
             'provider': {provider: profile}, 'lsp': False, 'formatter': False,
             'model': provider + '/' + model, 'small_model': provider + '/' + model, 'mcp': {},
             'permission': {'*': 'deny', 'torii_*': 'allow'},
             'instructions': [str(instructions_path)] + ([str(Path(cwd) / 'AGENTS.md')]
                              if (Path(cwd) / 'AGENTS.md').is_file() else [])}
+    for name, entry in (mcp_entries or {}).items():
+        config['mcp'][name] = {'type': 'remote', 'url': entry['url'], 'headers': entry['headers'], 'oauth': False}
+        config['permission'][re.sub(r'[^a-zA-Z0-9_-]', '_', name) + '_*'] = 'allow'
+    return config
 
 
-def write_parent_config(root, account, key_path, cwd, instructions_path):
+def write_parent_config(root, account, key_path, cwd, instructions_path, mcp_entries=None):
     directory = Path(root) / 'config' / 'opencode'
     directory.mkdir(parents=True, exist_ok=True, mode=0o700)
     directory.chmod(0o700)
@@ -215,7 +212,7 @@ def write_parent_config(root, account, key_path, cwd, instructions_path):
     write_private(Path(root) / 'guard-launch.json',
                   (json.dumps({'version': 1, 'launch': uuid.uuid4().hex}) + '\n').encode())
     path = directory / 'opencode.json'
-    write_private(path, (json.dumps(parent_config(account, key_path, cwd, instructions_path)) + '\n').encode())
+    write_private(path, (json.dumps(parent_config(account, key_path, cwd, instructions_path, mcp_entries)) + '\n').encode())
     return path
 
 
@@ -558,8 +555,19 @@ class OpenCodeBroker:
                     and block.get('until', 0) > time.time() else alias)
         return alias if opencode_subscription.available(self.store, alias, worker_id) else None
 
-    async def ready(self, alias, worker_id=None):
+    def default_model(self):
+        from . import opencode_accounts
+        return (opencode_accounts.accounts(self.store).get(opencode_accounts.active(self.store)) or {}).get('model')
+
+    def capacity(self, model):
+        """A short rate limit is not an outage."""
+        from . import opencode_accounts
+        account = opencode_accounts.active(self.store)
+        return bool(account and self.block(account).get('reason') == 'rate_limited') or self.select() is not None
+
+    async def ready(self, worker):
         from . import opencode_accounts, opencode_subscription
+        alias, worker_id = worker['account_alias'], worker['id']
         account = opencode_accounts.accounts(self.store).get(alias, {})
         if opencode_subscription.is_subscription(account):
             if opencode_subscription.launch_state(self.store, alias, worker_id) in opencode_subscription.AUTH_ERRORS:
@@ -568,6 +576,9 @@ class OpenCodeBroker:
                 return False
             return await opencode_subscription.ready(self.store, alias, worker_id)
         return self.select(alias, worker_id) is not None
+
+    def reset(self, worker):
+        return self.earliest_reset(worker['account_alias'], worker['id'])
 
     def earliest_reset(self, alias=None, worker_id=None):
         from . import opencode_accounts
@@ -622,7 +633,7 @@ class OpenCodeBroker:
             if state in opencode_subscription.AUTH_ERRORS:
                 return RunResult(session_id, failure_code='auth',
                                  error='OpenCode subscription failed: %s' % opencode_subscription.ERRORS[state])
-            if not await self.ready(alias, worker_id):
+            if not await self.ready({'account_alias': alias, 'id': worker_id}):
                 if state == 'usage_unavailable':
                     with self.store.db:
                         opencode_subscription.record_unavailable(self.store, alias)

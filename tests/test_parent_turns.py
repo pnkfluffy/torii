@@ -82,6 +82,7 @@ class ParentTurnTests(unittest.IsolatedAsyncioTestCase):
         for alias in ('a', 'b'):
             (self.root / alias).mkdir()
         with self.store.db:
+            self.store.put('coordinator_home_topic', 'home')
             self.store.put('accounts', {alias: {'config_dir': str(self.root / alias), 'enabled': True}
                                         for alias in ('a', 'b')})
             self.store.put('account_status', {alias: {

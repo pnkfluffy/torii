@@ -12,15 +12,8 @@ A later replay or a transcript entry confirms it. A running service worker keeps
 running under its host; it becomes `interrupted` only when its host died without
 an exit record. Telegram delivery failure retries the outbox without rerunning work.
 
-`tests.test_job_disposition` and `tests.test_job_resume` cover the optional
-`auto_resume` switch. They check settle reminders, owner waits, stop sources,
-cause mapping, retry bounds, progress resets, quota rebuilds, network recovery,
-native session reuse and final results from processes that remain running.
-They also check the default-off behavior and durable resume state after restart.
-`tests.test_job_review` covers Muse availability, per-job error isolation,
-parked secret and quota workers, condition failures after automatic continuation,
-account-fire attempt preservation, queued-worker notices and held-copy recovery.
-It also covers the deferred result-line requirement and short owner error text.
+`tests.test_job_disposition` checks that an interrupted worker leaves its job
+open with no automatic resume, the restart notice, and parked secret workers.
 
 Live verification needs an authorized disposable topic and native session.
 Observe the request, native receipt, worker result, and Telegram reply without

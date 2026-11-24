@@ -152,7 +152,75 @@ class PublicSnapshotTests(unittest.TestCase):
 
     def build(self, commit=None):
         return snapshot.build(self.repo, commit or self.commit, self.output, self.denylist,
-                              'Public Author', 'public@example.invalid')
+                              'Public Author', 'public@example.invalid', root=True)
+
+    def test_torii_rule_comments_are_removed_from_public_snapshot(self):
+        path = self.repo / 'coordinator/defaults/Torii.md'
+        path.parent.mkdir(parents=True)
+        template = (snapshot.ROOT / 'coordinator/defaults/Torii.md').read_text()
+        path.write_text(template + '\n- Public rule. <!-- private provenance -->\n')
+        self.manifest['keep']['coordinator/defaults/Torii.md'] = 'Shared rules.'
+        revision = self.save()
+        with patch.object(snapshot, 'scan'):
+            self.build(revision)
+        exported = (self.output / 'coordinator/defaults/Torii.md').read_text()
+        self.assertIn('Public rule.', exported)
+        self.assertNotIn('private provenance', exported)
+        self.assertNotIn('trash.move', exported)
+        self.assertIn('Move the target to the Trash', exported)
+
+    def test_successive_snapshots_fast_forward_and_pass_update_inventory(self):
+        from coordinator import updates
+        (self.repo / 'VERSION').write_text('version\n')
+        self.manifest['keep']['VERSION'] = 'Source version.'
+        self.commit = self.save()
+        with patch.object(snapshot, 'scan'):
+            first = self.build()
+        bare = self.root / 'public.git'
+        snapshot.git(self.root, 'clone', '--bare', str(self.output), str(bare), env=self.env)
+        clone = self.root / 'clone'
+        snapshot.git(self.root, 'clone', str(bare), str(clone), env=self.env)
+        (self.repo / 'README.md').write_text('new public source\n')
+        revision = self.save()
+        second_dir = self.root / 'second'
+        with patch.object(snapshot, 'scan'), patch.object(snapshot, 'PUBLIC_ROOT', first['snapshot_commit']):
+            second = snapshot.build(self.repo, revision, second_dir, self.denylist,
+                                    'Public Author', 'public@example.invalid', public_repo=str(bare))
+        self.assertEqual(second['parent'], first['snapshot_commit'])
+        self.assertEqual(snapshot.git(second_dir, 'show', 'HEAD:README.md'), b'new public source\n')
+        snapshot.git(second_dir, 'push', str(bare), 'HEAD:refs/heads/main', env=self.env)
+        with patch.object(updates, 'installation', return_value=(None, None, None)):
+            plan = updates.inventory(clone, {})
+        self.assertEqual(plan['old'], first['snapshot_commit'])
+        self.assertEqual(plan['target'], second['snapshot_commit'])
+        self.assertEqual(updates.checkout(clone, plan['target']), first['snapshot_commit'])
+        snapshot.git(clone, 'merge', '--ff-only', 'origin/main', env=self.env)
+        self.assertEqual(snapshot.git(clone, 'rev-parse', 'HEAD').decode().strip(), second['snapshot_commit'])
+        self.assertEqual(snapshot.git(clone, 'rev-parse', 'HEAD^{tree}'),
+                         snapshot.git(second_dir, 'rev-parse', 'HEAD^{tree}'))
+        third_dir = self.root / 'third'
+        with patch.object(snapshot, 'scan'), patch.object(snapshot, 'PUBLIC_ROOT', first['snapshot_commit']):
+            third = snapshot.build(self.repo, revision, third_dir, self.denylist,
+                                   'Public Author', 'public@example.invalid', public_repo=str(bare))
+        self.assertEqual(third['parent'], second['snapshot_commit'])
+        (second_dir / 'README.md').write_text('altered public tree\n')
+        snapshot.git(second_dir, 'add', '--all', env=self.env)
+        public_env = dict(self.env, GIT_AUTHOR_NAME='Public Author', GIT_AUTHOR_EMAIL='public@example.invalid',
+                          GIT_COMMITTER_NAME='Public Author', GIT_COMMITTER_EMAIL='public@example.invalid')
+        snapshot.git(second_dir, 'commit', '-m', 'Public source snapshot', env=public_env)
+        snapshot.git(second_dir, 'push', str(bare), 'HEAD:refs/heads/main', env=self.env)
+        with patch.object(snapshot, 'scan'), patch.object(snapshot, 'PUBLIC_ROOT', first['snapshot_commit']):
+            with self.assertRaisesRegex(ValueError, 'tree does not match'):
+                snapshot.build(self.repo, revision, self.root / 'invalid', self.denylist,
+                               'Public Author', 'public@example.invalid', public_repo=str(bare))
+
+    def test_untrusted_public_history_is_rejected(self):
+        bare = self.root / 'untrusted.git'
+        snapshot.git(self.root, 'clone', '--bare', str(self.repo), str(bare), env=self.env)
+        snapshot.git(self.repo, 'push', str(bare), 'HEAD:refs/heads/main', env=self.env)
+        with patch.object(snapshot, 'scan'), self.assertRaisesRegex(ValueError, 'trusted 2.0'):
+            snapshot.build(self.repo, self.commit, self.output, self.denylist,
+                           'Public Author', 'public@example.invalid', public_repo=str(bare))
 
     def test_export_uses_commit_allowlist_and_has_one_commit_no_remote_and_new_identity(self):
         (self.repo / 'README.md').write_text('dirty harmless-private-marker\n')
@@ -175,9 +243,10 @@ class PublicSnapshotTests(unittest.TestCase):
         self.assertTrue(dates[0].endswith('Z'))
         self.assertEqual(snapshot.git(self.output, 'status', '--porcelain').strip(), b'')
 
-    def test_source_manifest_includes_group_live_test_plan(self):
+    def test_source_manifest_includes_guide(self):
         manifest = json.loads((ROOT / snapshot.MANIFEST).read_text())
-        self.assertIn('docs/group-setup-live-test.md', manifest['keep'])
+        self.assertIn('README.md', manifest['keep'])
+        self.assertIn('Live Telegram checks', (ROOT / 'README.md').read_text())
 
     def test_snapshot_records_the_source_revision_before_scanning(self):
         (self.repo / 'VERSION').write_text('$Format:%h$\n')
@@ -345,7 +414,8 @@ class PublicClosureTests(unittest.TestCase):
             for node in ast.walk(ast.parse((ROOT / path).read_text())):
                 if not isinstance(node, ast.Constant) or not isinstance(node.value, str):
                     continue
-                if path == 'coordinator/extension.py' and node.value == '.' + extension.LOCAL.rsplit('.', 1)[1]:
+                if path == 'coordinator/extension.py' and node.value in ('.' + extension.LOCAL.rsplit('.', 1)[1],
+                                                                 '.' + extension.LOCAL_OPS.rsplit('.', 1)[1]):
                     continue
                 self.assertNotIn(node.value, names, path)
 
@@ -456,7 +526,7 @@ class PublicRuntimeSnapshotTests(unittest.TestCase):
                     worker = self.service.workers.get(self.worker())
                     await self.service.workers.run(worker, self.store.topic(TOPIC))
                     instructions = self.runner.calls[-1][4]['instructions']
-                    self.assertIn('Preserve native history.', instructions)
+                    self.assertIn('Ending your turn ends your work.', instructions)
                     job = self.store.task_create(TOPIC, 'Public job')
                     with self.assertRaisesRegex(ValueError, r'^pr must be a GitHub pull request URL\\.$'):
                         self.store.task_update(job['id'], pr='not-a-github-url')
@@ -526,7 +596,7 @@ class PublicRuntimeSnapshotTests(unittest.TestCase):
         self.assertIn('Ran 2 tests', result.stderr)
         result = subprocess.run([
             sys.executable, '-m', 'unittest', '-v', 'tests.test_main', 'tests.test_mac_identity',
-            'tests.test_workers.WorkerTests.test_a5_instruction_baselines_for_other_providers'],
+            'tests.test_workers.WorkerTests.test_rule_file_layers_reach_new_worker'],
             cwd=self.output, env=dict(self.env, PYTHONPATH=str(self.output)),
             capture_output=True, text=True, timeout=60)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -537,6 +607,7 @@ class PublicRuntimeSnapshotTests(unittest.TestCase):
             data = (root / name).read_bytes()
             if name == snapshot.MANIFEST:
                 data = (json.dumps({'keep': manifest['keep'], 'omit': {}}, indent=2) + '\n').encode()
+            data = snapshot.public_content(name, data)
             for index, value in enumerate(denied, 1):
                 for kind, content in (('filename', name.encode()), ('content', data)):
                     count = content.lower().count(value)
@@ -552,6 +623,11 @@ class PublicRuntimeSnapshotTests(unittest.TestCase):
         control = {'keep': {name: 'Synthetic boundary control.'}, 'omit': {}}
         self.assertEqual(self.denied_counts(self.repo, control, [token.encode()]),
                          {'entry-1 filename': 1, 'entry-1 content': 2})
+        rule = self.repo / 'coordinator/defaults/Torii.md'
+        rule.parent.mkdir(parents=True, exist_ok=True)
+        rule.write_text('<!-- ' + token + ' -->\nvisible\n')
+        self.assertEqual(self.denied_counts(self.repo, {'keep': {'coordinator/defaults/Torii.md': 'test'}},
+                                            [token.encode()]), {})
         if 'TORII_PUBLIC_DENYLIST' in os.environ:
             denylist = Path(os.environ['TORII_PUBLIC_DENYLIST'])
         else:

@@ -23,7 +23,7 @@ from coordinator.__main__ import service_running, state_dir
 from coordinator.bot_token import save_token
 from coordinator.pairing import link
 from coordinator.setup_flow import REMOVED, setup_state
-from coordinator import isolation
+from coordinator import host_os, isolation
 from coordinator import setup_terminal
 from coordinator.store import Store
 from coordinator.telegram import Telegram, TelegramError
@@ -56,18 +56,9 @@ def check_prereqs():
         rows.append((label, problem or ('ok' if found else 'not found (optional when the other agent is installed)')))
         agent_found = agent_found or found
     fatal = fatal or not agent_found
-    if sys.platform == 'darwin':
-        rows.append(('Service manager', 'launchd'))
-    elif sys.platform.startswith('linux') and os.getuid() != 0:
-        try:
-            working = subprocess.run(['systemctl', '--user', 'show-environment'], capture_output=True, timeout=10).returncode == 0
-        except (OSError, subprocess.TimeoutExpired):
-            working = False
-        rows.append(('Service manager', 'systemd user service, linger on at install' if working else 'unavailable; see scripts/run-service.sh'))
-        fatal = fatal or not working
-    else:
-        rows.append(('Service manager', 'Linux root is refused' if sys.platform.startswith('linux') else 'macOS or Linux required'))
-        fatal = True
+    manager, working = host_os.service_manager_status()
+    rows.append(('Service manager', manager))
+    fatal = fatal or not working
     return rows, fatal
 
 
@@ -173,10 +164,7 @@ def open_group_link(username, code):
         setup_terminal.print_link(url)
         return
     print('If nothing opened, use this link (valid 30 minutes): ' + url)
-    browser = os.environ.get('BROWSER')
-    command = [browser, url] if browser else (
-        ['open', url] if sys.platform == 'darwin' else (
-            ['xdg-open', url] if os.environ.get('DISPLAY') or os.environ.get('WAYLAND_DISPLAY') else None))
+    command = host_os.browser_command(url)
     if command:
         try:
             subprocess.run(command, check=False, timeout=10)

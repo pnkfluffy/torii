@@ -8,7 +8,8 @@ import json
 import re
 import time
 
-from .control_api import WAIT_KINDS
+from . import sweeps
+from .control_api import WAIT_KINDS, wait_context as Context
 
 
 COMMIT = re.compile(r'[a-fA-F0-9]{40,64}\Z')
@@ -37,8 +38,8 @@ def install_schema(store):
         then_provider TEXT, then_prompt TEXT, then_model TEXT, then_effort TEXT, then_work TEXT,
         created REAL NOT NULL, PRIMARY KEY(wait,task))''')
     store.db.execute('CREATE INDEX IF NOT EXISTS wait_jobs_task ON wait_jobs(task,wait)')
-    if 'wait' not in store._columns('task_iterations'):
-        store.db.execute('ALTER TABLE task_iterations ADD COLUMN wait INTEGER REFERENCES waits(id)')
+    store.db.execute('''CREATE TABLE IF NOT EXISTS wait_pending_fires (
+        wait INTEGER PRIMARY KEY REFERENCES waits(id), arguments TEXT NOT NULL)''')
 
 
 def _callback(store, topic, text):
@@ -90,8 +91,6 @@ class WaitStore:
         return result
 
     def waits_list(self, topic=None, owner=False):
-        if not self.get('waits_enabled', False):
-            return []
         rows = self.db.execute('''SELECT id FROM waits WHERE state='armed'
             AND (? IS NULL OR topic=? OR EXISTS (SELECT 1 FROM wait_jobs j JOIN tasks t ON t.id=j.task
                 WHERE j.wait=waits.id AND t.topic=?)) AND (?=0 OR kind='owner') ORDER BY id''',
@@ -99,18 +98,15 @@ class WaitStore:
         return [self.wait_get(row['id']) for row in rows]
 
     def wait_due(self, now=None):
-        if not self.get('waits_enabled', False):
-            return []
         return [self.wait_get(row['id']) for row in self.db.execute('''SELECT id FROM waits
-            WHERE state='armed' AND kind='time' AND next_check<=? ORDER BY next_check,id''',
+            WHERE state='armed' AND next_check<=? AND (kind='time' OR EXISTS
+                (SELECT 1 FROM wait_pending_fires p WHERE p.wait=waits.id)) ORDER BY next_check,id''',
             (time.time() if now is None else now,)).fetchall()]
 
     def task_wait(self, topic, kind, ask, task=None, key=None, at=None, job=None, on=None,
                   buttons=None, watch=False, then_provider=None, then_prompt=None,
                   then_model=None, then_effort=None, then_work=None, pr=None, until=None,
                   commit=None, signal=None, next=None):
-        if not self.get('waits_enabled', False):
-            raise ValueError("Waits aren't switched on yet.")
         if kind not in WAIT_KINDS:
             raise ValueError('Wait kind must be ' + ', '.join(WAIT_KINDS) + '.')
         if not isinstance(ask, str) or not ask.strip():
@@ -232,13 +228,16 @@ class WaitStore:
             if linked:
                 if kind == 'pr':
                     self.task_update(task, pr=detail['url'])
+                nonblocking = watch or kind == 'job' and target['topic'] != topic
                 self.db.execute('''INSERT OR IGNORE INTO wait_jobs
                     (wait,task,blocking,then_provider,then_prompt,then_model,then_effort,then_work,created)
-                    VALUES (?,?,?,?,?,?,?,?,?)''', (wait, task, int(not watch), then_provider, then_prompt,
+                    VALUES (?,?,?,?,?,?,?,?,?)''', (wait, task, int(not nonblocking), then_provider, then_prompt,
                                                    then_model, then_effort, then_work, now))
-                if not watch:
-                    self.db.execute("UPDATE tasks SET status='waiting',reason=?,updated=? WHERE id=?",
-                                    (ask.strip(), now, task))
+                if then_prompt:
+                    from .records import add_refs, folder_refs
+                    add_refs(self, task, folder_refs(then_prompt))
+                if not nonblocking:
+                    self.task_row_write(task, {'status': 'waiting', 'reason': ask.strip(), 'updated': now})
                     self.db.execute('''UPDATE task_iterations SET closed=?,outcome='waiting',reason=?
                         WHERE task=? AND k=? AND closed IS NULL''', (now, ask.strip(), task, linked['iteration']))
                     from .reactions import set_desired
@@ -262,8 +261,6 @@ class WaitStore:
                 self.wait_cancel(row['id'], 'replaced by a new ask', resume=False)
 
     def wait_end_blocking(self, task, reason):
-        if not self.get('waits_enabled', False):
-            return
         with self.transaction():
             rows = self.db.execute('''SELECT w.id FROM waits w JOIN wait_jobs j ON j.wait=w.id
                 WHERE j.task=? AND j.blocking=1 AND w.state='armed' ORDER BY w.id''', (task,)).fetchall()
@@ -276,8 +273,6 @@ class WaitStore:
             self.refresh_owner_waiting()
 
     def wait_resume_unblocked(self, reason='The wait ended without another trigger.'):
-        if not self.get('waits_enabled', False):
-            return
         with self.transaction():
             rows = self.db.execute('''SELECT t.id,t.topic,t.title FROM tasks t WHERE t.status='waiting'
                 AND NOT EXISTS (SELECT 1 FROM wait_jobs j JOIN waits w ON w.id=j.wait
@@ -289,8 +284,6 @@ class WaitStore:
                 self.wait_open_round(row['id'], message, reason=reason)
 
     def wait_resolve_task(self, task, message):
-        if not self.get('waits_enabled', False):
-            return
         with self.transaction():
             row = self.db.execute('''SELECT w.id FROM waits w JOIN wait_jobs j ON j.wait=w.id
                 WHERE j.task=? AND j.blocking=1 AND w.kind='owner' AND w.state='armed'
@@ -307,7 +300,7 @@ class WaitStore:
                 self.refresh_owner_waiting()
 
     def _clear_owner_buttons(self, item):
-        if not self.get('waits_enabled', False) or item['kind'] != 'owner' or item['ask_outbox'] is None:
+        if item['kind'] != 'owner' or item['ask_outbox'] is None:
             return
         row = self.db.execute('SELECT * FROM outbox WHERE id=?', (item['ask_outbox'],)).fetchone()
         if row is None:
@@ -330,37 +323,56 @@ class WaitStore:
             k = job['iteration'] + 1
             self.db.execute('''INSERT INTO task_iterations(task,k,opened,opened_by,origin,wait,reason)
                 VALUES (?,?,?,?,?,?,?)''', (task, k, now, opened_by, message, wait, reason))
-            self.db.execute("UPDATE tasks SET status='open',iteration=?,reason=NULL,updated=? WHERE id=?", (k, now, task))
+            self.task_row_write(task, {'status': 'open', 'iteration': k, 'reason': None, 'updated': now})
             from .reactions import set_desired
             set_desired(self, message, '👀')
         return self.task_get(task)
 
     def wait_fire(self, wait, message=None, choice=None, outcome=None, skip_worker=None, reuse_callback=False, proof=None, check=None):
-        if not self.get('waits_enabled', False):
-            raise ValueError("Waits aren't switched on yet.")
         with self.transaction():
             item = self.wait_get(wait)
             if item is None:
                 raise ValueError('Unknown wait.')
             if item['state'] != 'armed':
                 return item
+            pending = self.db.execute('SELECT arguments FROM wait_pending_fires WHERE wait=?', (wait,)).fetchone()
+            if pending:
+                arguments = json.loads(pending['arguments'])
+                message, choice, outcome = arguments['message'], arguments['choice'], arguments['outcome']
+                skip_worker, reuse_callback = arguments['skip_worker'], arguments['reuse_callback']
+                proof, check = arguments['proof'], arguments['check']
             origin = None
             if message is not None:
                 origin = self.db.execute('SELECT * FROM messages WHERE id=?', (message,)).fetchone()
                 allowed_topics = {item['topic']} | {job['topic'] for job in item['jobs']}
                 if not origin or origin['topic'] not in allowed_topics or origin['kind'] not in ('owner', 'callback', 'secret_filled'):
                     raise ValueError('Use an owner message or firing callback from the wait chat.')
+            from .idle_trim import spawn_guard
+            from .control_api import Refused
+            for link in item['jobs']:
+                if link['status'] == 'waiting' or (not link['blocking'] and link['status'] == 'interrupted'):
+                    try:
+                        if link['status'] == 'interrupted':
+                            raise Refused('Job is interrupted.')
+                        spawn_guard(self, link['task'])
+                    except Refused:
+                        arguments = dict(message=message, choice=choice, outcome=outcome, skip_worker=skip_worker,
+                                         reuse_callback=reuse_callback, proof=proof, check=check)
+                        self.db.execute('INSERT OR IGNORE INTO wait_pending_fires(wait,arguments) VALUES (?,?)',
+                                        (wait, json.dumps(arguments)))
+                        self.db.execute('UPDATE waits SET next_check=? WHERE id=?', (time.time() + 5, wait))
+                        return item
             outcome = outcome or ('choice:' + choice if choice is not None else
                                   {'owner': 'answered', 'time': 'due', 'job': 'done', 'signal': 'seen'}.get(item['kind'], 'manual'))
             self.db.execute("UPDATE waits SET state='fired',outcome=?,fired_by=?,updated=?,next_check=NULL WHERE id=?",
                             (outcome, str(message) if message is not None else None, time.time(), wait))
+            self.db.execute('DELETE FROM wait_pending_fires WHERE wait=?', (wait,))
             if proof is not None:
                 item['detail']['proof'] = proof
                 self.db.execute('UPDATE waits SET detail=? WHERE id=?', (json.dumps(item['detail']), wait))
             self._clear_owner_buttons(item)
             reason = 'dependency was dropped' if item['kind'] == 'job' and outcome == 'dropped' else outcome
             cause = {'answered': 'The question was answered.', 'due': 'The scheduled time arrived.',
-                     'account_available': 'An account is available.',
                      'done': 'The dependency is done.', 'dropped': 'The dependency was dropped.',
                      'waiting': 'The dependency is waiting.'}.get(outcome,
                          'Your choice was received.' if choice is not None else 'The wait ended.')
@@ -388,14 +400,19 @@ class WaitStore:
             for link in item['jobs']:
                 if self.get('topic_lifecycle:' + link['topic']):
                     continue
-                if link['status'] != 'waiting' and not (not link['blocking'] and link['status'] in ('done', 'dropped')):
-                    continue
-                automatic = (self.get('auto_resume', False) is True and item['kind'] == 'owner'
-                             and link['task'] in item['detail'].get('auto_resume_jobs', []))
-                if automatic and choice == 'Drop':
+                if not link['blocking'] and link['status'] in ('done', 'dropped'):
                     from .control_api import job_number
-                    self.task_update(link['task'], status='dropped', note='Dropped by the owner from the waiting list.')
-                    _callback(self, link['topic'], 'Job %s dropped by the owner.' % job_number(link['number'], link['iteration']))
+                    if link['topic'] not in callbacks:
+                        text = '' if trigger_text else cause + ' ' + item['ask']
+                        callbacks[link['topic']] = _callback(self, link['topic'], text)
+                        texts[link['topic']] = [text] if text else []
+                    label = 'Job %s (%s)' % (job_number(link['number'], link['iteration']), link['status'])
+                    text = '%s: %s.' % (label, trigger_text) if trigger_text else label + '.'
+                    if trigger_text:
+                        text += ' ' + item['ask'] + ('' if item['ask'].endswith(('.', '!', '?')) else '.')
+                    texts[link['topic']].append(text + ' Decide the next step.')
+                    continue
+                if link['status'] != 'waiting' and not (not link['blocking'] and link['status'] == 'open'):
                     continue
                 if proof is not None and self._wait_finish(item, link, outcome, proof, trigger_text):
                     continue
@@ -403,36 +420,30 @@ class WaitStore:
                     text = '' if trigger_text else cause + ' ' + item['ask']
                     callbacks[link['topic']] = _callback(self, link['topic'], text)
                     texts[link['topic']] = [text] if text else []
+                if not link['blocking'] and link['status'] == 'waiting':
+                    texts[link['topic']].append('%s remains waiting for another decision.' % link['title'])
+                    continue
                 firing = message if origin is not None else callbacks[link['topic']]
-                previous_round = self.task_iterations(link['task'])[-1] if automatic else None
-                job = self.wait_open_round(link['task'], firing, wait=wait, reason=reason)
-                queued_worker = None
-                if automatic and choice == 'Resume' and skip_worker != link['task']:
-                    if outcome == 'account_available':
-                        self.db.execute('''UPDATE task_iterations SET attempts=?,progress_head=?,cause=?
-                            WHERE task=? AND k=?''', (previous_round['attempts'], previous_round['progress_head'],
-                            previous_round['cause'], job['id'], job['iteration']))
-                    previous = self.db.execute('SELECT * FROM workers WHERE task=? ORDER BY id DESC LIMIT 1', (job['id'],)).fetchone()
-                    if previous:
-                        from .lifecycle import queue_resume
-                        queued_worker = queue_resume(self, job, dict(previous), automatic=outcome == 'account_available')
-                        if not queued_worker:
-                            self.db.execute("UPDATE tasks SET status='interrupted' WHERE id=?", (job['id'],))
-                            self.db.execute("""UPDATE task_iterations SET cause='account',resume_at=0,last_worker=?
-                                WHERE task=? AND k=?""", (previous['id'], job['id'], job['iteration']))
-                from .control_api import Context, Refused, op_workers_spawn
+                job = self.task_get(link['task']) if link['status'] == 'open' else self.wait_open_round(link['task'], firing, wait=wait, reason=reason)
+                from .control_api import Refused, op_workers_spawn
                 from .control_api import job_number
-                text = ('Job %s opened: %s.' % (job_number(job['number'], job['iteration']), trigger_text)
-                        if trigger_text else '%s opened.' % job['title'])
+                action = 'is open' if link['status'] == 'open' else 'opened'
+                text = ('Job %s %s: %s.' % (job_number(job['number'], job['iteration']), action, trigger_text)
+                        if trigger_text else '%s %s.' % (job['title'], action))
                 if trigger_text:
                     text += ' ' + item['ask'] + ('' if item['ask'].endswith(('.', '!', '?')) else '.')
-                if queued_worker:
-                    text += ' Worker %d queued to continue.' % queued_worker
-                elif link['then_provider'] and link['task'] != skip_worker:
+                if link['then_provider'] and link['task'] != skip_worker:
                     try:
+                        prompt = link['then_prompt']
+                        answer = choice if choice is not None else origin['text'] if origin is not None and origin['kind'] == 'owner' else None
+                        if item['kind'] == 'owner' and answer is not None:
+                            if answer.startswith('Replying to: '):
+                                answer = answer.partition('\n')[2]
+                            prompt = (prompt.replace('{answer}', answer) if '{answer}' in prompt
+                                      else prompt + '\n\nOwner answer: ' + answer)
                         with self.transaction():
                             result = op_workers_spawn(self, Context(), link['task'], link['then_provider'],
-                                link['then_prompt'], model=link['then_model'], effort=link['then_effort'], work=link['then_work'] or 'research')
+                                prompt, model=link['then_model'], effort=link['then_effort'], work=link['then_work'] or 'research')
                         text += ' Worker %d queued.' % result.data['worker']
                     except Exception as error:
                         from . import problems
@@ -449,6 +460,10 @@ class WaitStore:
                 self.db.execute('UPDATE messages SET text=? WHERE id=?', ('\n'.join(lines), callbacks[topic]))
             if message is None and callbacks:
                 self.db.execute('UPDATE waits SET fired_by=? WHERE id=?', (str(next(iter(callbacks.values()))), wait))
+            from .close_saves import request
+            for link in item['jobs']:
+                if not link['blocking']:
+                    request(self, link['task'])
             self.refresh_owner_waiting()
         return self.wait_get(wait)
 
@@ -492,8 +507,6 @@ class WaitStore:
         return True
 
     def wait_signal(self, name, *, internal=False):
-        if not self.get('waits_enabled', False):
-            return []
         if not isinstance(name, str) or not SIGNAL.fullmatch(name) or internal and name not in FIXED_SIGNALS:
             raise ValueError('Unknown signal name.')
         fired = []
@@ -513,15 +526,20 @@ class WaitStore:
                 raise ValueError('Unknown wait.')
             self.db.execute("""UPDATE waits SET state='cancelled',reason=?,updated=?,next_check=NULL
                 WHERE id=? AND state='armed'""", (reason.strip(), time.time(), wait))
+            self.db.execute('DELETE FROM wait_pending_fires WHERE wait=?', (wait,))
             if item['state'] == 'armed':
                 self._clear_owner_buttons(item)
+                from .close_saves import request
+                for link in item['jobs']:
+                    if not link['blocking']:
+                        request(self, link['task'])
             if resume:
                 self.wait_resume_unblocked(reason=reason.strip())
             self.refresh_owner_waiting()
         return self.wait_get(wait)
 
     def wait_task_changed(self, task, status):
-        if not self.get('waits_enabled', False) or status not in ('done', 'dropped', 'waiting'):
+        if status not in ('done', 'dropped', 'waiting'):
             return
         rows = self.db.execute("SELECT id,detail FROM waits WHERE kind='job' AND state='armed'").fetchall()
         for row in rows:
@@ -531,8 +549,6 @@ class WaitStore:
         self.refresh_owner_waiting()
 
     def wait_close_topic(self, topic):
-        if not self.get('waits_enabled', False):
-            return
         with self.transaction():
             for item in self.waits_list():
                 closing = [job for job in item['jobs'] if job['topic'] == topic]
@@ -555,16 +571,14 @@ class WaitStore:
                     self.db.execute('UPDATE waits SET topic=?,updated=? WHERE id=?',
                                     (destination, time.time(), item['id']))
             jobs = self.db.execute("SELECT id FROM tasks WHERE topic=? AND status IN ('open','waiting','interrupted')", (topic,)).fetchall()
-            self.db.execute("UPDATE tasks SET status='dropped',reason='chat closed',updated=? WHERE topic=? AND status='waiting'",
-                            (time.time(), topic))
+            for job in self.db.execute("SELECT id FROM tasks WHERE topic=? AND status='waiting'", (topic,)).fetchall():
+                self.task_row_write(job['id'], {'status': 'dropped', 'reason': 'chat closed', 'updated': time.time()})
             for job in jobs:
                 self.wait_task_changed(job['id'], 'dropped')
             self.wait_resume_unblocked(reason='The chat holding the wait closed.')
             self.refresh_owner_waiting()
 
     def wait_secret_filled(self, topic, message):
-        if not self.get('waits_enabled', False):
-            return
         for item in self.waits_list(topic, owner=True):
             if not item['key'].startswith('secret:'):
                 continue
@@ -574,8 +588,6 @@ class WaitStore:
                 self.wait_fire(item['id'], message)
 
     def refresh_owner_waiting(self):
-        if not self.get('waits_enabled', False):
-            return
         rows = self.db.execute("SELECT id FROM waits WHERE kind='owner' AND state!='armed'").fetchall()
         for row in rows:
             self._clear_owner_buttons(self.wait_get(row['id']))
@@ -606,16 +618,12 @@ class WaitStore:
 
 
 def pending_data(store, topic=None, owner=False):
-    if not store.get('waits_enabled', False):
-        return {'waits': [], 'held': []}
     held = [dict(row) for row in store.db.execute("""SELECT id,topic,title,number,iteration,copy_reason
         FROM tasks WHERE copy='held' AND (? IS NULL OR topic=?) ORDER BY topic,number""", (topic, topic))]
     return {'waits': store.waits_list(topic, owner), 'held': held if owner else []}
 
 
 def pending_text(store, data, limit=None):
-    if not store.get('waits_enabled', False):
-        return 'Nothing is waiting on you.'
     lines = []
     for item in data['waits']:
         ask = _short(item['ask'], 400)
@@ -643,8 +651,6 @@ def pending_text(store, data, limit=None):
 
 
 def owner_header(store, topic):
-    if not store.get('waits_enabled', False):
-        return ''
     lines = []
     for item in store.waits_list(topic, owner=True):
         values = (', '.join(job['title'] for job in item['jobs']) or 'Chat', item['ask'])
@@ -656,12 +662,12 @@ def owner_header(store, topic):
 
 def op_tasks_wait(store, ctx, kind, ask, task=None, topic=None, **params):
     from .control_api import Refused, Result
-    if not store.get('waits_enabled', False):
-        raise Refused("Waits aren't switched on yet.")
     if task is not None:
         job = store.task_get(task)
         if not job:
             raise Refused('Unknown job.')
+        if job['status'] == 'proposed':
+            raise Refused('A proposed job cannot wait until it is promoted.')
         if topic is not None and topic != job['topic']:
             raise Refused('Job is in another chat.')
         topic = job['topic']
@@ -676,10 +682,6 @@ def op_tasks_wait(store, ctx, kind, ask, task=None, topic=None, **params):
 
 def op_pending_signal(store, ctx, name):
     from .control_api import Refused, Result
-    if ctx.source != 'cli':
-        raise Refused('pending.signal is available only from the local CLI.')
-    if not store.get('waits_enabled', False):
-        raise Refused("Waits aren't switched on yet.")
     try:
         fired = store.wait_signal(name)
     except ValueError as error:
@@ -691,8 +693,6 @@ def op_pending_signal(store, ctx, name):
 def op_pending_list(store, ctx, topic=None, owner=False):
     from .control_api import Result
     data = pending_data(store, topic, owner)
-    if not store.get('waits_enabled', False):
-        return Result(True, 'Nothing is waiting on you.', data)
     return Result(True, pending_text(store, data) if owner else
                   '\n'.join(_wait_status(store, item) + ' ' + item['ask'] for item in data['waits']) or 'No waits.', data)
 
@@ -716,8 +716,6 @@ def op_pending_cancel(store, ctx, wait, reason):
 
 
 def accept_reply(store, topic, reply, message, text=None):
-    if not store.get('waits_enabled', False):
-        return
     if text is None:
         origin = store.db.execute('SELECT text FROM messages WHERE id=?', (message,)).fetchone()
         if origin is None:
@@ -735,7 +733,7 @@ def accept_reply(store, topic, reply, message, text=None):
 
 
 def accept_button(store, topic, message, data):
-    if not store.get('waits_enabled', False) or not isinstance(data, str):
+    if not isinstance(data, str):
         return 'stale_callback'
     match = WAIT_BUTTON.fullmatch(data)
     if match is None:
@@ -818,7 +816,7 @@ def _pr_observation(item, result):
 
 def _pr_checked(store, identifier, proof, outcome, check, detail, now):
     item = store.wait_get(identifier)
-    if not item or item['state'] != 'armed' or not store.get('waits_enabled', False):
+    if not item or item['state'] != 'armed':
         return
     interval = 60 if now - item['created'] < 1800 else 300
     detail.pop('not_found', None)
@@ -831,7 +829,7 @@ def _pr_checked(store, identifier, proof, outcome, check, detail, now):
 
 def _pr_unavailable(store, identifier, now, not_found=False, moved=None):
     item = store.wait_get(identifier)
-    if not item or item['state'] != 'armed' or not store.get('waits_enabled', False):
+    if not item or item['state'] != 'armed':
         return
     detail = item['detail']
     detail['not_found'] = detail.get('not_found', 0) + 1 if not_found else 0
@@ -861,73 +859,77 @@ def _pr_unavailable(store, identifier, now, not_found=False, moved=None):
 
 
 async def poll_github(store):
-    if not store.get('waits_enabled', False):
-        return
     from . import github
     from .store import PR
     runner = store.code_requests.run_github if store.code_requests is not None else github.run_github
     now = time.time()
     repositories = {}
     for item in store.waits_list():
-        if item['kind'] == 'pr':
+        if item['kind'] == 'pr' and not store.db.execute(
+                'SELECT 1 FROM wait_pending_fires WHERE wait=?', (item['id'],)).fetchone():
             repository = PR.fullmatch(item['detail']['url'])[1]
             repositories.setdefault(repository, []).append(item)
     for repository, items in repositories.items():
-        due = [item for item in items if item['next_check'] is not None and item['next_check'] <= now]
-        if not due:
+        if not any(item['next_check'] is not None and item['next_check'] <= now for item in items):
             continue
-        numbers = sorted({int(PR.fullmatch(item['detail']['url'])[2]) for item in items})
         try:
-            response = await asyncio.wait_for(runner(
-                ['gh', 'api', 'graphql', '-f', 'query=' + _pr_query(repository, numbers)],
-                github.GITHUB_TIMEOUT), github.GITHUB_TIMEOUT)
-            if not store.get('waits_enabled', False):
-                return
-            if (not isinstance(response, dict) or not isinstance(response.get('data'), dict)
-                    or 'repository' not in response['data']):
-                raise ValueError('GitHub query failed.')
-            results = response['data']['repository']
-        except asyncio.CancelledError:
-            raise
+            await _poll_repository(store, runner, now, repository, items)
         except Exception as error:
-            if not store.get('waits_enabled', False):
-                return
-            failed = time.time()
+            sweeps.failed(store, 'github-poll', repository, error, 'waits', {})
+        else:
+            sweeps.succeeded(store, 'github-poll', repository)
+
+
+async def _poll_repository(store, runner, now, repository, items):
+    """Check the due PR waits of one repository in one query. A failed query checks again in 15 min:
+    next_check is the only schedule, so the sweep state only records the failure and does not back off."""
+    from . import github
+    from .store import PR
+    due = [item for item in items if item['next_check'] is not None and item['next_check'] <= now]
+    numbers = sorted({int(PR.fullmatch(item['detail']['url'])[2]) for item in items})
+    try:
+        response = await asyncio.wait_for(runner(
+            ['gh', 'api', 'graphql', '-f', 'query=' + _pr_query(repository, numbers)],
+            github.GITHUB_TIMEOUT), github.GITHUB_TIMEOUT)
+        if (not isinstance(response, dict) or not isinstance(response.get('data'), dict)
+                or 'repository' not in response['data']):
+            raise ValueError('GitHub query failed.')
+        results = response['data']['repository']
+    except Exception:
+        failed = time.time()
+        with store.transaction():
+            for item in items:
+                store.db.execute("""UPDATE waits SET next_check=?,checks=checks+1,updated=?
+                    WHERE id=? AND state='armed'""", (failed + 900, failed, item['id']))
+        raise
+    for item in due:
+        number = PR.fullmatch(item['detail']['url'])[2]
+        alias = 'pr' + number
+        proof = results.get(alias) if isinstance(results, dict) else None
+        errors = [error for error in (response.get('errors') or []) if isinstance(error, dict)
+                  and isinstance(error.get('path'), list)
+                  and (error['path'] == ['repository'] or error['path'][:2] == ['repository', alias])]
+        not_found = proof is None and (any(error.get('type') == 'NOT_FOUND' for error in errors)
+            or isinstance(results, dict) and alias in results and not errors)
+        returned = PR.fullmatch(proof.get('url', '')) if isinstance(proof, dict) and isinstance(proof.get('url'), str) else None
+        moved = proof['url'] if returned and returned[1].casefold() != repository.casefold() and returned[2] == number else None
+        try:
+            if not_found or moved:
+                raise ValueError('PR is unavailable.')
+            outcome, check, detail = _pr_observation(item, proof)
+        except (ValueError, KeyError, TypeError, IndexError, AttributeError):
+            result = store.wait_hook('pr-trigger-failed', _pr_unavailable, store, item['id'], time.time(), not_found, moved)
+        else:
+            result = store.wait_hook('pr-trigger-failed', _pr_checked, store, item['id'], proof, outcome, check, detail, now)
+        if result is None:
             with store.transaction():
-                for item in items:
-                    store.db.execute("""UPDATE waits SET next_check=?,checks=checks+1,updated=?
-                        WHERE id=? AND state='armed'""", (failed + 900, failed, item['id']))
-            from . import problems
-            problems.record(store, 'waits', 'github-poll-failed', type(error).__name__)
-            continue
-        for item in due:
-            number = PR.fullmatch(item['detail']['url'])[2]
-            alias = 'pr' + number
-            proof = results.get(alias) if isinstance(results, dict) else None
-            errors = [error for error in (response.get('errors') or []) if isinstance(error, dict)
-                      and isinstance(error.get('path'), list)
-                      and (error['path'] == ['repository'] or error['path'][:2] == ['repository', alias])]
-            not_found = proof is None and (any(error.get('type') == 'NOT_FOUND' for error in errors)
-                or isinstance(results, dict) and alias in results and not errors)
-            returned = PR.fullmatch(proof.get('url', '')) if isinstance(proof, dict) and isinstance(proof.get('url'), str) else None
-            moved = proof['url'] if returned and returned[1].casefold() != repository.casefold() and returned[2] == number else None
-            try:
-                if not_found or moved:
-                    raise ValueError('PR is unavailable.')
-                outcome, check, detail = _pr_observation(item, proof)
-            except (ValueError, KeyError, TypeError, IndexError, AttributeError):
-                result = store.wait_hook('pr-trigger-failed', _pr_unavailable, store, item['id'], time.time(), not_found, moved)
-            else:
-                result = store.wait_hook('pr-trigger-failed', _pr_checked, store, item['id'], proof, outcome, check, detail, now)
-            if result is None and store.get('waits_enabled', False):
-                with store.transaction():
-                    store.db.execute("UPDATE waits SET next_check=? WHERE id=? AND state='armed'",
-                                     (time.time() + 900, item['id']))
+                store.db.execute("UPDATE waits SET next_check=? WHERE id=? AND state='armed'",
+                                 (time.time() + 900, item['id']))
 
 
 async def update_landed(updater, armed=False):
     store = updater.store
-    if not store.get('waits_enabled', False) or not updater.commit:
+    if not updater.commit:
         return
     from .updates import git, KEY
     record = store.get(KEY) or {}
@@ -943,8 +945,6 @@ async def update_landed(updater, armed=False):
             await asyncio.to_thread(git, updater.root, 'merge-base', '--is-ancestor', item['detail']['commit'], updater.commit)
         except (RuntimeError, OSError):
             continue
-        if not store.get('waits_enabled', False):
-            return
         store.wait_hook('update-trigger-failed', store.wait_fire, item['id'], outcome='landed', proof=proof)
     if not armed:
         store.wait_signal('update.landed', internal=True)
@@ -958,7 +958,9 @@ async def run(service):
         event = service.wake('waits')
         event.clear()
         await service.waits_once()
-        row = service.store.db.execute("""SELECT MIN(next_check) FROM waits
-            WHERE state='armed' AND kind IN ('time','pr') AND ?""", (int(bool(service.store.get('waits_enabled', False))),)).fetchone()
+        row = service.store.db.execute("""SELECT MIN(MAX(next_check, COALESCE(f.retry, 0))) FROM waits
+            LEFT JOIN sweep_failures f ON f.sweep='timer-trigger' AND f.item=CAST(waits.id AS TEXT)
+            WHERE state='armed' AND (kind IN ('time','pr') OR EXISTS
+                (SELECT 1 FROM wait_pending_fires p WHERE p.wait=waits.id))""").fetchone()
         delay = min(60, max(0, row[0] - time.time())) if row[0] is not None else 60
         await pause(event, delay)

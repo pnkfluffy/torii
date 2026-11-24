@@ -12,10 +12,10 @@ import signal
 import tempfile
 import unicodedata
 
-from . import problems
+from . import host_os, problems
+from .telegram import MIB, download_limit
 from .transcription import ModelUnavailable, UnsupportedVoice, default_backend, setup as setup_transcription
 
-MAX_FILE_BYTES = 20 * 1024 * 1024
 MAX_AGENT_IMAGE_BYTES = 5 * 1024 * 1024
 MAX_AGENT_IMAGE_SIDE = 2576
 IMAGE_TYPES = {'image/jpeg', 'image/png', 'image/webp', 'image/gif'}
@@ -185,10 +185,14 @@ def saved_path(row, directory):
     return str(path)
 
 
-def file_failure(row, oversized):
+def oversized(reason):
+    return reason.startswith('larger than ')
+
+
+def file_failure(row, reason):
     name = '`' + row['name'] + '`'
-    if oversized:
-        return (name + ' is larger than 20 MB, the most Telegram lets a bot download. Your message went to '
+    if oversized(reason):
+        return (name + ' is ' + reason + ', the most Telegram lets a bot download. Your message went to '
                 'the coordinator without the file. Send a smaller file or a link.')
     return (name + ' could not be downloaded. Your message went to the coordinator without the file. '
             'Send the file again.')
@@ -197,11 +201,16 @@ def file_failure(row, oversized):
 IMAGE_FAILURES = {
     'download failed': ('An image could not be downloaded. Your message text went to the coordinator without it. '
                         'Send only the image again.'),
-    'larger than 20 MB': ('An image is larger than 20 MB, the most Telegram lets a bot download. '
-                          'Your message text went to the coordinator without it. Send a smaller image.'),
     'not a supported image': ('An image is not a JPEG, PNG, WebP, or GIF. Your message text went to the coordinator '
                               'without it. Send the image in a supported format.'),
 }
+
+
+def image_failure(reason):
+    if oversized(reason):
+        return ('An image is ' + reason + ', the most Telegram lets a bot download. '
+                'Your message text went to the coordinator without it. Send a smaller image.')
+    return IMAGE_FAILURES[reason]
 
 
 def failure_reason(error):
@@ -249,14 +258,16 @@ def record_failure(store, message, row, error, notice, cause=None):
     return None, error
 
 
-async def attachment_data(telegram, message, row):
-    if row['size'] is not None and row['size'] > MAX_FILE_BYTES:
-        return b'', 'larger than 20 MB', 'size=%s' % row['size']
+async def attachment_data(store, telegram, message, row):
+    limit = download_limit(store)
+    too_large = 'larger than %d MB' % (limit // MIB)
+    if row['size'] is not None and row['size'] > limit:
+        return b'', too_large, 'size=%s' % row['size']
     try:
-        data = await download(telegram, message, row, MAX_FILE_BYTES)
+        data = await download(telegram, message, row, limit)
         return data, None if data else 'download failed', None
     except Exception as error:
-        reason = 'larger than 20 MB' if getattr(error, 'code', None) == 'file-too-large' else 'download failed'
+        reason = too_large if getattr(error, 'code', None) == 'file-too-large' else 'download failed'
         return b'', reason, 'class=%s reason=%s' % (type(error).__name__, failure_reason(error))
 
 
@@ -267,14 +278,14 @@ async def prepare_image(store, telegram, message, row):
         return saved_path(row, directory), None
     if row['error']:
         return None, row['error']
-    data, reason, cause = await attachment_data(telegram, message, row)
+    data, reason, cause = await attachment_data(store, telegram, message, row)
     if reason is None:
         try:
             suffix = image_suffix(data)
         except MediaError:
             reason = 'not a supported image'
     if reason:
-        return record_failure(store, message, row, reason, IMAGE_FAILURES[reason], cause)
+        return record_failure(store, message, row, reason, image_failure(reason), cause)
     path = directory / (str(row['id']) + suffix)
     make_private(directory)
     write_private(directory, path, data)
@@ -282,23 +293,6 @@ async def prepare_image(store, telegram, message, row):
         store.db.execute('UPDATE attachments SET path=? WHERE id=?', (str(path), row['id']))
         logging.getLogger(__name__).info('image saved attachment=%s bytes=%s', row['id'], len(data))
     return str(path), None
-
-
-async def run_sips(*arguments):
-    process = await asyncio.create_subprocess_exec('/usr/bin/sips', *map(str, arguments),
-        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
-    try:
-        output, _ = await asyncio.wait_for(process.communicate(), 30)
-    except (asyncio.TimeoutError, asyncio.CancelledError):
-        try:
-            process.kill()
-        except ProcessLookupError:
-            pass
-        await process.communicate()
-        raise
-    if process.returncode:
-        raise RuntimeError('image conversion failed')
-    return output
 
 
 async def prepare_agent_image(store, message, row):
@@ -313,15 +307,12 @@ async def prepare_agent_image(store, message, row):
     temporary = None
     try:
         if original.stat().st_size <= MAX_AGENT_IMAGE_BYTES:
-            output = await run_sips('-g', 'pixelWidth', '-g', 'pixelHeight', original)
-            dimensions = [int(value) for value in re.findall(
-                rb'^\s*pixel(?:Width|Height):\s*(\d+)\s*$', output, re.MULTILINE)]
+            dimensions = await host_os.image_dimensions(original)
             if len(dimensions) != 2 or max(dimensions) <= MAX_AGENT_IMAGE_SIDE:
                 return str(original)
         fd, temporary = tempfile.mkstemp(prefix='.agent-', suffix='.jpg', dir=original.parent)
         os.close(fd)
-        await run_sips('-Z', MAX_AGENT_IMAGE_SIDE, '--setProperty', 'format', 'jpeg',
-                       '--setProperty', 'formatOptions', '80', original, '--out', temporary)
+        await host_os.resize_jpeg(original, temporary, MAX_AGENT_IMAGE_SIDE)
         candidate = Path(temporary)
         if not 0 < candidate.stat().st_size <= MAX_AGENT_IMAGE_BYTES:
             raise RuntimeError('image copy exceeds reader limit')
@@ -352,7 +343,7 @@ async def prepare_file(store, telegram, message, row):
         return saved_path(row, directory), row['error']
     if row['error']:
         return None, row['error']
-    data, reason, cause = await attachment_data(telegram, message, row)
+    data, reason, cause = await attachment_data(store, telegram, message, row)
     if data:
         make_private(directory)
         name = 'audio-transcript.txt' if is_audio(row) and row['name'] == 'transcript.txt' else row['name']
@@ -364,7 +355,7 @@ async def prepare_file(store, telegram, message, row):
         row['size'] = len(data)
         return str(path), None
     return record_failure(store, message, row, reason,
-                          file_failure(row, reason == 'larger than 20 MB'), cause or 'empty download')
+                          file_failure(row, reason), cause or 'empty download')
 
 
 async def transcribe_audio(path, state, timeout=300, on_repair=None, backend='parakeet'):
@@ -400,12 +391,7 @@ async def prepare_transcripts(store, message, rows, slots=None):
             return
         if row['error']:
             return
-        try:
-            backend = store.get('transcription_model') or default_backend()
-        except (ValueError, TypeError):
-            backend = default_backend()
-        if backend not in ('parakeet', 'whisper'):
-            backend = default_backend()
+        backend = default_backend()
         try:
             async with slots.reserve(transcription_memory(row, backend)):
                 transcript = await transcribe_audio(
@@ -464,7 +450,8 @@ def image_instructions(paths, coordinator=False, provider='claude', forwarded=Fa
         return ('\n\n' + ('Forwarded' if forwarded else 'Owner-provided') + ' images for this message:\n' +
                 '\n'.join(paths) + '\nYou cannot open files or images in this chat. '
                 'Give the file paths to a worker that can read them.')
-    inspection = ('Open each image with %s before answering. ' % ('view_image' if provider == 'codex' else 'Read') +
+    inspection = ('Open each image with %s before answering. ' % (
+                      {'codex': 'view_image', 'antigravity': 'view_file'}.get(provider, 'Read')) +
                   'Give the file paths to a worker when the worker needs the image.'
                   if coordinator else
                   'Open every image with your native image-reading tool before doing the work. ')
@@ -483,7 +470,7 @@ def file_instructions(rows, provider='claude', forwarded=False, coordinator=Fals
     if saved:
         reading = ('Use the transcript below for audio. ' if any(row.get('transcript') for row in saved)
                    else 'Read each file with your shell tools; for a PDF, extract its text with a local tool before answering. '
-                   if provider == 'codex' else 'Read each file with the Read tool; for a PDF pass the pages parameter. ')
+                   if provider in ('codex', 'antigravity') else 'Read each file with the Read tool; for a PDF pass the pages parameter. ')
         if coordinator and provider == 'opencode':
             reading = ('You cannot open files or images in this chat. Give the file paths to a worker that can read them. ' +
                        ('Use the transcript below for audio. ' if any(row.get('transcript') for row in saved) else ''))

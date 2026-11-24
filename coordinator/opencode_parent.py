@@ -19,6 +19,8 @@ from .native_protocol import RunControl
 from .policy import chat_policy
 from .providers import ProviderRunner
 from .session import AccountsUnavailable, message_row_groups
+from .shared_mcp import read_entries
+from .scrub import Scrubber
 
 
 MCP_READY_SECONDS = 30
@@ -53,17 +55,99 @@ def fingerprint(store, root, alias, account, binary, prompt, config, servers):
         for item in server.get('env', []):
             if item.get('name') == 'TORII_MCP_READY':
                 item['value'] = str(root / 'mcp-ready')
-    content = {'tools': tools_hash(), 'provider': 'opencode', 'account': alias, 'account_record': account,
+    content = {'tools': tools_hash(store), 'provider': 'opencode', 'account': alias, 'account_record': account,
                'model': account.get('model'), 'instructions': prompt, 'config': json.dumps(config) + '\n',
                'mcp_servers': stable, 'binary': binary, 'cli': opencode_accounts.PINNED_VERSION,
                'guard': hashlib.sha256(Path(opencode_runtime.__file__).with_name('opencode_guard.js').read_bytes()).hexdigest()}
     return hashlib.sha256(json.dumps(content, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
 
 
-class OpenCodeParentSession:
-    provider = 'opencode'
+class AcpParentSession:
     _track = parent_state.track
     restarted_prompt = staticmethod(parent_state.restarted_prompt)
+
+    def _problem(self, category, code, detail):
+        problems.record(self.store, category, code, detail, level=logging.ERROR,
+                        topic=parent_state.key_topic(self.store, self.key), every=3600)
+
+    async def _close_attempt(self):
+        if self.process and self._monitor_task:
+            await self.stop()
+        elif self.process:
+            await parent_state.retire(self)
+            await self.process.wait()
+            self.process.detach()
+            if self._turn_rows:
+                self._settle(self._turn_rows)
+                self._track(set())
+        self.tasks = []
+        self.process = self.protocol = None
+        self._monitor_task = self._stop_task = None
+        self.closed = self._stopping = False
+        self.control = RunControl(self.control.receipt_timeout)
+
+    def _prompt_started(self, turn, wires):
+        from .parent_replies import started
+        started(self, turn, {row for wire in wires for row in self._rows.get(wire, ())})
+
+    def _separate_prompt(self, wire):
+        return self.store.db.execute('SELECT 1 FROM messages WHERE id=? AND batch_id IS NOT NULL',
+                                     (wire,)).fetchone() is not None
+
+    def _prompt_rows(self):
+        request = next((self.process.past_request(request_id) for request_id, (method, future)
+                        in self.protocol.requests.items() if method == 'session/prompt'), None)
+        wires = ((request or {}).get('params', {}).get('_meta', {}).get('toriiSteers')
+                 or self.protocol._prompt_messages)
+        return {row for wire in wires for row in self._rows.get(wire, ())}
+
+    def idle(self, *, ignore_recovery=False):
+        return not (self.busy or self.turn_open or self._sending or self._unread_reattach_events or
+                    self._unreplayed or self._recovery_uncertain and not ignore_recovery or self.protocol.queued or
+                    any(not future.done() for method, future in self.protocol.requests.values()))
+
+    def relaunch(self, rows=()):
+        if not parent_state.topic_enabled(self.store, self.key):
+            return
+        selected = parent_state.selection_changed(self)
+        if self.rejected or selected and not self.idle():
+            return
+        self.rejected = True
+        self._parent_retiring = selected
+        self._relaunch_rows = set(rows) | self._turn_rows | self._lost
+        with self.store.db:
+            self.store.put(self.key + '_lost', sorted(self._relaunch_rows))
+        self.protocol.disconnect()
+        asyncio.create_task(parent_state.retire(self))
+
+    async def stop(self):
+        if self._stop_task is None:
+            self._stop_task = asyncio.create_task(self._stop())
+        await asyncio.shield(self._stop_task)
+
+    async def _stop(self):
+        self._stopping = True
+        self.control.close()
+        if not self.closed:
+            await parent_state.retire(self)
+        await self._monitor_task
+
+    async def detach(self):
+        self._stopping = True
+        self.control.close()
+        self._monitor_task.cancel()
+        for task in self.tasks:
+            task.cancel()
+        await asyncio.gather(self._monitor_task, *self.tasks, return_exceptions=True)
+        self.process.detach()
+        parent_state._active_clients.discard((str((self.runner.state_dir / 'hosts').resolve()), self.key))
+
+    async def wait_closed(self):
+        await asyncio.shield(self._monitor_task)
+
+
+class OpenCodeParentSession(AcpParentSession):
+    provider = 'opencode'
 
     def __init__(self, store, runner, on_turn, receipt_timeout, key):
         self.store, self.runner, self.key = store, runner, key
@@ -94,8 +178,6 @@ class OpenCodeParentSession:
         from .parent import session_key
         runner = runner if isinstance(runner, ProviderRunner) else ProviderRunner(store.directory, binaries=runner)
         key = session_key(store, cwd, topic)
-        if key == 'coordinator':
-            raise ValueError('The home chat cannot use OpenCode.')
         saved_host = store.get(key + '_host')
         reattach_only = not parent_state.topic_enabled(store, key)
         if reattach_only and not saved_host:
@@ -123,12 +205,17 @@ class OpenCodeParentSession:
             with store.db:
                 store.put(key + '_opencode', None)
         servers = mcp_servers(store, topic, session.root / ('mcp-ready-' + uuid.uuid4().hex))
+        scrub = Scrubber({})
+        entries = read_entries(store, scrub, topic=topic)
         config = (opencode_runtime.parent_config(account, opencode_accounts.account_home(alias) / 'key', cwd,
-                                               session.root / 'instructions.md') if account else {})
-        digest = fingerprint(store, session.root, alias, account, binary, prompt, config, servers)
+                                               session.root / 'instructions.md', entries) if account else {})
+        digest = fingerprint(store, session.root, alias, account, binary,
+                             instructions, config, servers)
         attached = None
         try:
             attached = await parent_state.attach(session, saved_host, digest)
+            if attached:
+                session.usage_policy = None
             if opencode_recovery.state(store, key) or store.get(key + '_turn'):
                 opencode_recovery.confirm(session)
             session._turn_owner = opencode_recovery.state(store, key).get('owner')
@@ -165,14 +252,14 @@ class OpenCodeParentSession:
                     opencode_runtime.parent_environment(session.root, os.environ)
                     opencode_runtime.write_private(session.root / 'instructions.md', prompt.encode())
                     opencode_runtime.write_parent_config(session.root, account, opencode_accounts.account_home(alias) / 'key',
-                                                         cwd, session.root / 'instructions.md')
+                                                         cwd, session.root / 'instructions.md', entries)
                     servers = mcp_servers(store, topic, session.root / ('mcp-ready-' + uuid.uuid4().hex))
                     spec = {'argv': opencode_runtime.argv(binary, cwd), 'cwd': str(cwd),
                             'env': opencode_runtime.parent_environment(session.root, os.environ), 'provider': 'opencode',
                             'fresh': not session.session_id,
                             'locks': ['coordinator-' + key] + (['opencode-' + session.session_id] if session.session_id else []),
                             'account': alias}
-                    if not await parent_state.launch(session, spec, digest):
+                    if not await parent_state.launch(session, spec, digest, private={'scrub': scrub.forms}):
                         return None
                     fresh = not session.session_id
                     healthy = True
@@ -225,26 +312,6 @@ class OpenCodeParentSession:
             parent_state._active_clients.discard(client_key)
             raise
 
-    def _problem(self, category, code, detail):
-        problems.record(self.store, category, code, detail, level=logging.ERROR,
-                        topic=self.key.split(':', 1)[1])
-
-    async def _close_attempt(self):
-        if self.process and self._monitor_task:
-            await self.stop()
-        elif self.process:
-            await parent_state.retire(self)
-            await self.process.wait()
-            self.process.detach()
-            if self._turn_rows:
-                self._settle(self._turn_rows)
-                self._track(set())
-        self.tasks = []
-        self.process = self.protocol = None
-        self._monitor_task = self._stop_task = None
-        self.closed = self._stopping = False
-        self.control = RunControl(self.control.receipt_timeout)
-
     def _observe_session(self, sid):
         if not native_ids.valid('opencode', sid) or self.session_id and sid != self.session_id:
             raise RuntimeError('Provider changed the OpenCode parent session ID')
@@ -258,25 +325,6 @@ class OpenCodeParentSession:
                            'usd': saved.get('usd') if saved.get('session') == sid else None})
             opencode_recovery.observed(self.store, self.key, sid)
         return sid
-
-    def _event_consumed(self, seq):
-        with self.store.db:
-            self.store.put(self.key + '_host_seq', seq)
-
-    def _prompt_started(self, turn, wires):
-        from .parent_replies import started
-        started(self, turn, {row for wire in wires for row in self._rows.get(wire, ())})
-
-    def _separate_prompt(self, wire):
-        return self.store.db.execute('SELECT 1 FROM messages WHERE id=? AND batch_id IS NOT NULL',
-                                     (wire,)).fetchone() is not None
-
-    def _prompt_rows(self):
-        request = next((self.process.past_request(request_id) for request_id, (method, future)
-                        in self.protocol.requests.items() if method == 'session/prompt'), None)
-        wires = ((request or {}).get('params', {}).get('_meta', {}).get('toriiSteers')
-                 or self.protocol._prompt_messages)
-        return {row for wire in wires for row in self._rows.get(wire, ())}
 
     def _apply_event(self, event, replay=False):
         kind = event.get('type')
@@ -403,28 +451,9 @@ class OpenCodeParentSession:
         finally:
             self._sending -= 1
 
-    def idle(self, *, ignore_recovery=False):
-        return not (self.busy or self.turn_open or self._sending or self._unread_reattach_events or
-                    self._unreplayed or self._recovery_uncertain and not ignore_recovery or self.protocol.queued or
-                    any(not future.done() for method, future in self.protocol.requests.values()))
-
     def movable(self):
         return (parent_state.selection_changed(self) or self.stale or self.outdated or
                 self.account_alias != opencode_accounts.active(self.store))
-
-    def relaunch(self, rows=()):
-        if not parent_state.topic_enabled(self.store, self.key):
-            return
-        selected = parent_state.selection_changed(self)
-        if self.rejected or selected and not self.idle():
-            return
-        self.rejected = True
-        self._parent_retiring = selected
-        self._relaunch_rows = set(rows) | self._turn_rows | self._lost
-        with self.store.db:
-            self.store.put(self.key + '_lost', sorted(self._relaunch_rows))
-        self.protocol.disconnect()
-        asyncio.create_task(parent_state.retire(self))
 
     def transcript_receipts(self, path, rows):
         return opencode_runtime.parent_receipts(Path(path).parents[2], self.session_id, rows)
@@ -433,27 +462,3 @@ class OpenCodeParentSession:
         parent_state.settle(self.store, self.key, rows,
                             lambda wanted: opencode_runtime.parent_receipts(self.root, self.session_id, wanted))
 
-    async def stop(self):
-        if self._stop_task is None:
-            self._stop_task = asyncio.create_task(self._stop())
-        await asyncio.shield(self._stop_task)
-
-    async def _stop(self):
-        self._stopping = True
-        self.control.close()
-        if not self.closed:
-            await parent_state.retire(self)
-        await self._monitor_task
-
-    async def detach(self):
-        self._stopping = True
-        self.control.close()
-        self._monitor_task.cancel()
-        for task in self.tasks:
-            task.cancel()
-        await asyncio.gather(self._monitor_task, *self.tasks, return_exceptions=True)
-        self.process.detach()
-        parent_state._active_clients.discard((str((self.runner.state_dir / 'hosts').resolve()), self.key))
-
-    async def wait_closed(self):
-        await asyncio.shield(self._monitor_task)

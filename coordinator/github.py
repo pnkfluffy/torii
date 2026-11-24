@@ -3,8 +3,6 @@
 import asyncio
 import json
 import os
-from pathlib import Path
-import pwd
 import shutil
 
 
@@ -20,7 +18,6 @@ async def run_github(argv, timeout):
     if not binary:
         raise GitHubError('github_unavailable')
     env = dict(os.environ)
-    env.setdefault('GH_CONFIG_DIR', str(Path(pwd.getpwuid(os.getuid()).pw_dir) / '.config' / 'gh'))
     try:
         process = await asyncio.create_subprocess_exec(binary, *argv[1:], stdout=asyncio.subprocess.PIPE,
                                                        stderr=asyncio.subprocess.DEVNULL, env=env)

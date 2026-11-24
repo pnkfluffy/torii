@@ -12,7 +12,7 @@ import shutil
 import sqlite3
 import time
 
-from . import workspaces
+from . import host_os, workspaces
 from .worktree_salvage import preserve_worktree, repositories, verify_preserved_worktree
 
 
@@ -47,7 +47,7 @@ def _safe_target(target, policy, state_dir):
         return 'outside approved scratch roots'
     if target.resolve() != target or not target.is_dir():
         return 'missing or linked worktree'
-    if _within(target, Path(state_dir).resolve() / 'worktrees'):
+    if _within(target, Path(state_dir).resolve() / 'worktrees') or _within(target, Path(state_dir).resolve() / 'cow-worktrees'):
         return 'managed job worktree'
     if _within(Path(state_dir).resolve(), target):
         return 'worktree contains coordinator state'
@@ -93,12 +93,7 @@ def _owner_state(db, target, branch, now, idle):
 
 
 async def _process_paths():
-    _, listing = await asyncio.wait_for(workspaces._command(
-        '/usr/sbin/lsof', '-nP', '-Fpn', reject_stderr=True, strip=False), 30)
-    if '\ufffd' in listing:
-        raise ValueError('Process paths could not be decoded safely')
-    return {Path(line[1:]).resolve() for line in listing.splitlines()
-            if line.startswith('n/')}
+    return await host_os.worktree_process_paths(workspaces._command)
 
 
 async def _latest_write(target, git_dir):

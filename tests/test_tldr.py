@@ -2,6 +2,7 @@ import asyncio
 import json
 from pathlib import Path
 import tempfile
+import time
 import unittest
 from unittest.mock import AsyncMock, patch
 
@@ -153,6 +154,21 @@ class TldrTests(TldrTestsSupport, unittest.IsolatedAsyncioTestCase):
                                     self.service.extension, self.runner.binaries['claude'])
         self.assertRegex(reply, r'\d+ earlier messages left out')
         self.assertLessEqual(len(native.await_args.kwargs['input_data']), INPUT_LIMIT)
+
+    async def test_a_full_fable_meter_does_not_stop_the_opus_summary(self):
+        now = time.time()
+        with self.store.db:
+            self.store.put('account_status', {'test': {
+                'identity': {'email': 'test@example.com', 'logged_in': True}, 'observed_at': now,
+                'usage': {'seven_day': {'utilization': 78, 'resets_at': now + 7200},
+                          'seven_day_fable': {'utilization': 100, 'resets_at': now + 3600}}}})
+        self.owner(20, 'Summarize')
+        self.sent(21, 'One update')
+        with patch('coordinator.tldr._native', new_callable=AsyncMock,
+                   return_value={'result': '## Done\nNothing.'}) as native:
+            await summarize(self.store, self.topic, 90, self.service.accounts,
+                            self.service.extension, self.runner.binaries['claude'])
+        native.assert_awaited_once()
 
     async def test_summary_failure_text_when_extension_fails(self):
         self.owner(20, 'Summarize')

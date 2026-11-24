@@ -226,6 +226,19 @@ class SignInTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(listed.data, [])
         self.assert_absent(GOOD)
 
+    async def test_the_starting_message_shows_at_once_and_the_card_replaces_it(self):
+        record = self.add()
+        placeholder = self.store.db.execute('SELECT id,text FROM outbox WHERE id=?', (record['starting'],)).fetchone()
+        self.assertEqual(placeholder['text'], 'Starting the Claude sign-in…')
+        with self.store.db:
+            self.store.delivered(placeholder['id'], 555)
+        self.start()
+        envelope, text, _ = await self.card_posted()
+        self.assertIn('\n1. Tap this link', text)
+        self.assertEqual(self.store.db.execute('SELECT edit_message FROM outbox WHERE id=?',
+                                               (envelope['card_outbox'],)).fetchone()[0], 555)
+        self.assertIsNone(self.store.get(KEY)['starting'])
+
     async def test_a_taken_name_gets_a_number_and_no_email_gives_account(self):
         with self.store.db:
             self.store.put('accounts', {'default': {'config_dir': None, 'enabled': True},
@@ -313,7 +326,8 @@ class SignInTests(unittest.IsolatedAsyncioTestCase):
                                     'previous_config_dirs': [str(earlier), str(old)]})
         self.assertEqual(self.store.get('active_account'), 'Jane')
         self.assertEqual(self.store.get('account_status')['Jane'],
-                         {'identity': {'email': EMAIL, 'logged_in': True, 'type': 'Claude (plan unknown)'}})
+                         {'identity': {'email': EMAIL, 'logged_in': True, 'type': 'Claude (plan unknown)'},
+                          'login_recovery_pending': True})
         self.assertIsNotNone(self.store.get('account_status_refresh_requested'))
         self.assertFalse(self.driver.remove_folder(dict(record, created=True)))
         self.assertTrue(new.is_dir())
@@ -393,6 +407,32 @@ class SignInTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(old.is_dir())
         self.assertEqual(self.card(self.envelopes()[-1])[0],
                          '%s is signed in again. Torii uses it by the same rules as before.' % EMAIL)
+
+    async def test_a_sign_in_after_a_signed_out_probe_records_the_restored_login(self):
+        from coordinator.account_status import refresh_accounts
+        old = self.register_profile(logged_in=True)
+        profiles = self.store.get('accounts')
+        profiles['Jane'] = {'config_dir': str(old), 'enabled': True}
+        with self.store.db:
+            self.store.put('accounts', profiles)
+        signed_in = {'identity': {'email': EMAIL, 'logged_in': True}}
+        result = {'error': 'login_required'}
+
+        async def collect(account):
+            return dict(result)
+
+        await refresh_accounts(self.store, collect, ['Jane'])
+        self.start()
+        self.add('Jane')
+        await self.card_posted()
+        self.paste(GOOD)
+        await self.settled()
+        self.assertTrue(self.store.get('account_status')['Jane']['login_recovery_pending'])
+        result = signed_in
+        await refresh_accounts(self.store, collect, ['Jane'])
+        rows = [tuple(row) for row in self.store.db.execute('SELECT code,detail FROM problems ORDER BY id')]
+        self.assertEqual(rows, [('status-login-required', 'account=Jane'), ('status-login-restored', 'account=Jane')])
+        self.assertNotIn('login_recovery_pending', self.store.get('account_status')['Jane'])
 
     async def test_different_signed_out_claude_email_repoints_matching_alias(self):
         self.register_profile(email='carol@example.com')
@@ -559,7 +599,7 @@ class SignInTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.effects('delete'), [])
         self.assertEqual([row[0] for row in self.store.db.execute('SELECT text FROM messages')], chat * 2)
         self.assertEqual({row[0] for row in self.store.db.execute('SELECT topic FROM messages')}, {TOPIC})
-        self.assertEqual(len(self.texts()), 2)
+        self.assertEqual(len(self.texts()), 3)
         self.assertIsNone(self.driver.code)
         for text in chat:
             self.assertNotIn(text, self.log.getvalue())
@@ -946,7 +986,8 @@ class TargetCodexSignInTests(codex_tests.CodexFixture):
                                     'previous_config_dirs': [str(earlier), str(old)]})
         self.assertEqual(self.store.get('codex_active_account'), 'codex' if picked else None)
         self.assertEqual(self.store.get('codex_account_status')['codex'],
-                         {'identity': {'email': 'OWNER@example.com', 'logged_in': True, 'type': 'ChatGPT Pro'}})
+                         {'identity': {'email': 'OWNER@example.com', 'logged_in': True, 'type': 'ChatGPT Pro'},
+                          'login_recovery_pending': True})
         self.assertIsNotNone(self.store.get('codex_account_status_refresh_requested'))
         broker = codex_tests.CodexBroker(self.store)
         self.assertEqual(broker.active(), 'codex')

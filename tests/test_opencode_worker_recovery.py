@@ -5,6 +5,7 @@ import unittest
 from unittest.mock import patch
 
 from coordinator import opencode_subscription, opencode_runtime
+from coordinator.accounts import LIMIT_CONTINUATION
 from coordinator.service import Service
 from tests import test_opencode_subscription, test_opencode_runtime
 from tests.fake_opencode import SESSION_ID
@@ -50,18 +51,15 @@ class WorkerRecoveryTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(self.notices()), 1)
             self.assertEqual((self.pool.get(wid)['status'], self.pool.get(wid)['session']),
                              ('waiting_for_quota', SESSION_ID))
-            self.assertEqual(sum('short prompt' in text for text in self.prompts()), 1)
-            self.assertTrue(all(len(text) <= 100 for text in self.prompts()[1:]))
-            sessions = json.loads((self.store.directory / 'opencode/workers' / str(wid) /
-                                   'data/fake-sessions.json').read_text())
-            self.assertEqual(sum('sole authorized owner' in text for text in sessions[SESSION_ID]), 1)
+            self.assertTrue(all(text.count('short prompt') == 1 for text in self.prompts()))
+            self.assertTrue(all(LIMIT_CONTINUATION in text for text in self.prompts()[1:]))
         self.t.scenario(history_reply=True)
         await self.recheck(self.store.get('opencode_account_blocks')['one']['until'] + 1)
         done = self.pool.get(wid)
         self.assertEqual((done['status'], done['session'], done['account_alias']), ('done', SESSION_ID, 'one'))
         self.assertTrue(json.loads(done['result'])['success'])
         self.assertEqual(len(self.notices()), 1)
-        self.assertEqual(sum('short prompt' in text for text in self.prompts()), 1)
+        self.assertTrue(all(text.count('short prompt') == 1 for text in self.prompts()))
         self.assertNotIn('one', self.store.get('opencode_account_blocks'))
         self.t.scenario(http_error=status, **scenario)
         second = self.t.spawn(self.task).data['worker']
@@ -70,10 +68,10 @@ class WorkerRecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(block['until'] - block['observed_at'], 300)
         self.assertEqual(len(self.notices()), 2)
 
-    async def test_credit_rechecks_keep_one_notice_and_one_brief_with_capped_backoff(self):
+    async def test_credit_rechecks_keep_one_notice_and_resend_the_brief_with_capped_backoff(self):
         await self.persistent_refusal(402)
 
-    async def test_weekly_rechecks_keep_one_notice_and_one_brief_with_capped_backoff(self):
+    async def test_weekly_rechecks_keep_one_notice_and_resend_the_brief_with_capped_backoff(self):
         body = dict(test_opencode_runtime.WEEKLY_REFUSAL)
         body.pop('resetAt')
         await self.persistent_refusal(429, response_body=json.dumps(body))
@@ -97,7 +95,7 @@ class WorkerRecoveryTests(unittest.IsolatedAsyncioTestCase):
     async def test_retry_after_zero_has_a_launch_floor(self):
         await self.assert_launch_floor(response_headers={'Retry-After': '0'})
 
-    async def test_owner_follow_up_during_wait_is_sent_once_without_the_brief(self):
+    async def test_owner_follow_up_during_wait_goes_with_the_brief(self):
         self.t.scenario(http_error=402)
         wid = self.t.spawn(self.task).data['worker']
         await self.pool.run(self.pool.get(wid), self.store.topic('1:2'))
@@ -106,8 +104,11 @@ class WorkerRecoveryTests(unittest.IsolatedAsyncioTestCase):
                                   ('\n\nFollow-up:\nUse the blue option.', wid))
         for index in range(2):
             await self.recheck(self.store.get('opencode_account_blocks')['one']['until'] + 1)
-        self.assertEqual(sum('short prompt' in text for text in self.prompts()), 1)
-        self.assertEqual(sum('Use the blue option.' in text for text in self.prompts()), 1)
+        first, *rechecks = self.prompts()
+        self.assertNotIn('Use the blue option.', first)
+        self.assertEqual(len(rechecks), 2)
+        self.assertTrue(all(text.count('short prompt') == 1 and text.count('Use the blue option.') == 1
+                            for text in rechecks))
         self.assertEqual(len(self.notices()), 1)
 
     def test_provider_marker_reader_rejects_a_different_launch(self):

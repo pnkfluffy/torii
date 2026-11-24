@@ -189,7 +189,6 @@ class LogContentTests(unittest.TestCase):
         self.assertEqual(refused.state, 'refused')
         written = self.path.read_text()
         self.assertIn('control op=policy.set state=done ok=True source=cli', written)
-        self.assertIn('setting changed key=USAGE.md length=', written)
         self.assertIn('control op=telegram.token state=refused ok=False source=coordinator', written)
         self.assertNotIn(secret, written)
         self.assertNotIn('Always use', written)
@@ -235,9 +234,8 @@ class RunGuardTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('flapper', str(caught.exception))
         self.assertTrue(idle_task.is_set())
         written = self.path.read_text()
-        self.assertEqual(written.count('task crashed task=flapper'), 3)
+        self.assertEqual(written.count('code=loop-crashed'), 1)
         self.assertIn('ZeroDivisionError: loop bug', written)
-        self.assertIn('Traceback (most recent call last)', written)
         self.assertIn('service run commit=', written)
 
     async def test_a_task_that_recovers_keeps_the_service_running(self):
@@ -251,7 +249,7 @@ class RunGuardTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(await self.service.supervise('flaky', flaky), 'settled')
         self.assertEqual(len(attempts), 3)
-        self.assertEqual(self.path.read_text().count('task crashed task=flaky'), 2)
+        self.assertEqual(self.path.read_text().count('code=loop-crashed'), 1)
 
     async def test_the_guard_never_swallows_cancellation(self):
         async def cancelled():

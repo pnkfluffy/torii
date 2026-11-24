@@ -64,7 +64,7 @@ class ProblemTests(unittest.TestCase):
         self.store.db.execute('DROP TABLE problems')
         with self.assertLogs('coordinator.problems', 'WARNING') as logs:
             self.assertIsNone(problems.record(self.store, 'worker', 'start_failed'))
-        self.assertIn('ERROR:coordinator.problems:problem not saved area=worker code=start_failed '
+        self.assertIn('WARNING:coordinator.problems:problem not saved area=worker code=start_failed '
                       'type=OperationalError', logs.output)
 
     def test_sanitizer_removes_token_credentials_query_and_email(self):

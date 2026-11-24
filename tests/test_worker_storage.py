@@ -30,6 +30,8 @@ SID = '00000000-0000-4000-8000-000000000001'
 
 class StorageSupport:
     def setUp(self):
+        from tests.support import fake_codex_hook_trust
+        fake_codex_hook_trust(self)
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name).resolve()
@@ -47,11 +49,14 @@ class StorageSupport:
                                                 'usage': {'seven_day': {'utilization': 1}}}})
         (self.root / 'profile').mkdir()
         self.task = self.store.task_create(TOPIC, 'Build', worktree=str(self.root))
+        self.store.db.commit()
         self.expected_results = self.store.directory / 'results' / ('task-' + str(self.task['id']))
 
     def spawn(self, provider='claude', source='cli'):
-        result = control_api.call(self.store, 'workers.spawn', {'task': self.task['id'], 'provider': provider,
-                                  'prompt': 'build ' + provider}, source=source, topic=TOPIC)
+        params = {'task': self.task['id'], 'provider': provider, 'prompt': 'build ' + provider}
+        if source == 'mcp':
+            params['message'] = self.store.message_save(TOPIC, 'owner', 'Use %s for this job.' % provider)['id']
+        result = control_api.call(self.store, 'workers.spawn', params, source=source, topic=TOPIC)
         self.assertTrue(result.ok, result)
         worker = dict(self.store.db.execute('SELECT * FROM workers WHERE id=?',
                                            (result.data['worker'],)).fetchone())
@@ -136,6 +141,8 @@ class StorageControlTests(StorageSupport, unittest.TestCase):
         subprocess.run(['git', '-C', str(self.root), '-c', 'user.name=Test', '-c', 'user.email=test@example.test',
                         'commit', '-qm', 'fixture'], check=True, capture_output=True)
         self.assertFalse(self.expected_results.exists())
+        with self.store.db:
+            self.store.db.execute('UPDATE tasks SET worktree=NULL WHERE id=?', (self.task['id'],))
         for source in ('cli', 'mcp'):
             before = control_api.call(self.store, 'tasks.get', {'task': self.task['id']}, source=source)
             self.assertEqual(before.data.get('results'), str(self.expected_results))
@@ -160,6 +167,22 @@ class StorageControlTests(StorageSupport, unittest.TestCase):
 
 
 class WorkerStorageTests(StorageSupport, unittest.IsolatedAsyncioTestCase):
+    async def test_cleanup_removes_latest_finished_worker_temp_in_open_job(self):
+        worker, _ = self.spawn()
+        scratch = self.scratch(worker)
+        scratch.mkdir()
+        (scratch / 'file').write_text('temporary')
+        self.saved_host(worker)
+        self.store.worker_complete(worker['id'], {'success': True}, 'done')
+        self.assertNotIn(self.store.task_get(self.task['id'])['status'], ('done', 'dropped'))
+        with self.temp_scope():
+            storage = worker_storage.storage_for(self.store)
+            with patch('coordinator.scratch_worktrees.retire', new=AsyncMock()) as retire:
+                await storage.cleanup(worker['id'])
+        self.assertFalse(scratch.exists())
+        retire.assert_awaited_once()
+        self.assertEqual(retire.await_args.args[1], self.task['id'])
+
     async def test_unreadable_saved_temp_root_records_problem_and_keeps_healthy_cleanup(self):
         worker, _ = self.spawn()
         scratch = self.scratch(worker)
@@ -220,14 +243,14 @@ class WorkerStorageTests(StorageSupport, unittest.IsolatedAsyncioTestCase):
         service = Service(self.store, None, self.runner(), self.root)
         passed = asyncio.Event()
 
-        reconcile = service.workers.storage.reconcile
+        schedule = service.workers.storage.schedule
 
-        async def reconciled():
-            await reconcile()
+        def scheduled():
+            schedule()
             passed.set()
 
-        with self.temp_scope(), patch('coordinator.workspaces.cleanup_closed_worktrees', AsyncMock()), \
-                patch.object(service.workers.storage, 'reconcile', side_effect=reconciled), \
+        with self.temp_scope(), patch('coordinator.workspaces.cleanup_closed_copies', AsyncMock(return_value=False)), \
+                patch.object(service.workers.storage, 'schedule', side_effect=scheduled), \
                 patch.object(worker_storage, '_temp_index', wraps=worker_storage._temp_index) as scan:
             loop = asyncio.create_task(service.worktree_cleanup_loop())
             try:
@@ -333,7 +356,7 @@ class WorkerStorageTests(StorageSupport, unittest.IsolatedAsyncioTestCase):
         payload = json.loads((host_directory(self.store.directory, done) / 'spec.json').read_text())['initial_payload']
         self.assertIn(str(self.expected_results), payload)
         self.assertIn('$TMPDIR', payload)
-        self.assertIn('deleted outright', payload)
+        self.assertIn('cleared at worker end', payload)
 
     async def test_claude_private_temp_socket_symlink_and_readonly_cleanup(self):
         await self.check_launch('claude')
@@ -517,6 +540,51 @@ class WorkerStorageTests(StorageSupport, unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.expected_results.joinpath('proof').read_text(), 'keep')
         self.assertEqual(done['session'], SID)
 
+    async def test_resume_after_failed_owned_launch_without_owner(self):
+        for evidence in ('marker', 'exit'):
+            with self.subTest(evidence=evidence):
+                worker, _ = self.spawn('codex')
+                scratch = self.scratch(worker)
+                scratch.mkdir()
+                (scratch / 'old').write_text('old')
+                directory = self.saved_host(worker)
+                (directory / 'spec.json').write_text(json.dumps({'ownership': 'coalition', 'worker_temp': True,
+                                                                  'env': {'TMPDIR': str(scratch)}}))
+                (directory / 'pid').write_text('99999999')
+                if evidence == 'marker':
+                    (directory / 'launch-failed.json').write_text('true')
+                else:
+                    (directory / 'exit.json').write_text('{"returncode":1,"failure_code":"ownership_unavailable"}')
+                self.store.worker_complete(worker['id'], {'success': False, 'session_id': SID}, 'done')
+                self.store.db.execute("UPDATE workers SET status='queued',session=?,fresh=0 WHERE id=?",
+                                      (SID, worker['id']))
+                pool = self.pool(self.runner('codex'))
+                with self.temp_scope(), patch.object(pool.runner, '_external_writer', AsyncMock(return_value=False)):
+                    done = await pool.run(worker, self.store.topic(TOPIC))
+                    await self.cleaned(pool)
+                self.assertTrue(json.loads(done['result'])['success'], done)
+                self.assertEqual(json.loads((self.root / 'observed').read_text())['before'], [])
+                self.assertEqual(done['session'], SID)
+
+    async def test_failed_owned_launch_with_live_pid_keeps_temp(self):
+        worker, _ = self.spawn('codex')
+        scratch = self.scratch(worker)
+        scratch.mkdir()
+        (scratch / 'old').write_text('old')
+        directory = self.saved_host(worker)
+        (directory / 'spec.json').write_text(json.dumps({'ownership': 'coalition', 'worker_temp': True,
+                                                          'env': {'TMPDIR': str(scratch)}}))
+        (directory / 'launch-failed.json').write_text('true')
+        self.store.worker_complete(worker['id'], {'success': False, 'session_id': SID}, 'done')
+        pool = self.pool()
+        for name in ('pid', 'child.pid'):
+            with self.subTest(name=name):
+                (directory / name).write_text(str(os.getpid()))
+                with self.temp_scope(), self.assertRaisesRegex(OSError, 'Previous worker processes'):
+                    await pool.storage.prepare(worker['id'])
+                (directory / name).write_text('99999999')
+        self.assertEqual((scratch / 'old').read_text(), 'old')
+
     async def test_resume_cleans_finished_hosts_with_reused_child_pids(self):
         self.store.put('worker_temp', True)
         transcript = self.root / 'profile' / 'projects' / 'test' / (SID + '.jsonl')
@@ -654,10 +722,11 @@ class WorkerStorageTests(StorageSupport, unittest.IsolatedAsyncioTestCase):
             actual(path, *args, **kwargs)
             removed.set()
 
-        slow.avoids_symlink_attacks = actual.avoids_symlink_attacks
+        async def delete(path, **options):
+            await worker_storage._background(slow, path)
 
         service = Service(self.store, None, self.runner(), self.root)
-        with self.temp_scope(), patch('shutil.rmtree', slow):
+        with self.temp_scope(), patch('coordinator.workspaces.delete_tree', new=delete):
             cleaning = asyncio.create_task(service.workers_once())
             try:
                 self.assertTrue(await asyncio.wait_for(asyncio.to_thread(entered.wait, 2), 4))
@@ -685,7 +754,7 @@ class WorkerStorageTests(StorageSupport, unittest.IsolatedAsyncioTestCase):
         self.store.put('opencode_enabled', True)
         self.store.put('opencode_binary', str(binary))
         (binary.parent / 'scenario.json').write_text('{"scratch_files":true}')
-        with patch('coordinator.providers.platform', 'linux'), \
+        with patch('coordinator.host_os.uses_worker_coalitions', new=lambda: False), \
                 patch('coordinator.opencode_accounts.account_home', return_value=account), \
                 patch('coordinator.opencode_runtime.managed_preference_paths', return_value=()):
             worker, _ = self.spawn('opencode')
@@ -724,11 +793,14 @@ class WorkerStorageTests(StorageSupport, unittest.IsolatedAsyncioTestCase):
             result = await run(*args, **kwargs)
             directory = Path(result.log_path).parent
             spec = json.loads((directory / 'spec.json').read_text())
+            cache = Path(spec['env']['XDG_CACHE_HOME'])
+            cache.mkdir(parents=True, exist_ok=True)
+            (cache / 'scratch').write_text('cache')
             spec['ownership'] = 'coalition'
             (directory / 'spec.json').write_text(json.dumps(spec))
             (directory / 'owner.json').write_text('{"cleanup":"ok"}')
             return result
-        with self.temp_scope(), patch('coordinator.providers.platform', 'linux'), \
+        with self.temp_scope(), patch('coordinator.host_os.uses_worker_coalitions', new=lambda: False), \
                 patch('coordinator.opencode_accounts.account_home', return_value=key_home), \
                 patch('coordinator.opencode_runtime.managed_preference_paths', return_value=()), \
                 patch.object(pool.runner, 'run', preserve):
@@ -741,6 +813,8 @@ class WorkerStorageTests(StorageSupport, unittest.IsolatedAsyncioTestCase):
         scratch = Path(spec['env']['TMPDIR'])
         self.assertNotEqual(scratch, self.scratch(worker))
         self.assertTrue((scratch / 'scratch').exists())
+        cache = Path(spec['env']['XDG_CACHE_HOME'])
+        self.assertEqual((cache / 'scratch').read_text(), 'cache')
         self.assertEqual(scratch.stat().st_mode & 0o777, 0o700)
         launch = Path(spec['env']['XDG_CONFIG_HOME']).parent
         (directory / 'owner.json').write_text('{"cleanup":"ok"}')
@@ -748,6 +822,7 @@ class WorkerStorageTests(StorageSupport, unittest.IsolatedAsyncioTestCase):
             await pool.cleanup_finished()
             await self.cleaned(pool)
         self.assertFalse(scratch.exists())
+        self.assertFalse(cache.exists())
         self.assertFalse((launch / 'home/Library/Caches').exists())
         self.assertTrue((launch / 'home/retained').exists())
         self.assertTrue(self.expected_results.exists())

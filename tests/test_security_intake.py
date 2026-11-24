@@ -1,12 +1,12 @@
 import os
 import sqlite3
-import sys
 from pathlib import Path
 import tempfile
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
+from coordinator import host_os
 from coordinator import control_api
 from coordinator.store import Store
 from coordinator.telegram import Telegram, TelegramError
@@ -89,7 +89,7 @@ class ProtectedAttachmentTests(unittest.IsolatedAsyncioTestCase):
                   'HOSTS/worker/spec.json', 'hosts/worker/Spec.JSON', 'Shared-MCP.json',
                   'Legacy-MCP-test.JSON')]
         paths += [self.home / '.CLAUDE/credentials.json', self.home / '.Codex/auth.json']
-        with patch('coordinator.attachment_paths.sys.platform', 'darwin'), \
+        with patch('coordinator.host_os.SYSTEM', 'darwin'), \
                 patch.object(self.api, '_request') as request:
             for path in paths:
                 self.file(path)
@@ -146,7 +146,7 @@ class ProtectedAttachmentTests(unittest.IsolatedAsyncioTestCase):
             request.assert_not_called()
         self.assertEqual(self.store.db.execute('SELECT count(*) FROM outbox').fetchone()[0], 0)
 
-    @unittest.skipUnless(sys.platform == 'darwin', 'macOS temporary-directory aliases')
+    @unittest.skipUnless(host_os.macos(), 'macOS temporary-directory aliases')
     async def test_review_guard_paths_tmp_aliases_are_refused(self):
         with tempfile.TemporaryDirectory(dir='/tmp') as temporary:
             state = Path(temporary)

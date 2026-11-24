@@ -60,7 +60,7 @@ for line in sys.stdin:
         emit({'type':'system','subtype':'background_tasks_changed','tasks':[{'task_id':'helper','description':'background check'}]})
     if action=='finish-background':
         emit({'type':'system','subtype':'background_tasks_changed','tasks':[]})
-    used=.98 if action in ('soft-limit','finish-background') else .5
+    used=.99 if action in ('soft-limit','finish-background') else .5
     emit({'type':'rate_limit_event','session_id':sid,'rate_limit_info':{
         'rateLimitType':'seven_day','status':'rejected' if rejected else 'allowed',
         'utilization':used,'resetsAt':time.time()+3600}})
@@ -157,7 +157,7 @@ class ClaudeSwitchingContract(unittest.IsolatedAsyncioTestCase):
             status = self.store.get('account_status')
             status['b']['usage']['seven_day']['resets_at'] = time.time() + 600
             self.store.put('account_status', status)
-            self.assertEqual(first.router.activate(), 'b')
+            self.assertEqual(first.router.activate(model='native-default'), 'b')
             await self.send(first, 'sooner')
             await until(first.idle)
             self.assertFalse(first.rejected)

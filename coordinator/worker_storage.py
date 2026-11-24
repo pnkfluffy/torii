@@ -13,14 +13,15 @@ import threading
 import time
 import uuid
 
-from . import process_ownership, problems
+from . import host_os, process_ownership, problems, sweeps
+from .failures import internal_detail
 from .host import alive
 
 
 FINAL = ('done', 'interrupted')
 BATCH = 16
 DELETE_BATCH = 8
-RETRY_LIMIT = 20
+SWEEP = 'temp-cleanup'
 
 
 def results_directory(store, task_id, create=False):
@@ -30,6 +31,34 @@ def results_directory(store, task_id, create=False):
         path.chmod(0o700)
     return str(path)
 
+
+
+def handoff_brief(store, task_id):
+    path = Path(results_directory(store, task_id)) / 'HANDOFF.md'
+    try:
+        with path.open('r', encoding='utf-8', errors='replace') as source:
+            lines = []
+            for _ in range(61):
+                line = source.readline(8193)
+                if not line:
+                    break
+                lines.append(line)
+                if len(line) > 8192 or sum(map(len, lines)) > 32768:
+                    break
+    except OSError:
+        return ''
+    content = ''.join(lines[:60])[:32768]
+    truncated = len(lines) > 60 or len(''.join(lines)) > len(content) or any(len(line) > 8192 for line in lines)
+    return content + ('\n[Handoff truncated.]' if truncated else '')
+
+
+def handoff_missing(store, task_id, started):
+    if started is None or task_id is None:
+        return None
+    try:
+        return (Path(results_directory(store, task_id)) / 'HANDOFF.md').stat().st_mtime < started
+    except OSError:
+        return True
 
 def temp_base():
     return Path(tempfile.gettempdir()).resolve()
@@ -119,16 +148,7 @@ def _directory(name, parent):
         descriptor = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent)
     except PermissionError:
         mode = stat.S_IMODE(os.stat(name, dir_fd=parent, follow_symlinks=False).st_mode) | 0o700
-        try:
-            os.chmod(name, mode, dir_fd=parent, follow_symlinks=False)
-        except (NotImplementedError, ValueError):
-            capability = os.open(name, os.O_PATH | os.O_NOFOLLOW, dir_fd=parent)
-            try:
-                if not stat.S_ISDIR(os.fstat(capability).st_mode):
-                    raise OSError('Host deletion directory changed')
-                os.chmod('/proc/self/fd/%d' % capability, mode)
-            finally:
-                os.close(capability)
+        host_os.chmod_directory(name, mode, parent)
         descriptor = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent)
     try:
         mode = stat.S_IMODE(os.fstat(descriptor).st_mode)
@@ -324,7 +344,16 @@ def processes_gone(directory):
     spec = json.loads(spec_path.read_text())
     if spec.get('ownership'):
         record = process_ownership.read_owner(directory)
-        return record is not None and record['cleanup'] == 'ok'
+        if record is not None:
+            return record['cleanup'] in ('ok', 'stale')
+        failed = directory / 'launch-failed.json'
+        exit_path = directory / 'exit.json'
+        if not ((failed.is_file() and json.loads(failed.read_text()) is True) or
+                (exit_path.is_file() and json.loads(exit_path.read_text()).get('failure_code') in
+                 ('ownership_unavailable', 'session_busy'))):
+            return False
+        return all(not path.exists() or not alive(path.read_text().strip())
+                   for path in (directory / 'pid', directory / 'child.pid'))
     if (directory / 'exit.json').is_file():
         return True
     child = directory / 'child.pid'
@@ -386,7 +415,7 @@ def _scratch_paths(directory, worker, state, hosts):
                     break
                 if parent.is_symlink():
                     raise OSError('Symbolic link in OpenCode scratch path')
-            paths.update((launch / 'tmp', launch / 'home' / 'Library' / 'Caches'))
+            paths.update((launch / 'tmp', launch / 'cache', launch / 'home' / 'Library' / 'Caches'))
     return paths
 
 
@@ -412,7 +441,6 @@ class WorkerStorage:
     def __init__(self, store):
         self.store = store
         self.tasks = {}
-        self.retry_delays = {}
         self.hosts = None
         self.registered_hosts = {}
         self.host_loading = None
@@ -476,9 +504,9 @@ class WorkerStorage:
         with self.store.transaction():
             for worker_id in workers:
                 self.store.db.execute('''UPDATE worker_temp_state SET pending=1
-                    WHERE worker=? AND finished=1 AND pending=0 AND attempts<?
+                    WHERE worker=? AND finished=1 AND pending=0
                     AND EXISTS (SELECT 1 FROM workers WHERE workers.id=worker_temp_state.worker AND status IN ('done','interrupted'))''',
-                                      (worker_id, RETRY_LIMIT))
+                                      (worker_id,))
 
     def schedule(self, worker_id=None):
         if self.closed:
@@ -509,24 +537,24 @@ class WorkerStorage:
         if not self.closed and not task.cancelled():
             asyncio.get_running_loop().call_soon(self.schedule)
 
-    def retry(self, worker_id, error=None):
-        state = self.state(worker_id)
-        attempts = state['attempts'] + int(error is not None)
-        previous_delay = self.retry_delays.get(worker_id, 1) if state['retry_at'] else 1
-        delay = min(300, max(2 ** min(attempts, 9), previous_delay * 2))
-        self.retry_delays[worker_id] = delay
+    def retry(self, worker_id):
+        """Check again in 2 s, doubling to 300 s, while proofs are unsaved or worker processes still run."""
+        waits = self.state(worker_id)['attempts'] + 1
         with self.store.transaction():
-            self.store.db.execute('UPDATE worker_temp_state SET pending=?,attempts=?,retry_at=? WHERE worker=?',
-                                  (int(error is None or attempts < RETRY_LIMIT), attempts,
-                                   time.time() + delay, worker_id))
-        if error is not None:
-            if attempts >= RETRY_LIMIT:
-                self.retry_delays.pop(worker_id, None)
-            worker = dict(self.store.db.execute('SELECT topic,task FROM workers WHERE id=?', (worker_id,)).fetchone() or {})
-            problems.record(self.store, 'worker', 'temp-cleanup-failed', str(error),
-                            level=logging.ERROR if attempts >= RETRY_LIMIT else logging.WARNING,
-                            every=None if attempts >= RETRY_LIMIT else 3600,
-                            topic=worker.get('topic'), task=worker.get('task'), worker=worker_id)
+            self.store.db.execute('UPDATE worker_temp_state SET pending=1,attempts=?,retry_at=? WHERE worker=?',
+                                  (waits, time.time() + min(300, 2 ** min(waits, 9)), worker_id))
+
+    def failed(self, worker_id, error):
+        """A failed cleanup waits 2 s, doubling each time, and never longer than the sweep backoff."""
+        worker = dict(self.store.db.execute('SELECT topic,task FROM workers WHERE id=?', (worker_id,)).fetchone() or {})
+        sweeps.failed(self.store, SWEEP, worker_id, error, 'worker',
+                      dict(topic=worker.get('topic'), task=worker.get('task'), worker=worker_id))
+        row = self.store.db.execute('SELECT failures FROM sweep_failures WHERE sweep=? AND item=?',
+                                    (SWEEP, str(worker_id))).fetchone()
+        failures = row[0] if row else 1
+        with self.store.transaction():
+            self.store.db.execute('UPDATE worker_temp_state SET pending=1,retry_at=? WHERE worker=?',
+                                  (time.time() + min(2 ** min(failures, 20), sweeps.delay(failures)), worker_id))
 
     async def inspect(self, function, *args):
         if self.read_slots is None:
@@ -561,6 +589,7 @@ class WorkerStorage:
                 if not await self.inspect(_processes_gone, hosts):
                     self.retry(worker_id)
                     return
+                await self.save(worker)
                 paths, detached = await self.paths(worker, state, hosts)
                 registration_roots.update(str(path) for path in paths | detached)
                 repositories.update(await self.inspect(_scratch_repositories, paths | detached))
@@ -590,14 +619,9 @@ class WorkerStorage:
                 if self.removal_slots is None:
                     self.removal_slots = asyncio.Semaphore(4)
                 async with self.removal_slots:
-                    if self.store.get('close_clears_space', False) is True:
+                    if not Path(name).is_symlink():
                         from . import workspaces
-                        async with workspaces._repository_lock(self.store.directory, 'closed-copy-deletion'):
-                            path = Path(name)
-                            if path.is_symlink():
-                                await _background(_remove_tree, path)
-                            else:
-                                await workspaces.delete_tree(path, paced=True)
+                        await workspaces.delete_tree(Path(name), paced=True)
                     else:
                         await _background(_remove_tree, Path(name))
                 current = self.state(worker_id)
@@ -624,9 +648,22 @@ class WorkerStorage:
                     self.store.db.executemany('DELETE FROM settings WHERE key=?',
                                              ((key,) for key in (repository_key, roots_key)))
                     self.store.host_logs_changed(worker=worker_id)
-            self.retry_delays.pop(worker_id, None)
+            sweeps.succeeded(self.store, SWEEP, worker_id)
+            worker = self.worker(worker_id)
+            if not pending and worker['status'] in FINAL:
+                from .scratch_worktrees import retire
+                await retire(self.store, worker['task'])
         except Exception as error:
-            self.retry(worker_id, error)
+            self.failed(worker_id, error)
+
+    async def save(self, worker):
+        """Commit the job work tree once its worker ended. A failed save keeps nothing from cleanup: the close save still runs."""
+        from . import cleanup
+        try:
+            await cleanup.save(self.store, worker)
+        except Exception as error:
+            problems.record(self.store, 'worker', 'save-failed', internal_detail(error), every=3600,
+                            topic=worker['topic'], task=worker['task'], worker=worker['id'])
 
     async def prepare(self, worker_id):
         path = temp_directory(worker_id)
@@ -646,7 +683,7 @@ class WorkerStorage:
         with self.store.transaction():
             self.store.db.execute('UPDATE worker_temp_state SET path=?,finished=0,epoch=epoch+?,retry_at=0,attempts=0 WHERE worker=?',
                                   (str(path), int(bool(state['finished'])), worker_id))
-        self.retry_delays.pop(worker_id, None)
+        sweeps.succeeded(self.store, SWEEP, worker_id)
         self.schedule(worker_id)
         return str(path)
 

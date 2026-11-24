@@ -1,0 +1,10 @@
+{
+  "coordinators": {
+    "claude": {"model": "sonnet", "effort": "medium"},
+    "codex": {"model": "gpt-6.2-sol", "effort": "medium"}
+  },
+  "workers": {
+    "claude": {"model": "opus", "effort": "medium"},
+    "codex": {"model": "gpt-6.2-sol", "effort": "high"}
+  }
+}

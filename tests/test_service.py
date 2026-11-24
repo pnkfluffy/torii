@@ -28,12 +28,10 @@ from coordinator.session import message_tag, message_uuid
 from coordinator.store import Store
 from coordinator.telegram import TelegramError
 from coordinator.workers import reconcile_steers, steer_outcome
-from tests.support import restart_work_rows, settle, stop_test_hosts
+from tests.support import plain, restart_work_rows, settle, stop_test_hosts
 
 
 TOPIC = '-10042:4'
-REPLY_FIRST_LINE = (
-    "Owner message: if it starts a worker or a long task, confirm that in one line first.\n")
 
 
 ORIGIN_MAIN_CLOSE = {'request': {'created': 1000.0,
@@ -82,7 +80,7 @@ ORIGIN_MAIN_CLOSE = {'request': {'created': 1000.0,
                   'Its agent stops. The Telegram topic and all its messages will be deleted. This '
                   'cannot be undone.\n'
                   '\n'
-                  'Open jobs to mark dropped:\n'
+                  'Open and waiting jobs to mark dropped:\n'
                   'None.\n'
                   '\n'
                   'Folder: {root}/projects/closing-project\n'
@@ -279,7 +277,7 @@ class ServiceTestsSupport:
             self.store.put('coordinator_session', str(uuid.uuid4()))
         await self.service.start_session()
         await self.drain_feed()
-        sent = [(identity, text) for identity, text in self.sessions[0].sent
+        sent = [(identity, plain(text)) for identity, text in self.sessions[0].sent
                 if 'kind=secret_filled' in text]
         self.assertEqual(sent, [(message_uuid(notice['id']), tag(notice['id'], 'secret_filled') + notice['text'])])
         self.assertEqual(self.store.db.execute('SELECT delivered FROM messages WHERE id=?',
@@ -324,9 +322,49 @@ class ServiceTestsSupport:
 
 
 class ServiceTests(ServiceTestsSupport, unittest.IsolatedAsyncioTestCase):
+    async def test_feed_retries_database_lock(self):
+        attempts = 0
+        recovered = asyncio.Event()
+        async def feed_once():
+            nonlocal attempts
+            attempts += 1
+            if attempts <= 7:
+                raise sqlite3.OperationalError('database is locked')
+            recovered.set()
+            return True
+        with patch.object(self.service, 'feed_once', side_effect=feed_once):
+            feed = asyncio.create_task(self.service.supervise('feed', self.service.feed))
+            try:
+                await asyncio.wait_for(recovered.wait(), 15)
+                self.assertFalse(feed.done())
+            finally:
+                feed.cancel()
+                await asyncio.gather(feed, return_exceptions=True)
+
+    async def test_feed_retries_lock_while_reading_idle_setting(self):
+        recovered = asyncio.Event()
+        original_get = self.store.get
+        attempts = 0
+        def get(key, *args):
+            nonlocal attempts
+            if key == 'coordinator_account_retry_at':
+                attempts += 1
+                if attempts == 1:
+                    raise sqlite3.OperationalError('database is locked')
+                recovered.set()
+            return original_get(key, *args)
+        with patch.object(self.service, 'feed_once', return_value=False), patch.object(self.store, 'get', side_effect=get):
+            feed = asyncio.create_task(self.service.supervise('feed', self.service.feed))
+            try:
+                await asyncio.wait_for(recovered.wait(), 5)
+                self.assertFalse(feed.done())
+            finally:
+                feed.cancel()
+                await asyncio.gather(feed, return_exceptions=True)
+
     async def test_nonessential_loop_pauses_once_and_message_delivery_and_workers_continue(self):
         names = {'command_menu': 'command menu', 'reactions': 'reactions', 'signins': 'account sign-in',
-                 'tldr': 'summaries', 'worktree_cleanup': 'worktree cleanup',
+                 'tldr': 'summaries', 'worktree_cleanup': 'worktree cleanup', 'close_save': 'close-save clear',
                  'host_logs': 'host log cleanup', 'session_cleanup': 'native session cleanup', 'waits': 'wait triggers'}
         if self.store.code_requests is not None:
             names.update(self.store.code_requests.loop_names())
@@ -363,7 +401,7 @@ class ServiceTests(ServiceTestsSupport, unittest.IsolatedAsyncioTestCase):
                         rows = self.store.db.execute(
                             "SELECT code,detail FROM problems WHERE area='service' AND id>? AND code!='started'",
                             (before,)).fetchall()
-                        self.assertEqual([row['code'] for row in rows], ['loop-crashed'] * 6 + ['loop-stopped'])
+                        self.assertEqual([row['code'] for row in rows], ['loop-crashed', 'loop-stopped'])
                         self.assertIn('loop=%s InterfaceError: Synthetic loop error' % name, rows[-1]['detail'])
                         update_id = 9000 + list(names).index(name)
                         self.telegram.pending_updates.append(owner_update(update_id, 'continue after ' + name))
@@ -468,7 +506,7 @@ class ServiceTests(ServiceTestsSupport, unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(stopped.is_set())
                 codes = [row['code'] for row in self.store.db.execute(
                     "SELECT code FROM problems WHERE area='service' AND id>? ORDER BY id", (before,))]
-                self.assertEqual(codes, ['started'] + ['loop-crashed'] * 6 + ['loop-failed'])
+                self.assertEqual(codes, ['started', 'loop-crashed', 'loop-failed'])
                 self.assertEqual(self.store.get('service_run')['cause'],
                                  'loop failed: The %s service loop failed 6 times.' % name)
                 self.assertEqual(list(self.store.db.execute('SELECT text FROM outbox')), [])
@@ -499,7 +537,7 @@ class ServiceTests(ServiceTestsSupport, unittest.IsolatedAsyncioTestCase):
         self.assertEqual(attempts, 11)
         self.assertEqual(sleeps, [0] * 5 + [900, 1800, 3600, 7200, 7200])
         rows = self.problems()
-        self.assertEqual([row['code'] for row in rows], ['loop-crashed'] * 6 + ['loop-stopped'] + ['loop-crashed'] * 4)
+        self.assertEqual([row['code'] for row in rows], ['loop-crashed', 'loop-stopped'])
         notices = list(self.store.db.execute('SELECT topic,text FROM outbox'))
         self.assertEqual([(row['topic'], row['text']) for row in notices], [(TOPIC,
             'Torii paused its host log cleanup after repeated errors and will retry it by itself. '
@@ -531,9 +569,8 @@ class ServiceTests(ServiceTestsSupport, unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result, 'recovered', 'Ten healthy minutes must reset the consecutive crash budget')
         self.assertEqual(attempts, 16)
         self.assertEqual(sleeps, [0] * 15)
-        self.assertEqual([row['code'] for row in self.problems()], ['loop-crashed'] * 15)
-        self.assertIn('attempt=1', self.problems()[5]['detail'])
-        self.assertIn('attempt=1', self.problems()[10]['detail'])
+        self.assertEqual([row['code'] for row in self.problems()], ['loop-crashed'])
+        self.assertIn('attempt=1', self.problems()[0]['detail'])
         self.assertEqual(list(self.store.db.execute('SELECT text FROM outbox')), [])
 
     async def test_nonessential_pause_reporting_survives_database_errors(self):
@@ -572,14 +609,14 @@ class ServiceTests(ServiceTestsSupport, unittest.IsolatedAsyncioTestCase):
                 sleep=AsyncMock(), CancelledError=asyncio.CancelledError, Event=asyncio.Event)), self.assertLogs('coordinator', 'ERROR'):
             await self.service.supervise('host_logs', failing)
         rows = self.problems()
-        self.assertEqual([row['code'] for row in rows], ['loop-crashed'] * 6 + ['loop-stopped'])
+        self.assertEqual([row['code'] for row in rows], ['loop-crashed', 'loop-stopped'])
         for row in rows:
             self.assertEqual(row['area'], 'service')
             self.assertIn('loop=host_logs', row['detail'])
             self.assertIn('InterfaceError: Synthetic cleanup failure for [email]', row['detail'])
             self.assertNotIn('fixture@example.invalid', row['detail'])
 
-    def test_opencode_pause_texts_name_the_account_and_no_fallback(self):
+    def test_opencode_pause_texts_name_the_account_and_that_no_other_agent_can_take_it(self):
         from coordinator.session import AccountsUnavailable
         from datetime import datetime
         topic = '-10042:5'
@@ -610,7 +647,7 @@ class ServiceTests(ServiceTestsSupport, unittest.IsolatedAsyncioTestCase):
                 self.service.pause_parent(topic, AccountsUnavailable(reset, provider='opencode', alias=alias))
                 notice = self.store.get(key + '_notice')
                 self.assertEqual(notice['text'], 'This chat is paused: ' + text +
-                                 ' Torii does not move this chat to another agent. Your messages are saved.')
+                                 ' No other agent of its queue can take it now. Your messages are saved.')
                 self.assertEqual(self.store.get(key + '_retry_at'), reset)
                 self.assertEqual(self.store.db.execute('SELECT text FROM outbox ORDER BY id DESC LIMIT 1').fetchone()[0],
                                  notice['text'])
@@ -632,40 +669,23 @@ class ServiceTests(ServiceTestsSupport, unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(notes[0].startswith('This chat moved from ' + expected +
                                 ' because the owner changed the pick. Your earlier conversation is not in this context.\n\n'))
 
-    async def test_d4_chat_policy_next_message_clear_isolation_and_rerouted_result(self):
-        from coordinator import control_api
-        from coordinator.policy import chat_policy, usage_policy
-        other = '-10042:9'
-        self.store.db.execute('INSERT INTO topics(id,chat,thread,name,cwd,enabled) VALUES (?, -10042, 9, ?, ?, 1)',
-                              (other, 'Other', str(self.root)))
-        self.store.db.commit()
+    async def test_rule_file_edit_reaches_running_chat_without_relaunch(self):
+        from coordinator.policy import chat_path
         home = await self.service.start_session(TOPIC)
-        sibling = await self.service.start_session(other)
-        sibling.idle = lambda: True
-        async def deliver(topic, text, kind='owner'):
-            self.store.message_save(topic, kind, text)
-            await self.service.feed_once()
-            await asyncio.gather(*self.service.feed_tasks.values())
-        with self.store.db:
-            self.assertTrue(control_api.call(self.store, 'policy.chat', {'topic': TOPIC, 'text': 'Home text.'}).ok)
-        await deliver(TOPIC, 'changed')
-        self.assertTrue(home.sent[-1][1].endswith('Current usage policy:\n' + chat_policy(self.store, 'coordinator')))
-        await deliver(TOPIC, 'again')
-        self.assertNotIn('Current usage policy:', home.sent[-1][1])
-        await deliver(other, 'sibling')
-        self.assertNotIn('Current usage policy:', sibling.sent[-1][1])
-        with self.store.db:
-            self.assertTrue(control_api.call(self.store, 'policy.chat', {'topic': TOPIC}).ok)
-        await deliver(TOPIC, 'cleared')
-        self.assertTrue(home.sent[-1][1].endswith('Current usage policy:\n' + usage_policy(self.store.directory)))
-        self.store.put('coordinator_delegation', {'text': 'Home reroute.', 'revision': 1})
-        self.store.put('coordinator:' + other + '_delegation', {'text': 'Disabled text.', 'revision': 1})
-        self.store.db.execute('UPDATE topics SET enabled=0 WHERE id=?', (other,))
-        self.store.db.commit()
-        await deliver(other, 'worker finished', 'worker_result')
-        self.assertTrue(home.sent[-1][1].endswith('Current usage policy:\n' + chat_policy(self.store, 'coordinator')))
-        self.assertNotIn('Disabled text.', home.sent[-1][1])
-        self.assertEqual(len(self.sessions), 2)
+        path = chat_path(self.store, TOPIC)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text('- First rule\n')
+        self.store.message_save(TOPIC, 'owner', 'next')
+        await self.service.feed_once()
+        await asyncio.gather(*self.service.feed_tasks.values())
+        self.assertIs(self.service.sessions[TOPIC], home)
+        self.assertIn('- First rule', home.sent[-1][1])
+        path.write_text('- Changed rule\n')
+        self.store.message_save(TOPIC, 'owner', 'again')
+        await self.service.feed_once()
+        await asyncio.gather(*self.service.feed_tasks.values())
+        self.assertIs(self.service.sessions[TOPIC], home)
+        self.assertIn('- Changed rule', home.sent[-1][1])
 
     async def test_cli_event_without_service_reaches_its_topic_on_next_drain(self):
         other = '-10042:5'
@@ -684,7 +704,7 @@ class ServiceTests(ServiceTestsSupport, unittest.IsolatedAsyncioTestCase):
         self.assertFalse((self.store.directory / 'service.lock').exists())
         await self.drain_feed()
         session = self.service.sessions[other]
-        self.assertEqual(session.sent, [(message_uuid(event['id']),
+        self.assertEqual([(identity, plain(text)) for identity, text in session.sent], [(message_uuid(event['id']),
                                         tag(event['id'], 'event', other, 'Atlas') + 'Approval needed.')])
         self.assertNotIn(TOPIC, self.service.sessions)
         self.assertEqual(self.store.db.execute('SELECT delivered FROM messages WHERE id=?',
@@ -707,7 +727,7 @@ class ServiceTests(ServiceTestsSupport, unittest.IsolatedAsyncioTestCase):
         with patch('coordinator.service.pause', side_effect=post_during_idle):
             await self.run_until([self.service.feed], lambda: bool(self.sessions and self.sessions[0].sent))
         self.assertTrue(observed.is_set())
-        self.assertIn('kind=event] Lane stopped.', self.sessions[0].sent[0][1])
+        self.assertIn('kind=event] Lane stopped.', plain(self.sessions[0].sent[0][1]))
         self.assertEqual(self.telegram.calls, [])
         self.assertEqual(self.telegram.sent, [])
 
@@ -734,7 +754,8 @@ class ServiceTests(ServiceTestsSupport, unittest.IsolatedAsyncioTestCase):
     async def test_uncertain_event_has_the_same_restart_delivery_as_a_worker_result(self):
         session = await self.service.start_session(TOPIC)
         with patch.object(session, 'send', new=AsyncMock(return_value='uncertain')):
-            rows = [self.store.message_save(TOPIC, kind, 'Delivery uncertain.')
+            rows = [self.store.message_save(TOPIC, kind, json.dumps({'worker': 1, 'text': 'Delivery uncertain.'})
+                                            if kind == 'worker_result' else 'Delivery uncertain.')
                     for kind in ('worker_result', 'event')]
             await self.drain_feed()
         await session.stop()
@@ -745,7 +766,7 @@ class ServiceTests(ServiceTestsSupport, unittest.IsolatedAsyncioTestCase):
         self.assertFalse(any(row['kind'] in ('event', 'worker_result') for row in self.store.messages_pending()))
         self.assertEqual(self.telegram.sent, [])
 
-    async def test_named_codex_reset_is_queued_then_refused_below_95_percent(self):
+    async def test_named_codex_reset_is_queued_then_refused_below_99_percent(self):
         from coordinator import control_api
         self.store.put('codex_accounts', {'gpt': {'config_dir': str(self.root), 'enabled': True}})
         self.store.put('codex_account_status', {'gpt': {'identity': {'logged_in': True},
@@ -767,7 +788,7 @@ class ServiceTests(ServiceTestsSupport, unittest.IsolatedAsyncioTestCase):
             self.assertFalse(await self.service.controls_once())
         request = self.store.db.execute('SELECT state,result FROM service_requests WHERE id=?',
                                         (queued.data['request'],)).fetchone()
-        notice = 'This Codex account is below 95% on its resettable meters'
+        notice = 'This Codex account is below 99% on its resettable meters'
         self.assertEqual((request['state'], json.loads(request['result'])), ('refused', {'text': notice}))
         self.assertEqual([row[0] for row in self.store.db.execute('SELECT text FROM outbox')], [notice])
         self.assertEqual([entry.args[0] for entry in server.request.call_args_list],
@@ -813,12 +834,12 @@ class ServiceTests(ServiceTestsSupport, unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.store.get(updates.KEY)['health']['commit'], 'b' * 40)
         self.assertEqual(self.store.get(updates.KEY)['health']['process'], 'new process')
 
-    async def test_usage_provider_switch_keeps_continuity_without_a_topic_notice(self):
+    async def test_usage_provider_switch_keeps_continuity_and_sends_one_topic_line(self):
         saved = str(uuid.uuid4())
         self.store.put('coordinator_session', saved)
         session = FakeSession(str(uuid.uuid4()))
         session.switched = True
-        session.switch = {'from': 'claude', 'to': 'codex', 'reason': 'every Claude account is out of usage'}
+        session.switch = {'from': 'claude', 'to': 'codex', 'reason': 'Claude is out of usage'}
         self.service.session_factory = AsyncMock(return_value=session)
         await self.service.start_session(TOPIC)
         notes = [row['text'] for row in self.store.messages_pending() if row['kind'] == 'restarted']
@@ -827,8 +848,8 @@ class ServiceTests(ServiceTestsSupport, unittest.IsolatedAsyncioTestCase):
         self.assertIn('Channel continuity:', notes[0])
         self.assertNotIn('The service restarted.', notes[0])
         await self.service.start_session(TOPIC)
-        self.assertEqual(self.store.db.execute("SELECT count(*) FROM outbox WHERE topic=? "
-                                               "AND text LIKE 'This chat now runs%'", (TOPIC,)).fetchone()[0], 0)
+        self.assertEqual([row[0] for row in self.store.db.execute('SELECT text FROM outbox WHERE topic=?', (TOPIC,))],
+                         ['Claude is out of usage; this chat runs on ChatGPT until Claude can run again.'])
 
     def continuity_jobs(self):
         other = '-10042:5'
@@ -897,6 +918,42 @@ class ServiceTests(ServiceTestsSupport, unittest.IsolatedAsyncioTestCase):
                          reports + (mode == 'switch'))
         return notices[0], session
 
+    async def test_continuity_dates_and_reply_status(self):
+        answered = self.store.message_save(TOPIC, 'owner', 'Old question', telegram_message=401)
+        pending = self.store.message_save(TOPIC, 'owner', 'New question', telegram_message=402)
+        for row in (answered, pending):
+            self.store.message_delivered(row['id'], 'received')
+        with self.store.db:
+            self.store.db.execute('UPDATE messages SET created=? WHERE id IN (?,?)', (1609459200, answered['id'], pending['id']))
+            self.store.db.execute('UPDATE messages SET created=? WHERE id=?', (1609459300, pending['id']))
+            reply = self.store.enqueue_report(TOPIC, 'Answer', reply_to=401)
+            self.store.db.execute('UPDATE outbox SET created=? WHERE id=?', (1609459250, reply))
+        self.store.delivered(reply, 403)
+        notice, _ = await self.continuity_notice('fallback')
+        rows = json.loads(notice['text'].split('. Recent messages: ', 1)[1])
+        self.assertEqual([(row['created'], row['reply_status']) for row in rows[-2:]],
+                         [('2021-01-01T00:00:00+00:00', 'confirmed'),
+                          ('2021-01-01T00:01:40+00:00', 'reply not linked')])
+
+    async def test_continuity_status_only_owner_and_unquoted_send(self):
+        owner = self.store.message_save(TOPIC, 'owner', 'Question', telegram_message=501)
+        event = self.store.message_save(TOPIC, 'event', 'Event')
+        worker = self.store.message_save(TOPIC, 'worker_result', 'Worker result')
+        for row in (owner, event, worker):
+            self.store.message_delivered(row['id'], 'received')
+        with self.store.db:
+            self.store.db.execute('UPDATE messages SET created=100 WHERE id=?', (owner['id'],))
+            reply = self.store.enqueue_report(TOPIC, 'Unquoted answer')
+            self.store.db.execute('UPDATE outbox SET created=101 WHERE id=?', (reply,))
+        self.store.delivered(reply, 502)
+        notice, _ = await self.continuity_notice('fallback')
+        self.assertIn('check job notes before redoing anything. Recent messages: [', notice['text'])
+        rows = json.loads(notice['text'].split('. Recent messages: ', 1)[1])
+        by_kind = {row['kind']: row for row in rows}
+        self.assertEqual(by_kind['owner']['reply_status'], 'confirmed')
+        self.assertNotIn('reply_status', by_kind['event'])
+        self.assertNotIn('reply_status', by_kind['worker_result'])
+
     async def test_parent_jobs_summary_bounds_both_continuity_notices(self):
         jobs, finished, running = self.continuity_jobs()
         transcript = self.root / 'worker-transcript.jsonl'
@@ -907,22 +964,18 @@ class ServiceTests(ServiceTestsSupport, unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(PermissionError):
                 with open(transcript) as handle:
                     handle.read()
-            for mode in ('switch', 'restart', 'fallback'):
+            for mode in ('switch', 'fallback'):
                 notice, session = await self.continuity_notice(mode, full_tail=True)
                 with self.subTest(mode=mode):
                     prompt = notice['text']
                     self.assertLessEqual(len(prompt), 8000)
                     self.assertLessEqual(len(prompt), parent_state.RESTART_NOTICE_CHARS)
                     self.assertGreater(len(prompt), 7000)
-                    self.assertIn('stale-notice-' if mode == 'restart' else 'recent-message-', prompt)
-                    if mode != 'restart':
-                        tail = json.loads(prompt.split('. Recent messages: ', 1)[1])
-                        self.assertEqual(len(tail), 5)
-                        self.assertTrue(all(len(row['text']) == 500 for row in tail))
-                    else:
-                        tail = json.JSONDecoder().raw_decode(prompt.split('characters): ', 1)[1])[0]
-                        self.assertEqual((tail['count'], len(tail['shown']), tail['not_shown']), (10, 7, 3))
-                    summary = json.loads(prompt.split('Open jobs: ', 1)[1].split('. ', 1)[0])
+                    self.assertIn('recent-message-', prompt)
+                    tail = json.loads(prompt.split('. Recent messages: ', 1)[1])
+                    self.assertEqual(len(tail), 5)
+                    self.assertTrue(all(len(row['text']) == 500 for row in tail))
+                    summary = json.JSONDecoder().raw_decode(prompt.split('Open jobs: ', 1)[1])[0]
                     self.assertEqual(summary['count'], 60)
                     self.assertEqual(summary['not_shown'], 60 - len(summary['shown']))
                     self.assertLessEqual(len(summary['shown']), parent_state.RESTART_TASKS)
@@ -959,25 +1012,17 @@ class ServiceTests(ServiceTestsSupport, unittest.IsolatedAsyncioTestCase):
                 (task,topic,provider,prompt,status,result,created,updated) VALUES (?,?,?,?,?,?,?,?)''',
                 (newest['id'], TOPIC, 'codex', 'Finished', 'done', json.dumps({
                     'success': True, 'text': '界🦊' * 100}), 1, 1))
-        for mode in ('restart', 'switch'):
-            notice, _ = await self.continuity_notice(mode, full_tail=True)
-            with self.subTest(mode=mode):
-                prompt = notice['text']
-                summary = json.JSONDecoder().raw_decode(prompt.split('Open jobs: ', 1)[1])[0]
-                self.assertEqual([row['id'] for row in summary['shown'][:1]], [newest['id']])
-                self.assertEqual(summary['count'], 2)
-                self.assertEqual(summary['not_shown'], 2 - len(summary['shown']))
-                self.assertEqual(summary['shown'][0]['title'], '界🦊' * 100)
-                if mode == 'restart':
-                    self.assertEqual(summary['shown'][0]['notes'], '')
-                    text = summary['shown'][0]['finished']['text']
-                    self.assertTrue(text.endswith('…'))
-                    self.assertLess(len(text), 200)
-                else:
-                    self.assertTrue(summary['shown'][0]['notes'].endswith('…'))
-                    self.assertEqual(summary['shown'][0]['finished']['text'], '界🦊' * 100)
-                self.assertIn('recent-message-' if mode == 'switch' else 'stale-notice-', prompt)
-                self.assertLessEqual(len(prompt), parent_state.RESTART_NOTICE_CHARS)
+        notice, _ = await self.continuity_notice('switch', full_tail=True)
+        prompt = notice['text']
+        summary = json.JSONDecoder().raw_decode(prompt.split('Open jobs: ', 1)[1])[0]
+        self.assertEqual([row['id'] for row in summary['shown'][:1]], [newest['id']])
+        self.assertEqual(summary['count'], 2)
+        self.assertEqual(summary['not_shown'], 2 - len(summary['shown']))
+        self.assertEqual(summary['shown'][0]['title'], '界🦊' * 100)
+        self.assertTrue(summary['shown'][0]['notes'].endswith('…'))
+        self.assertEqual(summary['shown'][0]['finished']['text'], '界🦊' * 100)
+        self.assertIn('recent-message-', prompt)
+        self.assertLessEqual(len(prompt), parent_state.RESTART_NOTICE_CHARS)
 
     def test_parent_jobs_summary_trims_oldest_workers_and_counts_all_omissions(self):
         job = self.store.task_create(TOPIC, 'Worker trim')
@@ -1002,15 +1047,13 @@ class ServiceTests(ServiceTestsSupport, unittest.IsolatedAsyncioTestCase):
             worker = self.store.db.execute('''INSERT INTO workers
                 (task,topic,provider,prompt,status,work,created,updated) VALUES (?,?,?,?,?,?,?,?)''',
                 (older['id'], TOPIC, 'codex', 'Build', 'running', 'development', 1, 1)).lastrowid
-        for mode in ('restart', 'fallback'):
-            notice, _ = await self.continuity_notice(mode, full_tail=True)
-            with self.subTest(mode=mode):
-                summary = json.JSONDecoder().raw_decode(notice['text'].split('Open jobs: ', 1)[1])[0]
-                self.assertEqual(summary['shown'][0]['id'], older['id'])
-                self.assertEqual(summary['live_workers'], [
-                    {'id': worker, 'task': older['id'], 'provider': 'codex',
-                     'status': 'running', 'work': 'development'}])
-                self.assertLess(len(summary['shown']), 11)
+        notice, _ = await self.continuity_notice('fallback', full_tail=True)
+        summary = json.JSONDecoder().raw_decode(notice['text'].split('Open jobs: ', 1)[1])[0]
+        self.assertEqual(summary['shown'][0]['id'], older['id'])
+        self.assertEqual(summary['live_workers'], [
+            {'id': worker, 'task': older['id'], 'provider': 'codex',
+             'status': 'running', 'work': 'development'}])
+        self.assertLess(len(summary['shown']), 11)
 
     async def test_parent_jobs_summary_keeps_live_workers_when_last_job_is_cut(self):
         jobs = [self.store.task_create(TOPIC, 'Overflow %02d ' % number + 't' * 20, notes='long notes ' + 'n' * 1000)
@@ -1027,7 +1070,7 @@ class ServiceTests(ServiceTestsSupport, unittest.IsolatedAsyncioTestCase):
                     (job['id'], TOPIC, 'codex', 'Build', 'running', 'development', 1, 1)).lastrowid
                 live.append({'id': worker, 'task': job['id'], 'provider': 'codex',
                              'status': 'running', 'work': 'development'})
-        for mode in ('restart', 'fallback', 'switch'):
+        for mode in ('fallback', 'switch'):
             notice, _ = await self.continuity_notice(mode, full_tail=True)
             with self.subTest(mode=mode):
                 prompt = notice['text']
@@ -1096,7 +1139,7 @@ class ServiceTests(ServiceTestsSupport, unittest.IsolatedAsyncioTestCase):
         with self.store.db:
             self.store.db.executemany('UPDATE tasks SET updated=? WHERE id=?',
                                       [(30, jobs[0]['id']), (10, jobs[1]['id']), (30, jobs[2]['id'])])
-        for mode in ('switch', 'restart'):
+        for mode in ('switch', 'fallback'):
             notice, _ = await self.continuity_notice(mode)
             with self.subTest(mode=mode):
                 summary = json.JSONDecoder().raw_decode(notice['text'].split('Open jobs: ', 1)[1])[0]
@@ -1153,7 +1196,7 @@ class ServiceTests(ServiceTestsSupport, unittest.IsolatedAsyncioTestCase):
             worker = self.store.db.execute('''INSERT INTO workers
                 (task,topic,provider,prompt,status,work,created,updated) VALUES (?,?,?,?,?,?,?,?)''',
                 (job['id'], other, 'codex', 'Other CI', 'running', 'development', 1, 1)).lastrowid
-        for mode in ('switch', 'restart'):
+        for mode in ('switch', 'fallback'):
             home, _ = await self.continuity_notice(mode)
             channel, _ = await self.continuity_notice(mode, other)
             with self.subTest(mode=mode):
@@ -1202,7 +1245,7 @@ class ServiceTests(ServiceTestsSupport, unittest.IsolatedAsyncioTestCase):
                 (task,topic,provider,prompt,status,work,result,created,updated) VALUES (?,?,?,?,?,?,?,?,?)''',
                 (job['id'], TOPIC, 'codex', 'Older completion', 'done', 'development',
                  json.dumps({'success': True, 'text': 'stale result'}), 1, 15))
-        for mode in ('switch', 'restart'):
+        for mode in ('switch', 'fallback'):
             notice, _ = await self.continuity_notice(mode)
             summary = json.JSONDecoder().raw_decode(notice['text'].split('Open jobs: ', 1)[1])[0]
             with self.subTest(mode=mode):
@@ -1221,7 +1264,7 @@ class ServiceTests(ServiceTestsSupport, unittest.IsolatedAsyncioTestCase):
         for _ in range(10):
             message = self.store.message_save(TOPIC, 'owner', '\\"\n🦊' * 500)
             self.store.message_delivered(message['id'], 'uncertain')
-        for mode in ('switch', 'restart'):
+        for mode in ('switch', 'fallback'):
             notice, session = await self.continuity_notice(mode)
             with self.subTest(mode=mode):
                 prompt = notice['text']
@@ -1238,7 +1281,7 @@ class ServiceTests(ServiceTestsSupport, unittest.IsolatedAsyncioTestCase):
         jobs, finished, running = self.continuity_jobs()
         with self.store.db:
             self.store.db.execute("UPDATE tasks SET title='Small job',notes=NULL WHERE status='open'")
-        for mode in ('switch', 'restart'):
+        for mode in ('switch', 'fallback'):
             notice, _ = await self.continuity_notice(mode)
             summary = json.JSONDecoder().raw_decode(notice['text'].split('Open jobs: ', 1)[1])[0]
             with self.subTest(mode=mode):
@@ -1308,7 +1351,7 @@ class ServiceTests(ServiceTestsSupport, unittest.IsolatedAsyncioTestCase):
                 factory = self.service.session_factory
 
                 async def available_factory(*args, **kwargs):
-                    ready = (self.service.accounts.select() if provider == 'claude' else
+                    ready = (self.service.accounts.select(model='native-default') if provider == 'claude' else
                              self.service.codex_accounts.parent_account())
                     if ready != alias:
                         raise AccountsUnavailable(now + 3600, provider=provider, alias=alias)
@@ -1357,7 +1400,7 @@ class ServiceTests(ServiceTestsSupport, unittest.IsolatedAsyncioTestCase):
         factory = self.service.session_factory
 
         async def available_factory(store, runner, cwd, model, instructions, topic=None):
-            if topic == other and self.service.accounts.select() != alias:
+            if topic == other and self.service.accounts.select(model='native-default') != alias:
                 raise AccountsUnavailable(now + 3600, provider='claude', alias=alias)
             return await factory(store, runner, cwd, model, instructions, topic=topic)
 
@@ -1477,7 +1520,7 @@ class ServiceTests(ServiceTestsSupport, unittest.IsolatedAsyncioTestCase):
         self.store.message_delivered(row['id'], 'uncertain')
         path = self.root / 'rollout.jsonl'
         path.write_text(json.dumps({'type': 'event_msg', 'payload': {'type': 'user_message',
-            'message': tag(row['id']) + REPLY_FIRST_LINE + 'request'}}) + '\n')
+            'message': tag(row['id']) + 'request'}}) + '\n')
         session = SimpleNamespace(transcript_path=path, transcript_receipts=codex_transcript_receipts)
         self.service.confirm_from_transcript(TOPIC, session)
         receipt = self.store.db.execute('SELECT receipt FROM messages WHERE id=?', (row['id'],)).fetchone()[0]
@@ -1497,13 +1540,14 @@ class ServiceTests(ServiceTestsSupport, unittest.IsolatedAsyncioTestCase):
         await asyncio.gather(*self.service.feed_tasks.values())
         self.assertNotIn('Current usage policy:', launched[0])
         self.assertIn('Registered channels:', launched[0])
-        self.assertEqual(self.sessions[0].sent[0][1], tag(1) + REPLY_FIRST_LINE + 'first')
-        policy = 'Use one worker.\n## Coordinators\nReply first.\n## Effort\nKeep.\n'
-        (self.store.directory / 'USAGE.md').write_text(policy)
+        self.assertEqual(plain(self.sessions[0].sent[0][1]), tag(1) + 'first')
+        from coordinator.policy import personal_path
+        personal_path(self.store).write_text('- Use one worker.\n## Coordinators\n- Reply first.\n')
         self.store.message_save(TOPIC, 'owner', 'second')
         await self.service.feed_once()
         await asyncio.gather(*self.service.feed_tasks.values())
-        self.assertIn('Current usage policy:\n' + policy, self.sessions[0].sent[-1][1])
+        self.assertIn('Current usage policy:\n', self.sessions[0].sent[-1][1])
+        self.assertIn('- Use one worker.\n## Coordinators\n- Reply first.', self.sessions[0].sent[-1][1])
 
     async def test_rejected_claude_workers_report_once_at_home_without_project_callbacks(self):
         project = '-10042:55'
@@ -1515,7 +1559,7 @@ class ServiceTests(ServiceTestsSupport, unittest.IsolatedAsyncioTestCase):
         transcript.write_text('{}\n')
         self.runner.result = RunResult('rejected-session', quota_limited=True,
                                       transcript_path=str(transcript),
-                                      rate_limit_info={'status': 'rejected', 'rateLimitType': 'five_hour',
+                                      rate_limit_info={'status': 'rejected', 'rateLimitType': 'seven_day',
                                                        'resetsAt': reset})
         for attempt in range(2):
             identifier = self.worker(topic=project)
@@ -1537,22 +1581,22 @@ class ServiceTests(ServiceTestsSupport, unittest.IsolatedAsyncioTestCase):
         async def collect(account):
             return {'identity': {'logged_in': True, 'email': 'orbit@example.com'},
                     'observed_at': time.time(),
-                    'usage': {'seven_day_fable': {'utilization': used, 'resets_at': now + 3600}}}
+                    'usage': {'seven_day': {'utilization': used, 'resets_at': now + 3600}}}
 
         override = self.root / 'local-overrides.json'
         override.write_text(json.dumps({'account_switch_thresholds': {'orbit': .8}}))
         with patch('coordinator.accounts.LOCAL_OVERRIDES_PATH', override):
             for used in (60, 79, 80):
                 self.assertFalse(await refresh_accounts(self.store, collect))
-                self.assertEqual(self.store.get('account_status')['orbit']['usage']['seven_day_fable']['utilization'], used)
+                self.assertEqual(self.store.get('account_status')['orbit']['usage']['seven_day']['utilization'], used)
                 self.assertEqual(list(self.store.db.execute('SELECT text FROM outbox')), [])
-            self.assertIsNone(self.service.accounts.select())
+            self.assertIsNone(self.service.accounts.select(model='native-default'))
 
     async def test_owner_prompt_puts_reply_first_between_tag_and_text(self):
         row = self.store.message_save(TOPIC, 'owner', 'What changed?')
         await self.drain_feed()
-        self.assertEqual(self.sessions[0].sent, [
-            (message_uuid(row['id']), tag(row['id']) + REPLY_FIRST_LINE + row['text'])])
+        self.assertEqual([(identity, plain(text)) for identity, text in self.sessions[0].sent], [
+            (message_uuid(row['id']), tag(row['id']) + row['text'])])
 
     async def test_forwarded_user_reaches_parent_as_information_with_quoted_origin(self):
         incoming = owner_update(1, 'Read the forwarded report.')
@@ -1563,7 +1607,7 @@ class ServiceTests(ServiceTestsSupport, unittest.IsolatedAsyncioTestCase):
         row, = self.store.messages_pending()
         self.assertEqual(row['kind'], 'forwarded')
         await self.drain_feed()
-        self.assertEqual(self.sessions[0].sent, [(message_uuid(row['id']),
+        self.assertEqual([(identity, plain(text)) for identity, text in self.sessions[0].sent], [(message_uuid(row['id']),
             tag(row['id'], 'forwarded') + 'Forwarded from ' + json.dumps(name) + ':\nRead the forwarded report.')])
         self.assertEqual(self.store.db.execute('SELECT delivered FROM messages WHERE id=?',
                                               (row['id'],)).fetchone()[0], 'received')
@@ -1589,7 +1633,7 @@ class ServiceTests(ServiceTestsSupport, unittest.IsolatedAsyncioTestCase):
                 incoming['message'].update(fields)
                 self.assertEqual(self.store.accept(incoming), 'queued')
                 await self.drain_feed()
-                prompt = self.sessions[0].sent[-1][1]
+                prompt = plain(self.sessions[0].sent[-1][1])
                 self.assertEqual(prompt, tag(number, 'forwarded') + 'Forwarded from ' + json.dumps(name) +
                                  ':\nForwarded content ' + str(number))
 
@@ -1602,7 +1646,7 @@ class ServiceTests(ServiceTestsSupport, unittest.IsolatedAsyncioTestCase):
                 incoming['message'].update(fields)
                 self.assertEqual(self.store.accept(incoming), 'queued')
                 await self.drain_feed()
-                self.assertEqual(self.sessions[0].sent[-1][1], tag(number) + REPLY_FIRST_LINE + 'My own message.')
+                self.assertEqual(plain(self.sessions[0].sent[-1][1]), tag(number) + 'My own message.')
                 incoming = owner_update(number + 10, '/ping')
                 incoming['message'].update(fields)
                 self.assertEqual(self.store.accept(incoming), 'ping')
@@ -1620,10 +1664,11 @@ class ServiceTests(ServiceTestsSupport, unittest.IsolatedAsyncioTestCase):
         self.assertIn("owner's own message", result.text)
         self.assertEqual(self.store.tasks_list(), [])
         result = control_api.call(self.store, 'policy.chat', {'message': forwarded['id'], 'topic': TOPIC,
-                                  'text': 'Untrusted policy.'}, topic=TOPIC, source='mcp')
+                                  'append': 'Untrusted policy.'}, topic=TOPIC, source='mcp')
         self.assertFalse(result.ok)
         self.assertIn('owner message', result.text)
-        self.assertIsNone(self.store.get('coordinator_delegation'))
+        from coordinator.policy import chat_path
+        self.assertFalse(chat_path(self.store, TOPIC).exists())
         for kind in ('owner', 'event', 'worker_result', 'callback', 'restarted', 'secret_filled'):
             with self.subTest(kind=kind):
                 row = self.store.message_save(TOPIC, kind, 'Legitimate job origin.')
@@ -1659,8 +1704,10 @@ class ServiceTests(ServiceTestsSupport, unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.store.db.execute('SELECT COUNT(*) FROM outbox').fetchone()[0], 0)
         self.assertIsNone(self.store.get('project_setup:' + TOPIC))
         self.telegram.download_file = AsyncMock(return_value=b'Fixture file content.')
-        await self.drain_feed()
-        prompt = self.sessions[0].sent[-1][1]
+        for _ in range(3):
+            await self.drain_feed()
+        prompt = plain('\n\n'.join(text for _, text in self.sessions[0].sent))
+        prompt = prompt[prompt.index(tag(row['id'], 'forwarded')):]
         self.assertTrue(prompt.startswith(tag(row['id'], 'forwarded') + 'Forwarded from "Fixture Channel":\n'))
         self.assertIn('/service restart forwarded caption', prompt)
         self.assertIn('Forwarded files for this message:', prompt)
@@ -1684,7 +1731,7 @@ class ServiceTests(ServiceTestsSupport, unittest.IsolatedAsyncioTestCase):
                 with patch('coordinator.media.transcribe_audio', AsyncMock(return_value=transcript)):
                     self.assertEqual(self.store.accept(incoming), 'queued')
                     await self.drain_feed()
-                prompt = self.sessions[0].sent[-1][1]
+                prompt = plain(self.sessions[0].sent[-1][1])
                 self.assertTrue(prompt.startswith(tag(number, 'forwarded') + 'Forwarded from "Fixture Media":\n'))
                 self.assertNotIn('\n\nOwner-provided images for this message:', prompt)
                 self.assertNotIn('\n\nOwner-provided files for this message:', prompt)
@@ -1712,18 +1759,17 @@ class ServiceTests(ServiceTestsSupport, unittest.IsolatedAsyncioTestCase):
 
     def test_forwarded_messages_do_not_fill_controls_or_set_up_projects(self):
         from coordinator.control_ui import prompt
-        self.assertTrue(prompt(self.store, TOPIC, 'policy', 10))
+        self.assertTrue(prompt(self.store, TOPIC, 'model:worker', 10))
         card = self.store.db.execute('SELECT id FROM outbox ORDER BY id DESC LIMIT 1').fetchone()[0]
         self.store.delivered(card, 100)
-        policy = self.store.directory / 'USAGE.md'
-        before = policy.read_text()
-        incoming = owner_update(1, 'Untrusted policy.', reply=100)
+        before = self.store.get('worker_model')
+        incoming = owner_update(1, 'untrusted-model', reply=100)
         incoming['message']['forward_sender_name'] = 'Fixture Sender'
         self.assertEqual(self.store.accept(incoming), 'queued')
-        self.assertEqual(policy.read_text(), before)
+        self.assertEqual(self.store.get('worker_model'), before)
         self.assertEqual(self.store.messages_pending()[0]['kind'], 'forwarded')
-        self.assertEqual(self.store.accept(owner_update(3, 'Owner policy.', reply=100)), 'control')
-        self.assertEqual(policy.read_text(), 'Owner policy.')
+        self.assertEqual(self.store.accept(owner_update(3, 'owner-model', reply=100)), 'control')
+        self.assertEqual(self.store.get('worker_model'), 'owner-model')
         with self.store.db:
             self.store.put('control_topic', TOPIC)
             self.store.db.execute('UPDATE topics SET cwd=? WHERE id=?', ('', TOPIC))
@@ -1752,27 +1798,17 @@ class ServiceTests(ServiceTestsSupport, unittest.IsolatedAsyncioTestCase):
         self.assertTrue(Path(attachment['path']).is_file())
         instructions = attachment_instructions([attachment], coordinator=True)
         self.assertIn('Owner-provided images for this message:', instructions)
-        self.assertEqual(self.sessions[0].sent, [
-            (message_uuid(row['id']), tag(row['id']) + REPLY_FIRST_LINE + row['text'] + instructions)])
+        self.assertEqual([(identity, plain(text)) for identity, text in self.sessions[0].sent], [
+            (message_uuid(row['id']), tag(row['id']) + row['text'] + instructions)])
 
     async def test_non_owner_prompts_remain_exactly_tag_and_text(self):
         session = await self.service.start_session(TOPIC)
         for kind in ('worker_result', 'event', 'secret_filled', 'callback', 'restarted'):
             with self.subTest(kind=kind):
-                row = self.store.message_save(TOPIC, kind, 'Saved message.\nSecond line.')
+                text = 'Saved message.\nSecond line.'
+                row = self.store.message_save(TOPIC, kind, json.dumps({'worker': 1, 'text': text}) if kind == 'worker_result' else text)
                 await self.drain_feed()
-                self.assertEqual(session.sent[-1], (message_uuid(row['id']), tag(row['id'], kind) + row['text']))
-
-    async def test_three_owner_messages_are_sent_separately_in_order(self):
-        for number, text in enumerate(('first', 'second', 'third'), 1):
-            self.assertEqual(self.store.accept(owner_update(number, text)), 'queued')
-        await self.drain_feed()
-        self.assertEqual([text for _, text in self.sessions[0].sent],
-                         [tag(1) + REPLY_FIRST_LINE + 'first', tag(2) + REPLY_FIRST_LINE + 'second', tag(3) + REPLY_FIRST_LINE + 'third'])
-        rows = list(self.store.db.execute('SELECT id,delivered,receipt FROM messages ORDER BY id'))
-        self.assertEqual([row['delivered'] for row in rows], ['received'] * 3)
-        self.assertEqual([row['receipt'] for row in rows], ['written'] * 3)
-        self.assertEqual(len({message_id for message_id, _ in self.sessions[0].sent}), 3)
+                self.assertEqual((session.sent[-1][0], plain(session.sent[-1][1])), (message_uuid(row['id']), tag(row['id'], kind) + row['text']))
 
     async def test_late_rejected_receipts_preserve_recovery_and_closed_input_is_requeued(self):
         cases = [('received', 'received', 'replayed', ('received', 'replayed')),
@@ -1802,45 +1838,8 @@ class ServiceTests(ServiceTestsSupport, unittest.IsolatedAsyncioTestCase):
             self.store.put('control_ui:' + TOPIC, {'pending': 'policy', 'outbox': 0})
         self.assertEqual(self.store.accept(owner_update(2, '/goal finish all checks', reply=1)), 'queued')
         await self.drain_feed()
-        self.assertIn('Replying to: original\n/goal finish all checks', self.sessions[0].sent[1][1])
+        self.assertIn('Replying to: original\n/goal finish all checks', '\n\n'.join(text for _, text in self.sessions[0].sent))
         self.assertEqual(self.store.tasks_list(), [])
-
-    async def test_message_arriving_during_a_turn_is_sent_before_it_finishes(self):
-        self.store.accept(owner_update(1, 'hold'))
-        await self.service.feed_once()
-        await asyncio.sleep(0)
-        self.assertEqual(len(self.sessions[0].sent), 1)
-        self.store.accept(owner_update(2, 'follow'))
-        await self.service.feed_once()
-        await asyncio.sleep(0)
-        self.assertEqual([text for _, text in self.sessions[0].sent],
-                         [tag(1) + REPLY_FIRST_LINE + 'hold', tag(2) + REPLY_FIRST_LINE + 'follow'])
-        self.assertEqual(self.store.db.execute("SELECT delivered FROM messages WHERE telegram_message=2").fetchone()[0],
-                         'received')
-        self.sessions[0].hold.set()
-        await self.drain_feed()
-
-    async def test_image_preparation_keeps_message_order(self):
-        self.store.accept(owner_update(1, 'image'))
-        with self.store.db:
-            self.store.db.execute("UPDATE messages SET images='[]' WHERE telegram_message=1")
-        preparing = asyncio.Event()
-        release = asyncio.Event()
-
-        async def slow_images(store, telegram, message):
-            preparing.set()
-            await release.wait()
-            return []
-
-        with patch('coordinator.service.prepare_attachments', slow_images):
-            first_feed = asyncio.create_task(self.service.feed_once())
-            await preparing.wait()
-            self.store.accept(owner_update(2, 'later'))
-            release.set()
-            await first_feed
-            await self.drain_feed()
-        self.assertEqual([text for _, text in self.sessions[0].sent],
-                         [tag(1) + REPLY_FIRST_LINE + 'image', tag(2) + REPLY_FIRST_LINE + 'later'])
 
     async def test_owner_files_reach_the_coordinator_and_a_failed_one_does_not_block_the_feed(self):
         downloads = []
@@ -1862,14 +1861,13 @@ class ServiceTests(ServiceTestsSupport, unittest.IsolatedAsyncioTestCase):
         with patch('coordinator.media.DOWNLOAD_DELAYS', (0, 0)):
             await self.drain_feed()
         self.assertEqual(downloads, [('config', 20 * 1024 * 1024)] + [('broken', 20 * 1024 * 1024)] * 3)
-        sent = [text for _, text in self.sessions[0].sent]
-        self.assertEqual(len(sent), 3)
+        sent = plain('\n\n'.join(text for _, text in self.sessions[0].sent))
         saved = self.store.directory / 'files' / 'message-1' / 'config.json'
-        self.assertTrue(sent[0].startswith(tag(1) + REPLY_FIRST_LINE + 'part 1\n\nOwner-provided files for this message:\n'))
-        self.assertIn('%s (application/json, 12 bytes)' % saved, sent[0])
-        self.assertTrue(sent[1].startswith(tag(2) + REPLY_FIRST_LINE + 'part 2'))
-        self.assertIn('notes.md (application/json): download failed', sent[1])
-        self.assertEqual(sent[2], tag(3) + REPLY_FIRST_LINE + 'after')
+        self.assertTrue(sent.startswith(tag(1) + 'part 1\n\nOwner-provided files for this message:\n'))
+        self.assertIn('%s (application/json, 12 bytes)' % saved, sent)
+        self.assertLess(sent.index(tag(1)), sent.index(tag(2) + 'part 2'))
+        self.assertIn('notes.md (application/json): download failed', sent)
+        self.assertTrue(sent.endswith('\n\n' + tag(3) + 'after'))
         self.assertEqual([row[0] for row in self.store.db.execute('SELECT delivered FROM messages ORDER BY id')],
                          ['received'] * 3)
         reports = [row[0] for row in self.store.db.execute('SELECT text FROM outbox ORDER BY id')]
@@ -1927,15 +1925,16 @@ class ServiceTests(ServiceTestsSupport, unittest.IsolatedAsyncioTestCase):
                                                        (result['id'],)).fetchone()), ('sent', None))
             self.assertEqual(tuple(self.store.db.execute('SELECT delivered,receipt FROM messages WHERE id=?',
                                                        (owner_id,)).fetchone()), ('received', 'written'))
-            self.assertEqual([text for _, text in session.sent], [tag(owner_id) + REPLY_FIRST_LINE + 'owner message while result waits'])
+            self.assertEqual([plain(text) for _, text in session.sent], [tag(owner_id) + 'owner message while result waits'])
             release.set()
             await asyncio.wait_for(result_task, 2)
             await self.service.feed_once()
             self.assertEqual(tuple(self.store.db.execute('SELECT delivered,receipt FROM messages WHERE id=?',
                                                        (result['id'],)).fetchone()), ('received', 'written'))
-            self.assertEqual([text for _, text in session.sent], [
-                tag(owner_id) + REPLY_FIRST_LINE + 'owner message while result waits',
-                tag(result['id'], 'worker_result') + result['text']])
+            sent = [plain(text) for _, text in session.sent]
+            self.assertEqual(sent[0], tag(owner_id) + 'owner message while result waits')
+            self.assertTrue(sent[1].startswith(tag(result['id'], 'worker_result')))
+            self.assertEqual(len(sent), 2)
             self.assertEqual(self.store.db.execute('SELECT COUNT(*) FROM outbox').fetchone()[0], 0)
         finally:
             release.set()
@@ -2225,17 +2224,19 @@ class ServiceTests(ServiceTestsSupport, unittest.IsolatedAsyncioTestCase):
         brainstorm_sent = [text for _, text in self.service.sessions['-10042:5'].sent]
         self.assertTrue(brainstorm_sent[0].startswith('[topic=-10042:5'))
         self.assertIn('kind=restarted', brainstorm_sent[0])
-        idea = next(text for text in brainstorm_sent if 'kind=owner' in text)
-        result = next(text for text in brainstorm_sent if 'kind=worker_result' in text)
-        self.assertEqual(idea, tag(1, topic='-10042:5', name='Torii brainstorm') + REPLY_FIRST_LINE + 'idea')
-        self.assertTrue(result.startswith(tag(2, 'worker_result', '-10042:5', 'Torii brainstorm')))
-        self.assertEqual(json.loads(result.split('] ', 1)[1])['worker'], worker)
+        joined = plain('\n\n'.join(brainstorm_sent[1:]))
+        self.assertIn(tag(1, topic='-10042:5', name='Torii brainstorm') + 'idea', joined)
+        result = joined.split(tag(2, 'worker_result', '-10042:5', 'Torii brainstorm'), 1)[1]
+        self.assertEqual(json.JSONDecoder().raw_decode(result)[0]['worker'], worker)
         home = self.service.sessions[TOPIC]
-        self.assertEqual([text for _, text in home.sent if 'kind=owner' in text], [tag(3) + REPLY_FIRST_LINE + 'home'])
+        self.assertEqual([plain(text) for _, text in home.sent if 'kind=owner' in text], [tag(3) + 'home'])
         self.assertNotIn('kind=worker_result', ' '.join(text for _, text in home.sent))
 
     async def test_live_shaped_restart_notice_fits_host_request(self):
         tasks, workers = restart_work_rows(90, 50)
+        with self.store.db:
+            self.store.db.executemany('INSERT INTO topics(id,chat,thread,name,cwd) VALUES (?,?,?,?,?)',
+                                      [('channel-%d' % number, 1, 100 + number, 'Channel', '') for number in range(7)])
         stale_ids = [self.store.message_save(TOPIC, 'restarted', 'stale-notice-' + 'x' * 499987)['id']
                      for _ in range(10)]
         owner = self.store.message_save(TOPIC, 'owner', 'owner message retained')
@@ -2258,23 +2259,11 @@ class ServiceTests(ServiceTestsSupport, unittest.IsolatedAsyncioTestCase):
         line = (json.dumps({'op': 'write', 'line': json.dumps(event)}) + '\n').encode()
         print('live-shaped host request bytes: %d' % len(line), flush=True)
         self.assertLess(len(line), 32 * 1024)
-        jobs = json.JSONDecoder().raw_decode(prompt.split('Open jobs: ', 1)[1])[0]
-        active = jobs['live_workers']
-        uncertain = json.loads(prompt.split('characters): ', 1)[1].split('. Inspect', 1)[0])
-        self.assertEqual(jobs['count'], 90)
-        self.assertLess(len(jobs['shown']), 50)
-        self.assertEqual(jobs['not_shown'], 90 - len(jobs['shown']))
-        self.assertEqual([row['id'] for row in jobs['shown']],
-                         [row['id'] for row in sorted(tasks, key=lambda row: (
-                             row['id'] <= 50, row['updated'], row['id']), reverse=True)[:len(jobs['shown'])]])
-        self.assertTrue(all(set(row) == {'id', 'topic', 'number', 'title', 'stage', 'notes', 'finished'}
-                            for row in jobs['shown']))
-        self.assertEqual((len(active), jobs['live_workers_not_shown']), (30, 20))
-        self.assertEqual([row['id'] for row in active], list(range(50, 20, -1)))
-        self.assertTrue(all(set(row) == {'id', 'task', 'provider', 'status', 'work'} for row in active))
+        lines = prompt.splitlines()
+        self.assertEqual([line.split(':', 1)[0] for line in lines[1:31]], ['Worker %d' % number for number in range(50, 20, -1)])
+        self.assertIn('20 live workers not shown.', lines)
         self.assertLessEqual(len(prompt), parent_state.RESTART_NOTICE_CHARS)
-        self.assertEqual(uncertain, {'count': 1, 'shown': [{key: owner[key] for key in ('id', 'topic', 'kind', 'text')}], 'not_shown': 0})
-        self.assertTrue(all(row['id'] not in stale_ids for row in uncertain['shown']))
+        self.assertNotIn('stale-notice-', prompt)
         self.assertIn('tasks.get', prompt)
         self.assertIn('tasks.list', prompt)
         self.assertIn('workers.list', prompt)
@@ -2289,10 +2278,9 @@ class ServiceTests(ServiceTestsSupport, unittest.IsolatedAsyncioTestCase):
         await self.service.start_session()
         prompt = self.store.db.execute('SELECT text FROM messages WHERE id=?',
                                       (self.service.restart_messages[TOPIC],)).fetchone()[0]
-        summary = json.loads(prompt.split('characters): ', 1)[1].split('. Inspect', 1)[0])
-        self.assertEqual(summary['count'], 2)
-        self.assertEqual(summary['not_shown'], 0)
-        self.assertEqual([row['id'] for row in summary['shown']], [result['id'], owner['id']])
+        shown = [int(line.split()[2]) for line in prompt.splitlines() if line.startswith('Uncertain message ')]
+        self.assertEqual(shown, [result['id'], owner['id']])
+        self.assertNotIn('not shown', prompt)
         self.assertNotIn(stale['text'], prompt)
 
     async def test_closed_session_resumes_same_id_and_sends_restart_first(self):
@@ -2304,7 +2292,7 @@ class ServiceTests(ServiceTestsSupport, unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.sessions), 2)
         self.assertEqual(self.sessions[1].session_id, saved)
         self.assertIn('service restarted', self.sessions[1].sent[0][1].lower())
-        self.assertEqual(self.sessions[1].sent[1][1], tag(1) + REPLY_FIRST_LINE + 'continue')
+        self.assertEqual(plain(self.sessions[1].sent[1][1]), tag(1) + 'continue')
 
     async def test_idle_parent_winds_down_and_resumes_in_its_channel(self):
         other = '-10042:5'
@@ -2321,11 +2309,12 @@ class ServiceTests(ServiceTestsSupport, unittest.IsolatedAsyncioTestCase):
         self.assertTrue(home.closed)
         self.assertTrue(ideas.closed)
         self.assertEqual(self.store.get('coordinator:' + other + '_session'), saved)
-        self.store.message_save(other, 'worker_result', 'finished')
+        finished = json.dumps({'worker': 1, 'text': 'finished'})
+        self.store.message_save(other, 'worker_result', finished)
         await self.drain_feed()
         self.assertEqual(self.service.sessions[other].session_id, saved)
-        self.assertEqual([text.split('] ', 1)[1] for _, text in self.service.sessions[other].sent],
-                         ['finished'])
+        self.assertEqual([plain(text).split('] ', 1)[1] for _, text in self.service.sessions[other].sent],
+                         [finished])
         self.assertTrue(all('kind=worker_result' not in text for _, text in home.sent))
 
     async def test_secret_filled_wakes_a_wound_down_parent_in_its_channel(self):
@@ -2341,7 +2330,7 @@ class ServiceTests(ServiceTestsSupport, unittest.IsolatedAsyncioTestCase):
         self.store.message_save(other, 'secret_filled', 'Secret API_TOKEN, declared on job 1 Build service, is filled.')
         await self.drain_feed()
         self.assertEqual(self.service.sessions[other].session_id, saved)
-        self.assertEqual(self.service.sessions[other].sent[-1][1].split('] ', 1)[1],
+        self.assertEqual(plain(self.service.sessions[other].sent[-1][1]).split('] ', 1)[1],
                          'Secret API_TOKEN, declared on job 1 Build service, is filled.')
         self.assertNotIn(TOPIC, self.service.sessions)
 
@@ -2411,7 +2400,7 @@ class ServiceTests(ServiceTestsSupport, unittest.IsolatedAsyncioTestCase):
         self.store.message_save(TOPIC, 'owner', 'home')
         await self.drain_feed()
         await self.drain_feed()
-        self.assertEqual([text for _, text in self.service.sessions[TOPIC].sent], [tag(2) + REPLY_FIRST_LINE + 'home'])
+        self.assertEqual([plain(text) for _, text in self.service.sessions[TOPIC].sent], [tag(2) + 'home'])
         self.assertNotIn(other, self.service.sessions)
         self.assertEqual(attempts, [other])
         self.assertEqual(self.store.db.execute('SELECT delivered FROM messages WHERE id=?', (idea,)).fetchone()[0],
@@ -2585,7 +2574,7 @@ class ServiceTests(ServiceTestsSupport, unittest.IsolatedAsyncioTestCase):
         self.store.message_save(other, 'owner', 'next')
         await self.drain_feed()
         self.assertEqual(self.service.sessions[other].session_id, saved)
-        self.assertEqual(self.service.sessions[other].sent[-1][1].split('] ', 1)[1], REPLY_FIRST_LINE + 'next')
+        self.assertEqual(plain(self.service.sessions[other].sent[-1][1]).split('] ', 1)[1], 'next')
 
     async def test_pending_restart_notice_stays_with_its_channel_after_restart(self):
         other = '-10042:5'
@@ -2600,7 +2589,7 @@ class ServiceTests(ServiceTestsSupport, unittest.IsolatedAsyncioTestCase):
         await self.drain_feed()
         notice, request = [text for _, text in self.service.sessions[other].sent]
         self.assertTrue(notice.startswith('[topic=-10042:5 name="Ideas" message=3 kind=restarted] The service'))
-        self.assertEqual(request, tag(2, topic=other, name='Ideas') + REPLY_FIRST_LINE + 'continue')
+        self.assertEqual(plain(request), tag(2, topic=other, name='Ideas') + 'continue')
         self.assertNotIn(TOPIC, self.service.sessions)
 
     async def test_fresh_channel_note_lists_its_workers_and_leaves_out_waiting_messages(self):
@@ -2619,7 +2608,7 @@ class ServiceTests(ServiceTestsSupport, unittest.IsolatedAsyncioTestCase):
             {'id': worker, 'task': summary['shown'][0]['id'], 'provider': 'claude',
              'status': 'queued', 'work': 'research'}])
         self.assertNotIn('please create task X', note)
-        self.assertEqual(request, tag(2, topic=other, name='Ideas') + REPLY_FIRST_LINE + 'please create task X')
+        self.assertEqual(plain(request), tag(2, topic=other, name='Ideas') + 'please create task X')
 
     async def test_channel_prompt_lists_only_its_topic(self):
         other = '-10042:5'
@@ -2660,8 +2649,7 @@ class ServiceTests(ServiceTestsSupport, unittest.IsolatedAsyncioTestCase):
 
         self.service.session_factory = record
         await self.service.start_session(other)
-        self.assertTrue(captured[other].startswith(
-            "You are Torii's persistent coordinator for the sole Telegram owner in this channel.\n"))
+        self.assertTrue(captured[other].startswith('# Torii\n'))
         self.assertNotIn('across all registered', captured[other])
         self.assertIn('\nRegistered channels: [{"id":"-10042:5"', captured[other])
 
@@ -2697,9 +2685,9 @@ class ServiceTests(ServiceTestsSupport, unittest.IsolatedAsyncioTestCase):
         states = [tuple(row) for row in self.store.db.execute('SELECT delivered,receipt FROM messages WHERE id IN (?,?,?) ORDER BY id', rows)]
         self.assertEqual(states, [('received', 'transcript'), ('received', 'transcript'), ('uncertain', 'uncertain')])
         restart = self.store.db.execute("SELECT text FROM messages WHERE kind='restarted'").fetchone()[0]
-        self.assertIn('"count":1', restart)
-        self.assertIn('"text":"lost"', restart)
-        self.assertNotIn('"text":"seen"', restart)
+        self.assertIn('Uncertain message %d (owner): lost' % rows[2], restart)
+        self.assertNotIn('Uncertain message %d ' % rows[0], restart)
+        self.assertNotIn('not shown', restart)
 
     async def test_restart_waits_for_outbox_then_exits(self):
         def restarting():
@@ -2847,6 +2835,7 @@ class ServiceTests(ServiceTestsSupport, unittest.IsolatedAsyncioTestCase):
         async def pause(event, delay):
             delays.append(delay)
             if len(delays) == 1:
+                self.assertEqual(nightly.call_count, 0)
                 with self.store.db:
                     self.store.db.execute('INSERT INTO problems(created,area,code) VALUES (?,?,?)',
                                           (now[0] - 31 * 86400, 'service', 'next-day'))
@@ -2855,9 +2844,11 @@ class ServiceTests(ServiceTestsSupport, unittest.IsolatedAsyncioTestCase):
             raise asyncio.CancelledError
 
         with patch('coordinator.service.time.time', side_effect=lambda: now[0]), \
+                patch('coordinator.memory.nightly') as nightly, \
                 patch('coordinator.service.pause', side_effect=pause):
             with self.assertRaises(asyncio.CancelledError):
                 await self.service.stray_report_loop()
+        self.assertEqual(nightly.call_count, 1)
         self.assertEqual([row['code'] for row in self.problems()], ['recent'])
         self.assertTrue(all(delay is not None and 0 < delay <= 86400 for delay in delays))
 
@@ -2924,7 +2915,7 @@ class ServiceTests(ServiceTestsSupport, unittest.IsolatedAsyncioTestCase):
             await self.run_until([self.service.poll, self.service.feed, self.service.reactions],
                                  lambda: self.sessions and self.sessions[0].sent)
         await asyncio.gather(*self.service.feed_tasks.values())
-        self.assertEqual(self.sessions[0].sent[0][1], tag(1) + REPLY_FIRST_LINE + 'Replying to: The job report\nReacted 👍')
+        self.assertEqual(plain(self.sessions[0].sent[0][1]), tag(1) + 'Replying to: The job report\nReacted 👍')
         self.assertEqual(self.reacted(), [])
 
     async def test_owner_reaction_in_disabled_channel_stores_no_message_and_starts_no_parent(self):
@@ -2982,7 +2973,7 @@ class ServiceTests(ServiceTestsSupport, unittest.IsolatedAsyncioTestCase):
                     task.cancel()
                 await asyncio.gather(*idle, return_exceptions=True)
         self.assertEqual(self.telegram.sent[0]['reply_to'], 5)
-        self.assertEqual(self.sessions[0].sent[0][1], tag(1) + REPLY_FIRST_LINE + 'hello')
+        self.assertEqual(plain(self.sessions[0].sent[0][1]), tag(1) + 'hello')
 
     async def test_poll_retries_a_network_failure_within_a_second(self):
         replies = [TelegramError('network-or-invalid-response'), [owner_update(5, 'hello')]]
@@ -3006,7 +2997,7 @@ class ServiceTests(ServiceTestsSupport, unittest.IsolatedAsyncioTestCase):
             self.store.accept(update)
             self.store.accept(owner_update(6, 'undated'))
             await self.run_until([self.service.reactions, self.service.feed],
-                                 lambda: self.sessions and len(self.sessions[0].sent) == 2)
+                                 lambda: self.sessions and 'message=2 ' in '\n'.join(text for _, text in self.sessions[0].sent))
             await asyncio.gather(*self.service.feed_tasks.values())
         output = '\n'.join(logs.output)
         age = re.search(r'owner message saved message=1 telegram_age=([0-9.]+)', output)
@@ -3014,7 +3005,7 @@ class ServiceTests(ServiceTestsSupport, unittest.IsolatedAsyncioTestCase):
         self.assertGreaterEqual(float(age.group(1)), 3)
         self.assertIn('owner message saved message=2 telegram_age=unknown', output)
         self.assertEqual(self.reacted(), [])
-        self.assertRegex(output, r'coordinator steer message=2 receipt=received after=[0-9.]+')
+        self.assertRegex(output, r'coordinator steer message=[12] receipt=received after=[0-9.]+')
         self.assertNotIn('-10042', output)
 
     async def test_delivery_retry_does_not_create_worker(self):
@@ -3203,15 +3194,43 @@ class ServiceTests(ServiceTestsSupport, unittest.IsolatedAsyncioTestCase):
         self.assertIn('Worker cannot receive input.', self.sessions[0].sent[-1][1])
         self.assertIn('not delivered', self.sessions[0].sent[-1][1])
 
-    async def test_queued_steer_over_brief_limit_notifies_parent(self):
+    async def test_finished_worker_steer_waits_for_idle_trim(self):
+        import fcntl
+        from coordinator import idle_trim
+
         worker = self.worker()
-        request = self.store.service_request('workers.steer', {'worker': worker, 'prompt': 'x' * BRIEF_LIMIT})
+        self.store.worker_complete(worker, {'success': True, 'session_id': str(uuid.uuid4())})
+        task = self.service.workers.get(worker)['task']
+        request = self.store.service_request('workers.steer', {'worker': worker, 'prompt': 'continue'})
+        fd = idle_trim.lock_file(self.store.directory, task)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            with self.store.db:
+                self.store.db.execute('INSERT INTO idle_trims(task,idle_since,active,trimmed) VALUES (?,0,1,1)', (task,))
+            with patch('coordinator.service.can_resume_finished', return_value=True):
+                await self.service.controls_once()
+            self.assertEqual(self.service.workers.get(worker)['status'], 'done')
+        finally:
+            os.close(fd)
+        with patch('coordinator.service.can_resume_finished', return_value=True):
+            await self.service.controls_once()
+        self.assertEqual(self.request(request), ('done', {'receipt': 'resumed'}))
+        self.assertTrue(self.store.db.execute('SELECT 1 FROM idle_trim_workers WHERE worker=?', (worker,)).fetchone())
+
+    async def test_queued_steer_over_brief_limit_keeps_the_newest_text(self):
+        from coordinator.workers import STEER_ELISION
+        worker = self.worker()
+        original = self.service.workers.get(worker)['prompt']
+        request = self.store.service_request('workers.steer', {'worker': worker, 'prompt': 'old' + 'x' * BRIEF_LIMIT})
         self.assertTrue(await self.service.controls_once())
-        self.assertEqual(self.request(request),
-                         ('refused', {'text': 'The queued brief would exceed %d characters.' % BRIEF_LIMIT}))
-        self.assertEqual(self.notes(),
-                         ['Steer request %d for worker %d was not delivered: '
-                          'The queued brief would exceed %d characters.' % (request, worker, BRIEF_LIMIT)])
+        self.assertEqual(self.store.db.execute('SELECT state FROM service_requests WHERE id=?', (request,)).fetchone()[0],
+                         'done')
+        prompt = self.service.workers.get(worker)['prompt']
+        self.assertTrue(prompt.startswith(original + STEER_ELISION))
+        self.assertTrue(prompt.endswith('x' * 1000))
+        self.assertNotIn('old', prompt[len(original):])
+        self.assertLessEqual(len(prompt) - len(original), BRIEF_LIMIT)
+        self.assertEqual(self.notes(), [])
 
     async def test_finished_worker_steer_resumes_newest_open_job_session_for_both_providers(self):
         from coordinator import control_api
@@ -3282,7 +3301,7 @@ class ServiceTests(ServiceTestsSupport, unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(self.store.db.execute('SELECT COUNT(*) FROM workers').fetchone()[0], count)
                     self.assertTrue(all(result['status'] == 'done' for result in results))
 
-    async def test_finished_worker_resume_refuses_older_and_closed_jobs_for_both_providers(self):
+    async def test_finished_worker_resume_refuses_closed_jobs_for_both_providers(self):
         from coordinator import control_api
 
         for provider in ('claude', 'codex'):
@@ -3291,35 +3310,18 @@ class ServiceTests(ServiceTestsSupport, unittest.IsolatedAsyncioTestCase):
                 self.store.worker_complete(worker, {'success': True, 'session_id': str(uuid.uuid4())})
                 finished = self.service.workers.get(worker)
                 with self.store.db:
-                    newer = self.store.db.execute('''INSERT INTO workers
-                        (task,topic,provider,prompt,cwd,workspace,status,created,updated)
-                        VALUES (?,?,?,?,?,?,'done',1,1)''',
-                        (finished['task'], TOPIC, provider, 'newer worker', str(self.root), '{}')).lastrowid
-                    self.store.db.execute('UPDATE workers SET session=?,fresh=0 WHERE id=?',
-                                          (str(uuid.uuid4()), newer))
-                    older = control_api.call(self.store, 'workers.steer',
+                    self.store.db.execute("UPDATE tasks SET status='done' WHERE id=?", (finished['task'],))
+                    closed = control_api.call(self.store, 'workers.steer',
                         {'worker': worker, 'prompt': 'Continue.'}, topic=TOPIC)
-                self.assertEqual((older.ok, older.text),
+                self.assertEqual((closed.ok, closed.text),
                                  (False, 'Worker cannot receive input. Status: done.'))
-                for refused_worker in (worker, newer):
-                    if refused_worker == newer:
-                        with self.store.db:
-                            self.store.db.execute("UPDATE tasks SET status='done' WHERE id=?", (finished['task'],))
-                            closed = control_api.call(self.store, 'workers.steer',
-                                {'worker': newer, 'prompt': 'Continue.'}, topic=TOPIC)
-                        self.assertEqual((closed.ok, closed.text),
-                                         (False, 'Worker cannot receive input. Status: done.'))
-                    refused = self.store.service_request('workers.steer',
-                        {'worker': refused_worker, 'prompt': 'Already queued before the job changed.'})
-                    try:
-                        with self.assertLogs('coordinator.problems', 'WARNING'):
-                            await self.service.controls_once()
-                        self.assertEqual(self.request(refused),
-                                         ('refused', {'text': 'Worker cannot receive input.'}))
-                        self.assertEqual(self.service.workers.get(refused_worker)['status'], 'done')
-                    finally:
-                        with self.store.db:
-                            self.store.db.execute("UPDATE workers SET status='interrupted' WHERE status='queued'")
+                refused = self.store.service_request('workers.steer',
+                    {'worker': worker, 'prompt': 'Already queued before the job changed.'})
+                with self.assertLogs('coordinator.problems', 'WARNING'):
+                    await self.service.controls_once()
+                self.assertEqual(self.request(refused),
+                                 ('refused', {'text': 'Worker cannot receive input.'}))
+                self.assertEqual(self.service.workers.get(worker)['status'], 'done')
 
     async def test_finished_worker_resume_requires_session_and_no_live_task(self):
         from coordinator import control_api
@@ -3773,7 +3775,7 @@ class ServiceTests(ServiceTestsSupport, unittest.IsolatedAsyncioTestCase):
         written = [json.loads(line) for line in HostClient(host_directory).written_lines()]
         self.assertEqual([row['uuid'] for row in written if row.get('type') == 'user'], [wire])
         await self.drain_feed()
-        self.assertEqual([text for _, text in self.sessions[-1].sent if note in text],
+        self.assertEqual([part for _, text in self.sessions[-1].sent for part in plain(text).split('\n\n') if note in part],
                          [tag(self.store.db.execute("SELECT id FROM messages WHERE kind='callback'").fetchone()[0],
                               'callback') + note])
 
@@ -4026,7 +4028,7 @@ class ServiceTests(ServiceTestsSupport, unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.store.db.execute('SELECT COUNT(*) FROM outbox').fetchone()[0], 1)
 
     def test_boot_time_reads_sysctl_seconds(self):
-        with patch('coordinator.host_os.SYSTEM', 'darwin'), patch('coordinator.service.subprocess.run') as run:
+        with patch('coordinator.host_os.SYSTEM', 'darwin'), patch('coordinator.host_os.subprocess.run') as run:
             run.return_value.stdout = '{ sec = 123, usec = 456 }\n'
             self.assertEqual(boot_time(), 123)
             run.assert_called_once_with(['sysctl', '-n', 'kern.boottime'], capture_output=True, text=True,
@@ -4140,17 +4142,16 @@ class ServiceTests(ServiceTestsSupport, unittest.IsolatedAsyncioTestCase):
             self.service.restart_reason = 'deploy'
             raise _Restart()
         self.service.supervised = lambda: [('restart', restart)]
-        with self.assertLogs('coordinator.problems', 'WARNING'):
-            await self.service.run()
+        await self.service.run()
         self.assertEqual(self.store.get('service_run')['cause'], 'restart reason=deploy')
         self.assertNotIn('code', self.store.get('service_run'))
         with self.assertLogs('coordinator.problems', 'WARNING'):
             Service(self.store, self.telegram, self.runner, self.root).record_start()
         rows = self.problems()
-        self.assertEqual([row['code'] for row in rows], ['started', 'unclean-exit', 'unclean-exit', 'started'])
+        self.assertEqual([row['code'] for row in rows], ['started', 'unclean-exit', 'started'])
         self.assertEqual(rows[0]['detail'], 'previous exit: unknown, no record')
         self.assertRegex(rows[1]['detail'], r'^previous run started \S+ ended without an exit record$')
-        self.assertEqual(rows[3]['detail'], 'previous exit: restart reason=deploy')
+        self.assertEqual(rows[2]['detail'], 'previous exit: restart reason=deploy')
 
 
 class DisabledParentTests(ServiceTestsSupport, unittest.IsolatedAsyncioTestCase):
@@ -4492,7 +4493,7 @@ class DisabledParentTests(ServiceTestsSupport, unittest.IsolatedAsyncioTestCase)
             self.store.message_save('other', 'owner', 'continue')
             await self.drain_feed()
             resumed = self.service.sessions['other']
-            observed['wake'] = [text.split('] ', 1)[1] for _, text in resumed.sent]
+            observed['wake'] = [plain(text).split('] ', 1)[1] for _, text in resumed.sent]
             self.store.put('parent_selection', {'provider': 'codex', 'model': 'changed'})
             with patch('coordinator.service.parent_state.selection_changed', return_value=True):
                 await self.service.feed_once()
@@ -4511,15 +4512,12 @@ class DisabledParentTests(ServiceTestsSupport, unittest.IsolatedAsyncioTestCase)
          'before_idle': False,
          'closed_restarts': 3,
          'native': 'saved-native',
-         'restart': ['The service restarted. Open jobs: '
-                     '{"count":0,"live_workers":[],"live_workers_not_shown":0,"not_shown":0,"shown":[]}. '
-                     'Messages with uncertain delivery (newest 10 at most, text cut to 500 characters): '
-                     '{"count":0,"not_shown":0,"shown":[]}. Inspect current state before acting. Do not '
+         'restart': ['The service restarted. Open jobs:\nInspect current state before acting. Do not '
                      'repeat completed work. Use tasks.get for job notes, and tasks.list and workers.list '
                      'for the rest.'],
          'selection_relaunches': 1,
          'startup': ['-10042:4', 'other'],
-         'wake': [REPLY_FIRST_LINE + 'continue']})
+         'wake': ['continue']})
 
     async def test_D6_disabled_workers_finish_and_result_reaches_home(self):
         self.other_topic()
@@ -4603,7 +4601,6 @@ class DisabledNativeParentTests(ServiceTestsSupport, unittest.IsolatedAsyncioTes
     async def assert_native_intake_flood(self, provider):
         from tests.support import until
         session = await self.start_native(provider, 'other')
-        self.store.put('coordinator_intake_batching', True)
         turns = []
         session.on_turn = lambda text: turns.append((text, session._turn_rows - session._unreplayed))
 
@@ -4709,7 +4706,7 @@ class DisabledNativeParentTests(ServiceTestsSupport, unittest.IsolatedAsyncioTes
 
                 def reply(text):
                     replies.append(text)
-                    self.store.enqueue_report('other', text)
+                    self.store.enqueue_report('other', text, sender='other')
 
                 attached.on_turn = reply
                 for _ in range(3):
@@ -4837,7 +4834,7 @@ class NativeServiceTests(ServiceTestsSupport, unittest.IsolatedAsyncioTestCase):
         with patch('coordinator.service.SHUTDOWN_SECONDS', .02), \
                 patch.object(self.service.extension, 'start', AsyncMock()), \
                 patch.object(self.service.extension, 'close', AsyncMock(side_effect=stuck)) as close, \
-                self.assertLogs('coordinator.service', level='ERROR') as logs:
+                self.assertLogs('coordinator.problems', level='ERROR') as logs:
             await asyncio.wait_for(self.service.run(), .5)
         self.assertTrue(cancelled.is_set())
         self.service.on_restart.assert_called_once_with()
@@ -4845,7 +4842,7 @@ class NativeServiceTests(ServiceTestsSupport, unittest.IsolatedAsyncioTestCase):
         session.detach.assert_awaited_once_with()
         session.stop.assert_not_awaited()
         self.assertEqual(self.store.get('service_run')['cause'], 'restart reason=upgrade')
-        self.assertTrue(any('service shutdown timed out' in line for line in logs.output))
+        self.assertTrue(any('shutdown-timeout' in line for line in logs.output))
 
     async def test_public_service_starts_and_closes_and_logs_the_extension_mode(self):
         async def restart():
@@ -4994,157 +4991,14 @@ ORIGIN_MAIN_VALID_CHAT_CREATE = {'reply': {'ok': True,
  'calls': [['createForumTopic', {'chat_id': -10042, 'name': 'Valid pick'}]]}
 
 class TopicCreationTests(unittest.IsolatedAsyncioTestCase):
-    async def test_create_delegation_refuses_surrogates_and_controls_before_queue_on_cli_and_mcp(self):
-        from argparse import Namespace
-        from contextlib import redirect_stdout
-        from io import StringIO
-        from coordinator import mcp
-        from coordinator.__main__ import ctl
-        from tests.test_group_setup import HOME
-        owner = self.store.message_save(HOME, 'owner', 'Create a delegated chat.')['id']
-        cases = [('\ud800', 'surrogate characters'), ('\udfff', 'surrogate characters')]
-        cases += [(chr(code), 'control characters other than newline and tab')
-                  for code in (*range(32), *range(127, 160)) if code not in (9, 10)]
-        for source in ('cli', 'mcp'):
-            for character, character_class in cases:
-                for text in ('Use Sol.' + character + 'Use Claude.', character + 'Use Sol.' + character):
-                    with self.subTest(source=source, text=repr(text)):
-                        before = {table: [tuple(row) for row in self.store.db.execute('SELECT * FROM ' + table + ' ORDER BY 1')]
-                                  for table in ('settings', 'topics', 'outbox', 'service_requests')}
-                        changes = self.store.db.total_changes
-                        fields = dict(name='Refused', delegation=text, message=owner)
-                        refusal = 'Chat delegation instructions cannot contain ' + character_class + '.'
-                        if source == 'cli':
-                            output = StringIO()
-                            args = Namespace(operation='call', op='topic.create', topic=HOME,
-                                             pairs=[key + '=' + str(value) for key, value in fields.items()])
-                            with patch('coordinator.__main__.service_running', return_value=True), redirect_stdout(output):
-                                status = ctl(args, self.store)
-                            result = json.loads(output.getvalue())
-                            self.assertEqual((status, result['ok'], result['state'], result['text']),
-                                             (3, False, 'refused', refusal))
-                        else:
-                            response = mcp.dispatch(self.store, {'method': 'tools/call', 'params': {
-                                'name': 'topic_create', 'arguments': fields}}, topic=HOME)
-                            self.assertTrue(response['isError'], response)
-                            self.assertEqual(response['content'][0]['text'], refusal + '\nnull')
-                        await self.service.controls_once()
-                        after = {table: [tuple(row) for row in self.store.db.execute('SELECT * FROM ' + table + ' ORDER BY 1')]
-                                 for table in before}
-                        self.assertEqual(after, before)
-                        self.assertEqual(self.store.db.total_changes, changes + (source == 'cli'))
-                        if source == 'cli':
-                            self.assertEqual(tuple(self.store.db.execute(
-                                'SELECT op,state FROM cli_calls ORDER BY id DESC LIMIT 1').fetchone()),
-                                             ('topic.create', 'refused'))
-                        self.assertEqual(list(self.projects.iterdir()), [])
-                        self.assertEqual(self.telegram.calls, [])
-
-    async def test_create_delegation_accepts_newline_and_tab_on_cli_and_mcp(self):
-        from argparse import Namespace
-        from contextlib import redirect_stdout
-        from io import StringIO
-        from coordinator import mcp
-        from coordinator.__main__ import ctl
-        from tests.test_group_setup import HOME
-        owner = self.store.message_save(HOME, 'owner', 'Create delegated chats.')['id']
-        for source in ('cli', 'mcp'):
-            text = 'Use Sol.\n\tUse Claude for UI. ' + source
-            fields = dict(name='Whitespace ' + source, delegation=text, message=owner)
-            if source == 'cli':
-                output = StringIO()
-                args = Namespace(operation='call', op='topic.create', topic=HOME,
-                                 pairs=[key + '=' + str(value) for key, value in fields.items()])
-                with patch('coordinator.__main__.service_running', return_value=True), redirect_stdout(output):
-                    status = ctl(args, self.store)
-                self.assertEqual(status, 0, output.getvalue())
-                number = json.loads(output.getvalue())['data']['request']
-            else:
-                response = mcp.dispatch(self.store, {'method': 'tools/call', 'params': {
-                    'name': 'topic_create', 'arguments': fields}}, topic=HOME)
-                self.assertFalse(response['isError'], response)
-                number = json.loads(response['content'][0]['text'].split('\n', 1)[1])['request']
-            self.assertEqual(json.loads(self.request(number)['params'])['delegation'], text)
+    async def test_rule_file_creation_is_atomic(self):
+        from coordinator.policy import chat_path
+        number = self.create('Rules chat', rules='- New rule')
+        with patch('os.replace', wraps=os.replace) as replace:
             self.assertEqual((await self.finish(number))['state'], 'done')
-            target = json.loads(self.request(number)['result'])['topic']
-            self.assertEqual(self.store.get('coordinator:' + target + '_delegation'), {'text': text, 'revision': 1})
-
-    async def test_d9_delegation_link_atomic_first_launch_ready_and_event(self):
-        from coordinator.policy import chat_policy
-        number = self.create('Delegated', delegation='  Use Sol.  ')
-        await self.service.controls_once()
-        await self.service.controls_once()
-        original = self.store.link_created_topic
-        own = {'text': 'Use Sol.', 'revision': 1}
-        def linked(*args, **kwargs):
-            original(*args, **kwargs)
-            observer = Store(self.root / 'state')
-            try:
-                self.assertTrue(observer.topic('-10042:11')['enabled'])
-                self.assertEqual(observer.get('coordinator:-10042:11_delegation'), own)
-                saved = observer.db.execute('SELECT result FROM service_requests WHERE id=?', (number,)).fetchone()
-                self.assertEqual(json.loads(saved['result'])['phase'], 'linked')
-            finally:
-                observer.close()
-        trace = []
-        self.store.db.set_trace_callback(trace.append)
-        try:
-            with patch.object(self.store, 'link_created_topic', side_effect=linked):
-                await self.service.controls_once()
-        finally:
-            self.store.db.set_trace_callback(None)
-        self.assertEqual(trace.count('COMMIT'), 1)
-        self.assertEqual([sql for sql in trace if sql.startswith('BEGIN')], ['BEGIN '])
-        self.assertEqual((await self.finish(number))['state'], 'done')
-        target = '-10042:11'
-        self.factory.return_value.key = 'coordinator:' + target
-        session = await self.service.start_session(target)
-        self.assertEqual(session.usage_policy, chat_policy(self.store, 'coordinator:' + target))
-        folder = str(self.projects / 'delegated')
-        agent = 'Chat agent: Claude claude-opus-5-5 · max thinking · default.'
-        ready = 'Delegated is ready.\nProject folder: ' + folder + '\n' + agent
-        ready += '\nDelegation updated.'
-        event = 'Chat created: topic=' + target + '\nName: Delegated\nFolder: ' + folder + '\n' + agent
-        event += '\nDelegation: own instructions (8 characters).'
-        self.assertEqual([row[0] for row in self.store.db.execute('SELECT text FROM outbox WHERE topic=?', (target,))], [ready])
-        self.assertEqual(self.events()[-1]['text'], event)
-        self.assertEqual(self.store.db.execute('SELECT text FROM outbox ORDER BY id DESC LIMIT 1').fetchone()[0], event)
-
-    async def test_d10_delegation_cap_before_effects_and_restart_each_phase(self):
-        from coordinator.control_api import call
-        from tests.test_group_setup import HOME
-        for text in ('x' * 2001, '   '):
-            result = call(self.store, 'topic.create', {'name': 'Refused', 'delegation': text}, topic=HOME)
-            self.assertFalse(result.ok, result.text)
-            self.assertEqual(result.text, 'Keep chat delegation instructions to 2000 characters or fewer (this text has 2001).'
-                             if len(text) > 2000 else 'Send text of 1 to 16000 characters for delegation.')
-            self.assertEqual(list(self.projects.iterdir()), [])
-            self.assertEqual(self.telegram.calls, [])
-            self.assertEqual(self.store.db.execute('SELECT count(*) FROM service_requests').fetchone()[0], 0)
-        for checkpoint in range(5):
-            name = 'Delegation restart ' + str(checkpoint)
-            number = self.create(name, delegation='Use Sol.')
-            for unused in range(checkpoint):
-                await self.service.controls_once()
-            self.restart()
-            self.assertEqual((await self.finish(number))['state'], 'done')
-            target = json.loads(self.request(number)['result'])['topic']
-            self.assertEqual(self.store.get('coordinator:' + target + '_delegation'), {'text': 'Use Sol.', 'revision': 1})
-            self.assertEqual(len([entry for entry in self.created() if entry['name'] == name]), 1)
-            self.assertEqual(len([path for path in self.projects.iterdir() if path.name == 'delegation-restart-' + str(checkpoint)]), 1)
-            self.assertEqual(self.store.db.execute('SELECT count(*) FROM outbox WHERE topic=?', (target,)).fetchone()[0], 1)
-
-    async def test_d11_old_queued_create_without_delegation_finishes_unchanged(self):
-        number = self.create('Old shape')
-        self.assertNotIn('delegation', json.loads(self.request(number)['params']))
-        self.restart()
-        self.assertEqual((await self.finish(number))['state'], 'done')
-        self.assertIsNone(self.store.get('coordinator:-10042:11_delegation'))
-        agent = 'Chat agent: Claude claude-opus-5-5 · max thinking · default.'
-        ready = 'Old shape is ready.\nProject folder: ' + str(self.projects / 'old-shape') + '\n' + agent
-        self.assertEqual([row[0] for row in self.store.db.execute("SELECT text FROM outbox WHERE topic='-10042:11'")], [ready])
-        self.assertEqual(self.events()[-1]['text'], 'Chat created: topic=-10042:11\nName: Old shape\nFolder: ' +
-                         str(self.projects / 'old-shape') + '\n' + agent)
+        path = chat_path(self.store, '-10042:11')
+        self.assertEqual(path.read_text(), '- New rule\n')
+        self.assertTrue(any(call.args[1] == path for call in replace.call_args_list))
 
     async def test_f2d_cli_and_mcp_mismatches_refuse_before_queue_folder_or_telegram(self):
         from contextlib import redirect_stdout
@@ -5154,8 +5008,8 @@ class TopicCreationTests(unittest.IsolatedAsyncioTestCase):
         from tests.test_group_setup import HOME
         owner = self.store.message_save(HOME, 'owner', 'Create a picked chat.')['id']
         cases = [('claude', 'gpt-6-luna', 'Send a Claude model with provider=claude, for example claude-opus-5-5.'),
-                 ('codex', 'claude-opus-5-5', 'Send a ChatGPT model with provider=codex, for example gpt-6.1-sol.'),
-                 ('codex', 'opus', 'Send a ChatGPT model with provider=codex, for example gpt-6.1-sol.')]
+                 ('codex', 'claude-opus-5-5', 'Send a ChatGPT model with provider=codex, for example gpt-6.2-sol.'),
+                 ('codex', 'opus', 'Send a ChatGPT model with provider=codex, for example gpt-6.2-sol.')]
         for source in ('cli', 'mcp'):
             for provider, model, text in cases:
                 with self.subTest(source=source, provider=provider, model=model):
@@ -5175,7 +5029,7 @@ class TopicCreationTests(unittest.IsolatedAsyncioTestCase):
                         response = mcp.dispatch(self.store, {'method': 'tools/call', 'params': {
                             'name': 'topic_create', 'arguments': fields}}, topic=HOME)
                         self.assertTrue(response['isError'], response)
-                        self.assertEqual(response['content'][0]['text'], text + '\nnull')
+                        self.assertEqual(response['content'][0]['text'], text + '\n{}')
                     await self.service.controls_once()
                     after = {table: [tuple(row) for row in self.store.db.execute('SELECT * FROM ' + table + ' ORDER BY 1')]
                              for table in before}
@@ -5248,6 +5102,8 @@ class TopicCreationTests(unittest.IsolatedAsyncioTestCase):
         cases = [({}, 'Claude claude-opus-5-5 · max thinking · default'),
                  (dict(provider='claude', model='claude-sonnet-5', effort='high'),
                   'Claude claude-sonnet-5 · high thinking · picked for this chat'),
+                 (dict(provider='claude', model='claude-opus-5-5', effort='xhigh'),
+                  'Claude claude-opus-5-5 · xhigh thinking · picked for this chat'),
                  (dict(provider='codex', model='gpt-6-luna', effort='low'),
                   'ChatGPT gpt-6-luna · low thinking · picked for this chat')]
         for index, (pick, label) in enumerate(cases):
@@ -5290,7 +5146,7 @@ class TopicCreationTests(unittest.IsolatedAsyncioTestCase):
         for source in ('cli', 'mcp'):
             for pick in (dict(model='gpt-6-luna'), dict(effort='low'), dict(provider='opencode'),
                          dict(provider='unknown'), dict(provider='codex', model='bad model'),
-                         dict(provider='claude', effort='xhigh'), dict(provider='codex', effort=4)):
+                         dict(provider='codex', effort=4)):
                 with self.subTest(source=source, pick=pick):
                     before = list(self.store.db.execute('SELECT * FROM settings ORDER BY key'))
                     result = call(self.store, 'topic.create', dict(pick, name='Invalid', message=owner),
@@ -6347,11 +6203,28 @@ class CloseTopicsTests(CloseTopicsTestsSupport, unittest.IsolatedAsyncioTestCase
         self.assertEqual(request, expected['request'])
         card, = self.store.db.execute('SELECT * FROM outbox')
         card = dict(card)
+        self.assertIsNone(card.pop('image_source'))
+        self.assertIsNone(card.pop('task'))
+        self.assertIsNone(card.pop('sender'))
         card['reply_markup'] = json.loads(card['reply_markup'])
         self.assertEqual(card, expected['card'])
         self.assertEqual(self.store.topic(self.closing_topic)['enabled'], 1)
         self.assertTrue(self.project.is_dir())
         self.assertFalse(self.telegram.calls)
+
+    async def test_close_expires_proposed_followups(self):
+        from coordinator import control_api
+        parent = self.store.task_create(self.closing_topic, 'Parent')
+        item = control_api.call(self.store, 'followup.propose', {'parent': parent['id'], 'title': 'Later', 'why': 'Y'}).data
+        message = self.store.message_save(TOPIC, 'owner', 'Close that chat and keep its folder.')['id']
+        result = self.message_close('keep', message, 'cli')
+        self.assertTrue(result.ok, result.text)
+        settled = await self.finish_close(result.data['request'])
+        self.assertEqual(settled['state'], 'done', settled['result'])
+        proposal = self.store.task_get(item['id'])
+        self.assertEqual(proposal['status'], 'expired')
+        self.assertIn('Expired because the chat closed.', proposal['notes'])
+        self.assertNotIn(item['id'], [row['id'] for row in control_api.call(self.store, 'followup.ready', {}).data])
 
     async def test_close_matches_origin_main_cli(self):
         await self.assert_close_matches_origin_main('cli')
@@ -6893,7 +6766,6 @@ class FeedStallTests(ServiceTestsSupport, unittest.IsolatedAsyncioTestCase):
 
     async def idle_chat(self, files=0):
         with self.store.db:
-            self.store.put('close_clears_space', True)
             other = '-10042:5'
             self.store.db.execute('''INSERT INTO topics(id,chat,thread,name,cwd,enabled)
                 VALUES (?,?,?,?,?,1)''', (other, -10042, 5, 'Ideas', str(self.root / 'ideas')))
@@ -6932,18 +6804,6 @@ class FeedStallTests(ServiceTestsSupport, unittest.IsolatedAsyncioTestCase):
                 release.set()
             await settle(deleted.wait())
         self.assertFalse(path.exists())
-
-    async def test_switch_off_starts_no_chat_scratch_clear(self):
-        other, path = await self.idle_chat()
-        with self.store.db:
-            self.store.put('close_clears_space', False)
-        with patch('coordinator.close_saves.clear_chat_scratch', new_callable=AsyncMock) as clear:
-            with patch('coordinator.service.PARENT_IDLE', 0):
-                await self.service.feed_once()
-            await asyncio.sleep(0)
-            clear.assert_not_called()
-        self.assertIn(other, self.service.wound_down)
-        self.assertTrue(path.exists())
 
     async def test_one_scratch_clear_per_chat_until_it_finishes(self):
         other, path = await self.idle_chat()
@@ -7025,8 +6885,6 @@ class FeedStallTests(ServiceTestsSupport, unittest.IsolatedAsyncioTestCase):
         self.assertTrue(path.exists())
 
     async def test_idle_wind_down_does_not_stall_the_feed_while_space_loop_deletes(self):
-        with self.store.db:
-            self.store.put('close_clears_space', True)
         other = '-10042:5'
         with self.store.db:
             self.store.db.execute('''INSERT INTO topics(id,chat,thread,name,cwd,enabled)

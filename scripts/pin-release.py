@@ -13,6 +13,10 @@ import subprocess
 import sys
 
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from coordinator import extension
+
+
 LABEL = 'local.telegram-agent-coordinator'
 SERVICE_PYTHON = '/usr/bin/python3'
 
@@ -58,7 +62,13 @@ def main(argv=None):
         print('Release exists: ' + str(target))
     else:
         releases.mkdir(parents=True, exist_ok=True, mode=0o700)
-        git(home, 'worktree', 'add', '--detach', str(target), commit)
+        maker = extension.optional('tree_maker')
+        try:
+            made = maker is not None and maker.make_release(home, commit, target)
+        except RuntimeError as error:
+            raise SystemExit(str(error)) from error
+        if not made:
+            git(home, 'worktree', 'add', '--detach', str(target), commit)
         print('Release created: ' + str(target))
     arguments = current.get('ProgramArguments') or []
     python = arguments[0] if arguments and os.access(arguments[0], os.X_OK) else (

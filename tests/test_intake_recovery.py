@@ -2,6 +2,7 @@ import asyncio
 from collections import Counter
 import json
 import re
+import time
 from types import SimpleNamespace
 import unittest
 from unittest.mock import AsyncMock, patch
@@ -28,10 +29,7 @@ class RecoveryParent(FakeSession):
 
 
 class IntakeRecoveryTests(ServiceTestsSupport, unittest.IsolatedAsyncioTestCase):
-    batching = True
-
     async def parent(self, topic=TOPIC):
-        self.store.put('coordinator_intake_batching', True)
         if topic != TOPIC:
             with self.store.db:
                 self.store.db.execute('INSERT INTO topics(id,chat,thread,name,cwd,enabled) VALUES (?,?,?,?,?,1)',
@@ -40,6 +38,7 @@ class IntakeRecoveryTests(ServiceTestsSupport, unittest.IsolatedAsyncioTestCase)
         session.key = self.service.session_key(topic)
         session.usage_policy = chat_policy(self.store, session.key)
         self.service.sessions[topic] = session
+        self.service.last_turn[topic] = time.monotonic()
         self.sessions.append(session)
         return session
 
@@ -57,7 +56,6 @@ class IntakeRecoveryTests(ServiceTestsSupport, unittest.IsolatedAsyncioTestCase)
         return started
 
     async def drain(self):
-        self.store.put('coordinator_intake_batching', self.batching)
         started = [await self.flush() for _ in range(5)]
         self.assertEqual(started[-2:], [False, False])
         self.assertEqual(self.store.messages_pending(), [])
@@ -190,7 +188,3 @@ class IntakeRecoveryTests(ServiceTestsSupport, unittest.IsolatedAsyncioTestCase)
         await self.drain()
         self.assert_received_once(session, [worker])
         self.assertEqual((self.saved(anchor)['delivered'], self.saved(anchor)['receipt']), ('received', 'written'))
-
-
-class IntakeRecoverySwitchOffTests(IntakeRecoveryTests):
-    batching = False

@@ -11,12 +11,14 @@ from coordinator import envelopes
 from coordinator.failures import TaskFailure
 from coordinator.service import Service
 from coordinator.store import Store
-from tests.test_envelopes import BOT, OWNER, TOPIC, VALUE, IntakeFixture, private
+from coordinator.telegram import TelegramError
+from tests.test_envelopes import BOT, GROUP, OWNER, TOPIC, VALUE, IntakeFixture, private, topic_reply
 
 
-def prompt(name):
-    return ('Send the value for ' + name +
-            ' now in one message. I will delete it after I store it. Send /cancel to stop.')
+def prompt(name, job='Job: any job'):
+    return ('Envelope: %s\nWhy: Push the release branch\nUsed by: release worker\n%s\n'
+            'Reply to this message with the value in one message within 24 hours. I delete it after I store it. '
+            'Reply /cancel to stop.') % (name, job)
 
 
 class ValueDateFixture(IntakeFixture):
@@ -97,76 +99,6 @@ class ValueDateFixture(IntakeFixture):
             self.assertIn(('deleteMessage', {'chat_id': OWNER, 'message_id': 100 + self.number}), self.telegram.calls)
         self.assert_nowhere(value)
 
-    def assert_no_misfile(self):
-        self.assertEqual(self.vault.values, {})
-        self.assertFalse(any(' stored.' in text for text in self.replies()))
-        self.assertEqual(self.store.db.execute("SELECT count(*) FROM envelopes WHERE state='filled'").fetchone()[0], 0)
-        self.assertEqual(self.store.db.execute("SELECT count(*) FROM messages WHERE kind='secret_filled'").fetchone()[0], 0)
-        self.assertFalse(any('Filled.' in row[0] for row in self.store.db.execute('SELECT text FROM outbox')))
-        self.assert_nowhere(VALUE)
-
-
-class ValueDateRaceTests(ValueDateFixture):
-    def begin(self, waiter=True):
-        self.ask()
-        if waiter:
-            self.ask('NPM_TOKEN')
-        self.loop()
-
-    def finish(self, value=VALUE):
-        self.loop()
-        self.assert_refused(value)
-        self.assert_no_misfile()
-
-    def test_R0_start_read_before_expiry_then_value_after(self):
-        self.begin()
-        self.assertEqual(self.send('/start'), 'envelope_arm')
-        self.expire()
-        self.finish()
-        self.assertEqual(self.envelope('NPM_TOKEN')['state'], 'open')
-
-    def test_R1_start_and_value_in_flight_across_expiry(self):
-        self.begin()
-        self.expire()
-        self.assertEqual(self.send('/start'), 'envelope_arm')
-        self.finish()
-
-    def test_R2_loop_sweeps_between_sending_and_reading_start(self):
-        self.begin()
-        self.expire()
-        self.loop()
-        self.assertEqual(self.send('/start'), 'envelope_arm')
-        self.finish()
-
-    def test_R3_new_ask_sweeps_then_start_and_value_in_flight(self):
-        self.begin(waiter=False)
-        self.expire()
-        self.ask('NPM_TOKEN')
-        self.assertEqual(self.send('/start'), 'envelope_arm')
-        self.finish()
-
-    def test_R4_restart_with_start_and_value_queued(self):
-        self.begin()
-        self.expire()
-        self.reopen()
-        self.loop()
-        self.assertEqual(self.send('/start'), 'envelope_arm')
-        self.finish()
-
-    def test_R5_start_read_then_new_ask_then_value(self):
-        self.begin(waiter=False)
-        self.expire()
-        self.assertEqual(self.send('/start'), 'envelope_start')
-        self.ask('NPM_TOKEN')
-        self.finish()
-
-    def test_R6_refused_paste_then_start_poke_and_second_paste(self):
-        self.begin()
-        self.expire()
-        self.assert_refused(VALUE, deliver=False)
-        self.assertEqual(self.send('/start'), 'envelope_arm')
-        self.finish(VALUE + '-second-paste')
-
 
 class ValueDateBoundaryTests(ValueDateFixture):
     def test_same_second_is_refused(self):
@@ -222,7 +154,7 @@ class ValueDateBoundaryTests(ValueDateFixture):
         self.assert_refused(VALUE, self.telegram.date)
         self.assertEqual(self.send(VALUE + '-later', self.telegram.date + 1), 'envelope_fill')
 
-    def test_resending_prompt_preserves_the_first_delivered_date(self):
+    def test_start_after_delivery_keeps_the_first_prompt_date(self):
         self.ask()
         self.loop()
         self.telegram.date += 10
@@ -231,268 +163,280 @@ class ValueDateBoundaryTests(ValueDateFixture):
         self.assertEqual(self.send(VALUE, self.telegram.date - 9), 'envelope_fill')
 
 
-class IntakeClockTests(ValueDateFixture):
-    def test_waiting_reply_uses_intake_now(self):
-        self.ask()
-        self.ask('NPM_TOKEN')
-        with self.store.db:
-            envelopes.close(self.store, self.envelope(), 'cancelled', 'cancel', source='test')
-            self.store.db.execute("UPDATE envelopes SET expires=? WHERE name='NPM_TOKEN'", (2000000005,))
-        message = private(1, '/cancel')['message']
-        with patch('coordinator.envelopes.time.time', return_value=2000000000):
-            intake = envelopes.prepare_private(self.store, message)
-        with patch('coordinator.envelopes.time.time', return_value=2000000010), self.store.db:
-            self.assertEqual(envelopes.accept_private(self.store, message, intake), 'envelope_reject')
-        self.assertEqual(self.replies()[-1],
-                         'No credential ask is taking a value. Another ask is waiting. Tap Fill privately on its card.')
-
-    def test_waiting_card_skips_expired_armed_asks(self):
-        self.ask()
-        self.ask('NPM_TOKEN')
-        with patch('coordinator.envelopes.time.time', return_value=self.envelope()['expires'] + 1):
-            text = envelopes.ask_text(self.store, self.envelope('NPM_TOKEN'))
-        self.assertNotIn('behind another', text)
-        self.assertIn('Tap Fill privately within 10 minutes', text)
-
 
 class DeliveredIntakeFixture(IntakeFixture):
-    def dated_update(self, number, text=None, **extra):
-        if not extra and text not in ('/start', '/cancel') and not (text or '').startswith('/start '):
-            self.run_effects()
-        return private(number, text, date=self.telegram.date + 1, **extra)
-
-
-class DirectPromptTests(DeliveredIntakeFixture):
-    def accept(self, number, text=None, **extra):
-        message = self.dated_update(number, text, **extra)['message']
-        intake = envelopes.prepare_private(self.store, message)
-        with self.store.db:
-            return envelopes.accept_private(self.store, message, intake)
-
-    def assert_fills_next(self, number=50):
-        self.assertEqual(self.envelope('NPM_TOKEN')['state'], 'armed')
-        self.assertEqual(self.replies()[-1], prompt('NPM_TOKEN'))
-        self.assertEqual(self.accept(number, VALUE), 'envelope_fill')
-        self.assertEqual(self.vault.values['NPM_TOKEN'], VALUE)
-        self.assertNotIn('GITHUB_TOKEN', self.vault.values)
-        self.assert_value_absent()
-
-    def test_T2_ask_prompts_directly_and_the_next_private_message_fills(self):
-        task = self.store.task_create(TOPIC, 'Release')
-        self.assertTrue(self.ask(task=task['id']).ok)
-        envelope = self.envelope()
-        self.assertEqual((envelope['state'], envelope['chat']), ('armed', OWNER))
-        self.assertEqual(self.effects(), [('reply', OWNER, None, prompt('GITHUB_TOKEN'), 'pending')])
-        card = self.outbox(envelope['card_outbox'])
-        self.assertEqual(self.count('outbox'), 1)
-        self.assertIn('Waiting for the value in the private chat.', card['text'])
-        fill, cancel = card['markup']['inline_keyboard']
-        self.assertEqual(fill, [{'text': 'Fill privately', 'url': 'https://t.me/' + BOT}])
-        self.assertEqual(cancel, [{'text': 'Cancel', 'callback_data': 'envelope:%d:cancel' % envelope['id']}])
-        self.assertEqual(self.accept(1, VALUE), 'envelope_fill')
-        self.assertEqual(self.vault.values, {'GITHUB_TOKEN': VALUE})
-        self.assertEqual(self.deletes(), [101])
-        self.assertEqual(self.replies()[-1], 'GITHUB_TOKEN stored. Length %d, fingerprint %s.' %
-                         (len(VALUE), self.vault.fingerprint(VALUE)))
-        notice, = self.store.db.execute("SELECT * FROM messages WHERE kind='secret_filled'").fetchall()
-        self.assertEqual((notice['topic'], notice['source_envelope'], notice['text']),
-                         (TOPIC, envelope['id'], 'Secret GITHUB_TOKEN, declared on job 1, is filled.'))
-        self.assert_value_absent()
-        self.run_effects()
-        self.assertEqual([method for method, _ in self.telegram.calls],
-                         ['sendMessage', 'deleteMessage', 'sendMessage'])
-        self.assertTrue(all(row[4] == 'done' for row in self.effects()))
-
-    def test_T3_waits_and_fills_each_name_in_oldest_first_order(self):
-        for name in ('GITHUB_TOKEN', 'NPM_TOKEN', 'DEPLOY_TOKEN'):
-            self.assertTrue(self.ask(name).ok)
-        self.assertEqual(self.replies(), [prompt('GITHUB_TOKEN')])
-        for name in ('NPM_TOKEN', 'DEPLOY_TOKEN'):
-            self.assertEqual(self.envelope(name)['state'], 'open')
-            card = self.outbox(self.envelope(name)['card_outbox'])
-            self.assertIn('Waiting behind another credential ask', card['text'])
-            self.assertEqual(card['markup']['inline_keyboard'][0],
-                             [{'text': 'Fill privately', 'callback_data': 'envelope:%d:fill' % self.envelope(name)['id']}])
-            self.assertEqual(card['markup']['inline_keyboard'][1],
-                             [{'text': 'Cancel', 'callback_data': 'envelope:%d:cancel' % self.envelope(name)['id']}])
-        for number, name in enumerate(('GITHUB_TOKEN', 'NPM_TOKEN', 'DEPLOY_TOKEN'), 1):
-            self.assertEqual(self.envelope(name)['state'], 'armed')
-            self.assertEqual(self.replies()[-1], prompt(name))
-            self.assertEqual(self.accept(number, VALUE + name), 'envelope_fill')
-            self.assertEqual(self.envelope(name)['state'], 'filled')
-        self.assertEqual(self.vault.values, {name: VALUE + name for name in
-                                          ('GITHUB_TOKEN', 'NPM_TOKEN', 'DEPLOY_TOKEN')})
-        self.assertEqual(self.deletes(), [101, 102, 103])
-        for name in self.vault.values:
-            self.assert_value_absent(VALUE + name)
-
-    def test_T4_private_cancel_prompts_the_next_waiter(self):
-        self.ask()
-        self.ask('NPM_TOKEN')
-        self.assertEqual(self.accept(1, '/cancel'), 'envelope_cancel')
-        self.assertEqual(self.envelope()['state'], 'cancelled')
-        self.assertEqual(self.replies()[-2:], ['Cancelled GITHUB_TOKEN.', prompt('NPM_TOKEN')])
-        self.assert_fills_next()
-
-    def test_T4_card_cancel_prompts_the_next_waiter(self):
-        self.ask()
-        self.ask('NPM_TOKEN')
-        self.assertEqual(self.click_cancel(1, self.envelope()), 'envelope_cancel')
-        self.assertEqual(self.envelope()['state'], 'cancelled')
-        self.assert_fills_next()
-
-    def expire_first(self):
-        with self.store.db:
-            self.store.db.execute('UPDATE envelopes SET expires=? WHERE name=?',
-                                  (self.envelope()['created'] - 1, 'GITHUB_TOKEN'))
+    def setUp(self):
+        super().setUp()
+        self.number = 0
 
     def service(self):
         return Service(self.store, self.telegram, object(), self.root, vault=self.vault)
 
-    def assert_waits_for_start(self, state):
-        self.assertEqual(self.envelope()['state'], state)
-        self.assertEqual(self.envelope('NPM_TOKEN')['state'], 'open')
-        self.assertEqual(self.store.db.execute("SELECT count(*) FROM envelopes WHERE state='armed'").fetchone()[0], 0)
-        notice = ("GITHUB_TOKEN %s, so I won't take a value for it. "
-                  'To give the next one, tap Fill privately on its card.') % state
-        self.assertEqual(self.replies()[-1], notice)
+    def send(self, text, date=None, **extra):
+        self.number += 1
         self.run_effects()
-        self.assertIn(('sendMessage', {'chat_id': OWNER, 'text': notice}), self.telegram.calls)
-        self.assertEqual(self.accept(40, VALUE + '-for-github'), 'envelope_reject')
-        self.assertEqual(self.vault.values, {})
-        self.assertNotIn(prompt('NPM_TOKEN'), self.replies())
-        self.assertEqual(self.accept(41, '/start'), 'envelope_arm')
-        self.assert_fills_next()
+        return self.store.accept(private(self.number, text, date=self.telegram.date + 1 if date is None else date,
+                                         **extra))
 
-    def test_T4_fill_prompts_the_next_waiter(self):
-        self.ask()
-        self.ask('NPM_TOKEN')
-        self.assertEqual(self.accept(1, VALUE + '-first'), 'envelope_fill')
-        self.assertEqual(self.replies()[-1], prompt('NPM_TOKEN'))
-        self.assertEqual(self.accept(2, VALUE + '-second'), 'envelope_fill')
-        self.assertEqual(self.vault.values, {'GITHUB_TOKEN': VALUE + '-first', 'NPM_TOKEN': VALUE + '-second'})
-
-    def test_T4_expiry_waits_for_start_before_prompting_the_next_waiter(self):
-        self.ask()
-        self.ask('NPM_TOKEN')
-        self.expire_first()
-        with self.store.db:
-            self.assertEqual(envelopes.sweep(self.store), 1)
-        self.assert_waits_for_start('expired')
-        with self.store.db:
-            self.assertEqual(envelopes.sweep(self.store), 0)
-
-    def test_failed_rotate_preserves_the_armed_request_and_waiters(self):
-        self.ask()
-        self.ask('NPM_TOKEN')
-        before = self.effects()
-        with patch.dict(os.environ, {'GITHUB_TOKEN': 'fixture-only'}):
-            self.assertEqual(self.call('secret.rotate', name='GITHUB_TOKEN').state, 'refused')
-        self.assertEqual(self.envelope()['state'], 'armed')
-        self.assertEqual(self.envelope('NPM_TOKEN')['state'], 'open')
-        self.assertEqual(self.effects(), before)
-
-    def test_T4_service_revoke_waits_for_start_before_prompting_the_next_waiter(self):
-        self.ask()
-        self.ask('NPM_TOKEN')
-        self.assertTrue(self.call('secret.revoke', name='GITHUB_TOKEN').ok)
-        asyncio.run(self.service().controls_once())
-        self.assert_waits_for_start('revoked')
-
-    def test_T9_P1_service_expiry_never_files_the_first_value_under_the_waiter(self):
-        self.ask()
-        self.ask('NPM_TOKEN')
+    def reply_to(self, name, text):
         self.run_effects()
-        self.expire_first()
-        asyncio.run(self.service().envelopes_once())
-        self.assertEqual(self.store.accept(self.dated_update(1, VALUE)), 'envelope_reject')
-        self.assertEqual(self.vault.values, {})
-        self.assertEqual(self.envelope('NPM_TOKEN')['state'], 'open')
-        self.assertEqual(self.store.accept(self.dated_update(2, '/start')), 'envelope_arm')
-        self.assertEqual(self.store.accept(self.dated_update(3, VALUE + '-npm')), 'envelope_fill')
-        self.assertEqual(self.vault.values, {'NPM_TOKEN': VALUE + '-npm'})
+        return self.send(text, reply_to_message={'message_id': self.envelope(name)['prompt_message'],
+                                                 'chat': {'id': OWNER, 'type': 'private'}})
 
-    def test_T9_P2_live_rotate_never_files_the_first_value_under_the_waiter(self):
-        self.ask()
-        self.ask('NPM_TOKEN')
-        self.run_effects()
-        self.assertEqual(self.call('secret.rotate', name='GITHUB_TOKEN').state, 'refused')
-        self.assertEqual(self.store.accept(self.dated_update(1, VALUE)), 'envelope_fill')
-        self.assertEqual(self.vault.values, {'GITHUB_TOKEN': VALUE})
-        self.assertEqual(self.store.accept(self.dated_update(2, VALUE + '-npm')), 'envelope_fill')
-        self.assertEqual(self.vault.values['NPM_TOKEN'], VALUE + '-npm')
+    def card(self, name='GITHUB_TOKEN'):
+        return self.outbox(self.envelope(name)['card_outbox'])
 
-    def test_T9_P3_another_ask_sweeps_expiry_without_prompting_the_waiter(self):
-        self.ask()
-        self.ask('NPM_TOKEN')
-        self.run_effects()
-        self.expire_first()
+    def stored(self, name, value=VALUE):
+        return '%s stored. Length %d, fingerprint %s.' % (name, len(value), self.vault.fingerprint(value))
+
+
+class EveryAskPromptsTests(DeliveredIntakeFixture):
+    def test_every_ask_posts_its_own_prompt_at_once(self):
+        task = self.store.task_create(TOPIC, 'Release')
+        self.assertTrue(self.ask(task=task['id']).ok)
+        self.assertTrue(self.ask('NPM_TOKEN').ok)
         self.assertTrue(self.ask('DEPLOY_TOKEN').ok)
-        self.assertEqual(self.store.accept(self.dated_update(1, VALUE)), 'envelope_reject')
-        self.assertEqual(self.vault.values, {})
-        self.assertNotIn(prompt('NPM_TOKEN'), self.replies())
-        self.assertEqual(self.envelope('NPM_TOKEN')['state'], 'open')
-        self.assertEqual(self.envelope('DEPLOY_TOKEN')['state'], 'open')
-        self.assertEqual(self.store.accept(self.dated_update(2, '/start')), 'envelope_arm')
-        self.assertEqual(self.replies()[-1], prompt('NPM_TOKEN'))
-        self.assertEqual(self.store.accept(self.dated_update(3, VALUE + '-npm')), 'envelope_fill')
-        self.assertEqual(self.vault.values, {'NPM_TOKEN': VALUE + '-npm'})
+        self.assertEqual(self.effects(), [('reply', OWNER, None, prompt('GITHUB_TOKEN', 'Job: 1 Release'), 'pending'),
+                                          ('reply', OWNER, None, prompt('NPM_TOKEN'), 'pending'),
+                                          ('reply', OWNER, None, prompt('DEPLOY_TOKEN'), 'pending')])
+        for name in ('GITHUB_TOKEN', 'NPM_TOKEN', 'DEPLOY_TOKEN'):
+            envelope = self.envelope(name)
+            self.assertEqual((envelope['state'], envelope['chat']), ('armed', OWNER))
+            card = self.card(name)
+            self.assertIn('The prompt is in your private chat with me. Reply to it there', card['text'])
+            self.assertNotIn('behind', card['text'])
+            self.assertEqual(card['markup']['inline_keyboard'], [
+                [{'text': 'Fill privately', 'url': 'https://t.me/' + BOT}],
+                [{'text': 'Cancel', 'callback_data': 'envelope:%d:cancel' % envelope['id']}]])
+        self.run_effects()
+        sent = [params['text'] for method, params in self.telegram.calls if method == 'sendMessage']
+        self.assertEqual(sent, [row[3] for row in self.effects()])
+        for name in ('GITHUB_TOKEN', 'NPM_TOKEN', 'DEPLOY_TOKEN'):
+            envelope = self.envelope(name)
+            self.assertEqual(envelope['prompt_date'], self.telegram.date)
+            self.assertIsInstance(envelope['prompt_message'], int)
 
-    def test_T9_P4_service_revoke_never_files_the_first_value_under_the_waiter(self):
+    def test_handoff_gets_no_private_prompt_and_blocks_nothing(self):
+        with self.store.db:
+            handoff = envelopes.ask(self.store, TOPIC, envelopes.HANDOFF, 'Sign in', 'Claude')
+        self.assertEqual(self.effects(), [])
+        row = self.envelope(envelopes.HANDOFF)
+        self.assertEqual((row['state'], row['expires'] - row['created']), ('open', 600))
+        card = self.outbox(row['card_outbox'])
+        self.assertEqual(card['text'], 'Sign in\n3. Paste it here as one message within 10 minutes. I delete it at once.')
+        self.assertEqual(card['markup']['inline_keyboard'],
+                         [[{'text': 'Cancel', 'callback_data': 'envelope:%d:cancel' % handoff}]])
+        self.ask()
+        with self.store.db:
+            envelopes.sweep(self.store)
+        self.assertEqual(self.envelope(envelopes.HANDOFF)['state'], 'open')
+        self.assertEqual(self.send(VALUE), 'envelope_fill')
+        self.assertEqual(self.vault.values, {'GITHUB_TOKEN': VALUE})
+        self.assertEqual(self.envelope(envelopes.HANDOFF)['state'], 'open')
+
+    def test_prompt_of_a_closed_ask_is_not_sent(self):
+        self.ask()
+        self.assertEqual(self.click_cancel(1, self.envelope()), 'envelope_cancel')
+        self.run_effects()
+        self.assertEqual([method for method, _ in self.telegram.calls], [])
+        self.assertEqual(self.effects()[0][4], 'done')
+
+    def test_rows_from_before_the_upgrade_get_their_prompts(self):
+        self.ask()
+        self.ask('NPM_TOKEN')
+        with self.store.db:
+            self.store.db.execute('DELETE FROM envelope_effects')
+            self.store.db.execute("UPDATE envelopes SET prompt_effect=NULL WHERE name='GITHUB_TOKEN'")
+            self.store.db.execute("UPDATE envelopes SET state='open',chat=NULL,prompt_effect=NULL WHERE name='NPM_TOKEN'")
+        self.store.close()
+        self.store = Store(self.root / 'state')
+        self.store.vault = self.vault
+        asyncio.run(self.service().envelopes_once())
+        self.assertEqual(self.replies(), [prompt('GITHUB_TOKEN'), prompt('NPM_TOKEN')])
+        self.assertEqual(self.envelope('NPM_TOKEN')['state'], 'armed')
+        self.assertEqual(self.reply_to('NPM_TOKEN', VALUE), 'envelope_fill')
+        self.assertEqual(self.vault.values, {'NPM_TOKEN': VALUE})
+
+
+class FillTargetTests(DeliveredIntakeFixture):
+    def two(self):
         self.ask()
         self.ask('NPM_TOKEN')
         self.run_effects()
-        self.assertTrue(self.call('secret.revoke', name='GITHUB_TOKEN').ok)
-        asyncio.run(self.service().controls_once())
-        self.assertEqual(self.store.accept(self.dated_update(1, VALUE)), 'envelope_reject')
-        self.assertEqual(self.vault.values, {})
-        self.assertEqual(self.envelope('NPM_TOKEN')['state'], 'open')
-        self.assertEqual(self.store.accept(self.dated_update(2, '/start')), 'envelope_arm')
-        self.assertEqual(self.store.accept(self.dated_update(3, VALUE + '-npm')), 'envelope_fill')
-        self.assertEqual(self.vault.values, {'NPM_TOKEN': VALUE + '-npm'})
 
-    def test_T9_owner_away_answers_old_prompts_in_order_without_misfiling(self):
-        names = ('GITHUB_TOKEN', 'NPM_TOKEN', 'DEPLOY_TOKEN')
-        for name in names:
-            self.assertTrue(self.ask(name).ok)
-        asyncio.run(self.service().envelopes_once())
-        self.expire_first()
-        asyncio.run(self.service().envelopes_once())
-        for number, name in enumerate(names, 1):
-            self.assertEqual(self.store.accept(self.dated_update(number, VALUE + name)), 'envelope_reject')
-        self.assertEqual(self.vault.values, {})
-        self.assertEqual(self.replies().count(prompt('GITHUB_TOKEN')), 1)
-        self.assertNotIn(prompt('NPM_TOKEN'), self.replies())
-        self.assertNotIn(prompt('DEPLOY_TOKEN'), self.replies())
-        self.assertEqual(self.store.accept(self.dated_update(4, '/start')), 'envelope_arm')
-        for number, name in enumerate(names[1:], 5):
-            self.assertEqual(self.replies()[-1], prompt(name))
-            self.assertEqual(self.store.accept(self.dated_update(number, VALUE + name)), 'envelope_fill')
-        self.assertEqual(self.vault.values, {name: VALUE + name for name in names[1:]})
+    def test_reply_to_a_prompt_fills_that_ask(self):
+        self.two()
+        self.assertEqual(self.reply_to('NPM_TOKEN', VALUE), 'envelope_fill')
+        self.assertEqual(self.vault.values, {'NPM_TOKEN': VALUE})
+        self.assertEqual(self.envelope()['state'], 'armed')
+        self.assertEqual(self.replies()[-1], self.stored('NPM_TOKEN') + ' Still waiting: GITHUB_TOKEN.')
+        self.assertEqual(self.deletes(), [101])
+        self.assertEqual(self.reply_to('GITHUB_TOKEN', VALUE + '-gh'), 'envelope_fill')
+        self.assertEqual(self.replies()[-1], self.stored('GITHUB_TOKEN', VALUE + '-gh'))
+        self.assertEqual(self.vault.values, {'NPM_TOKEN': VALUE, 'GITHUB_TOKEN': VALUE + '-gh'})
+        self.assert_value_absent()
+        self.assert_value_absent(VALUE + '-gh')
 
-    def test_T12_waiter_gets_ten_minutes_from_its_prompt(self):
+    def test_plain_message_fills_the_oldest_and_names_it(self):
+        self.two()
+        self.assertEqual(self.send(VALUE), 'envelope_fill')
+        self.assertEqual(self.replies()[-1], self.stored('GITHUB_TOKEN') + ' Still waiting: NPM_TOKEN.')
+        self.assertEqual(self.send(VALUE + '-npm'), 'envelope_fill')
+        self.assertEqual(self.replies()[-1], self.stored('NPM_TOKEN', VALUE + '-npm'))
+        self.assertEqual(self.vault.values, {'GITHUB_TOKEN': VALUE, 'NPM_TOKEN': VALUE + '-npm'})
+
+    def test_reply_to_the_owners_own_message_counts_as_plain(self):
+        self.two()
+        self.assertEqual(self.send(VALUE, reply_to_message={'message_id': 1, 'from': {'id': OWNER}}), 'envelope_fill')
+        self.assertEqual(self.vault.values, {'GITHUB_TOKEN': VALUE})
+
+    def test_reply_to_a_bot_message_that_names_no_waiting_ask_stores_nothing(self):
+        self.two()
+        bot = {'id': 1, 'is_bot': True}
+        for number, replied in enumerate(({'message_id': 1, 'from': bot, 'text': 'GITHUB_TOKEN stored.'},
+                                          {'message_id': 2, 'from': bot, 'text': 'Envelope: DEPLOY_TOKEN\nWhy: x'},
+                                          {'message_id': 3}), 1):
+            with self.subTest(replied=replied):
+                self.assertEqual(self.send(VALUE, reply_to_message=replied), 'envelope_reject')
+                self.assertEqual(self.events()[-1], ('reject', 'unknown_reply', 'intake'))
+                self.assertEqual(self.replies()[-1], 'That reply does not match a waiting credential ask, so I deleted '
+                                 'it and stored nothing. Waiting for GITHUB_TOKEN, NPM_TOKEN. Reply to its prompt.')
+                self.assertEqual(self.deletes()[-1], 100 + self.number)
+        self.assertEqual(self.vault.calls, [])
+        self.assert_value_absent()
+
+    def test_reply_to_a_lost_copy_of_a_prompt_fills_its_own_ask(self):
         self.ask()
         self.ask('NPM_TOKEN')
-        now = self.envelope()['created'] + 300
+        real = self.telegram.call
+        lost = {}
+
+        async def call(method, **params):
+            if method == 'sendMessage' and params['text'].startswith('Envelope: NPM_TOKEN') and not lost:
+                lost['id'] = (await real(method, **params))['message_id']
+                raise TelegramError('network-or-invalid-response', reason='timeout')
+            return await real(method, **params)
+
+        self.telegram.call = call
+        self.run_effects()
         with self.store.db:
-            self.store.db.execute("UPDATE envelopes SET expires=? WHERE name='NPM_TOKEN'", (now + 20,))
-        with patch('coordinator.envelopes.time.time', return_value=now):
-            self.assertEqual(self.accept(1, '/cancel'), 'envelope_cancel')
-        armed = self.envelope('NPM_TOKEN')
-        self.assertEqual(armed['expires'], now + 600)
-        self.assertEqual(armed['armed_at'], now)
-        self.assertEqual(self.replies()[-1], prompt('NPM_TOKEN'))
+            self.store.db.execute('UPDATE envelope_effects SET next_attempt=0')
+        self.run_effects()
+        self.assertNotIn(self.envelope('NPM_TOKEN')['prompt_message'], (None, lost['id']))
+        copy = {'message_id': lost['id'], 'from': {'id': 1, 'is_bot': True}, 'text': prompt('NPM_TOKEN')}
+        self.assertEqual(self.send(VALUE, reply_to_message=copy), 'envelope_fill')
+        self.assertEqual(self.vault.values, {'NPM_TOKEN': VALUE})
+        self.assertEqual(self.envelope()['state'], 'armed')
+        self.assert_value_absent()
+
+    def test_reply_to_an_old_format_prompt_fills_the_ask_it_names(self):
+        self.two()
+        old = {'message_id': 4, 'from': {'id': 1, 'is_bot': True},
+               'text': 'Send the value for NPM_TOKEN now in one message. I will delete it after I store it. '
+                       'Send /cancel to stop.'}
+        self.assertEqual(self.send(VALUE, reply_to_message=old), 'envelope_fill')
+        self.assertEqual(self.vault.values, {'NPM_TOKEN': VALUE})
+
+    def test_reply_to_a_closed_prompt_stores_nothing(self):
+        self.two()
+        self.assertEqual(self.click_cancel(900, self.envelope('NPM_TOKEN')), 'envelope_cancel')
+        self.assertEqual(self.reply_to('NPM_TOKEN', VALUE), 'envelope_reject')
+        self.assertEqual(self.replies()[-1], envelopes.REPLIES['closed_prompt'])
+        self.assertEqual(self.events()[-1], ('reject', 'closed_prompt', 'intake'))
+        self.assertEqual(self.deletes()[-1], 100 + self.number)
+        self.assertEqual(self.envelope()['state'], 'armed')
+        self.assertEqual(self.reply_to('GITHUB_TOKEN', VALUE + '-gh'), 'envelope_fill')
+        self.assertEqual(self.reply_to('GITHUB_TOKEN', VALUE + '-again'), 'envelope_reject')
+        self.assertEqual(self.vault.values, {'GITHUB_TOKEN': VALUE + '-gh'})
+        self.assert_value_absent()
+        self.assert_value_absent(VALUE + '-again')
+
+    def test_reply_to_an_expired_prompt_before_the_sweep_stores_nothing(self):
+        self.two()
         with self.store.db:
-            self.assertEqual(envelopes.sweep(self.store, now + 599), 0)
-            self.assertEqual(envelopes.sweep(self.store, now + 600), 1)
+            self.store.db.execute("UPDATE envelopes SET expires=? WHERE name='NPM_TOKEN'", (time.time() - 1,))
+        self.assertEqual(self.reply_to('NPM_TOKEN', VALUE), 'envelope_reject')
+        self.assertEqual(self.vault.values, {})
         self.assertEqual(self.envelope('NPM_TOKEN')['state'], 'expired')
-        self.assertEqual(self.replies()[-1], "NPM_TOKEN expired, so I won't take a value for it.")
-        self.assertEqual(self.accept(2, VALUE), 'envelope_reject')
-        self.assertEqual(self.vault.values, {})
 
-    def test_T13_live_rotate_is_refused_and_the_queue_is_unchanged(self):
-        self.ask()
-        self.ask('NPM_TOKEN')
+    def test_cancel_by_reply_or_plain(self):
+        self.two()
+        self.ask('DEPLOY_TOKEN')
+        self.assertEqual(self.reply_to('NPM_TOKEN', '/cancel'), 'envelope_cancel')
+        self.assertEqual(self.replies()[-1], 'Cancelled NPM_TOKEN.')
+        self.assertEqual(self.envelope('NPM_TOKEN')['state'], 'cancelled')
+        self.assertEqual(self.reply_to('NPM_TOKEN', '/cancel'), 'envelope_reject')
+        self.assertEqual(self.envelope()['state'], 'armed')
+        self.assertEqual(self.send('/cancel'), 'envelope_cancel')
+        self.assertEqual(self.replies()[-1], 'Cancelled GITHUB_TOKEN.')
+        self.assertEqual(self.envelope('DEPLOY_TOKEN')['state'], 'armed')
+        self.assertEqual(self.send(VALUE), 'envelope_fill')
+        self.assertEqual(self.vault.values, {'DEPLOY_TOKEN': VALUE})
+        self.assertEqual(self.send('/cancel'), 'envelope_reject')
+        self.assertEqual(self.replies()[-1], envelopes.REPLIES['nothing_to_cancel'])
+
+    def test_invalid_value_and_vault_failure_keep_every_ask_open(self):
+        self.two()
+        for value in ('two\nlines-of-value', '/not-a-value-at-all', 'x' * 4097):
+            self.assertEqual(self.reply_to('NPM_TOKEN', value), 'envelope_reject')
+        self.vault.fail_next = 'io'
+        self.assertEqual(self.send(VALUE), 'envelope_reject')
+        self.assertEqual((self.envelope()['state'], self.envelope('NPM_TOKEN')['state']), ('armed', 'armed'))
+        self.assertEqual(self.deletes(), [101, 102, 103, 104])
+        self.assertEqual(self.send(VALUE), 'envelope_fill')
+        self.assertEqual(self.vault.values, {'GITHUB_TOKEN': VALUE})
+        self.assert_value_absent()
+
+    def test_non_owner_and_other_chat_fill_nothing(self):
+        self.two()
+        before = self.effects()
+        for extra in ({'user': 99}, {'chat': 55}, {'sender_chat': {'id': 1}}):
+            self.assertEqual(self.send(VALUE, **extra), 'ignored')
+        group = private(9, VALUE, date=self.telegram.date + 1)['message']
+        group['chat'] = {'id': OWNER, 'type': 'supergroup'}
+        intake = envelopes.prepare_private(self.store, group)
+        with self.store.db:
+            self.assertEqual(envelopes.accept_private(self.store, group, intake), 'ignored')
+        self.assertEqual(self.effects(), before)
+        self.assertEqual(self.vault.calls, [])
+        self.assert_value_absent()
+
+    def test_duplicate_update_fills_once(self):
+        self.two()
+        update = private(1, VALUE, date=self.telegram.date + 1)
+        self.assertEqual(self.store.accept(update), 'envelope_fill')
+        self.assertEqual(self.store.accept(update), 'duplicate')
+        self.assertEqual(self.envelope('NPM_TOKEN')['state'], 'armed')
+        self.assertEqual(self.vault.calls, [('put', 'GITHUB_TOKEN')])
+
+    def test_prompts_survive_store_reopen(self):
+        self.two()
+        self.store.close()
+        self.store = Store(self.root / 'state')
+        self.store.vault = self.vault
+        self.assertEqual(self.reply_to('NPM_TOKEN', VALUE), 'envelope_fill')
+        self.assertEqual(self.send(VALUE + '-gh'), 'envelope_fill')
+        self.assertEqual(self.vault.values, {'NPM_TOKEN': VALUE, 'GITHUB_TOKEN': VALUE + '-gh'})
+
+    def test_no_ask_reply(self):
+        self.assertEqual(self.send(VALUE), 'envelope_reject')
+        self.assertEqual(self.replies()[-1], 'No credential ask is waiting for a value, so I deleted your message.')
+
+    def test_start_resends_only_missing_prompts_or_lists_the_asks(self):
+        self.assertEqual(self.send('/start'), 'envelope_start')
+        self.assertEqual(self.replies()[-1], envelopes.REPLIES['bare_start'])
+        self.two()
+        self.assertEqual(self.send('/start'), 'envelope_arm')
+        self.assertEqual(self.replies()[-1], 'Waiting for GITHUB_TOKEN, NPM_TOKEN. Reply to its prompt above with the value.')
+        with self.store.db:
+            self.store.db.execute("UPDATE envelopes SET prompt_message=NULL,prompt_date=NULL WHERE name='NPM_TOKEN'")
+        self.assertEqual(self.send('/start'), 'envelope_arm')
+        self.assertEqual(self.replies()[-1], prompt('NPM_TOKEN'))
+        self.assertEqual(self.replies().count(prompt('GITHUB_TOKEN')), 1)
+        self.assertEqual(self.reply_to('NPM_TOKEN', VALUE), 'envelope_fill')
+
+    def test_live_rotate_is_refused_and_nothing_changes(self):
+        self.two()
         tables = ('envelopes', 'envelope_events', 'envelope_effects', 'outbox')
         before = {table: [tuple(row) for row in self.store.db.execute('SELECT * FROM ' + table)] for table in tables}
         for name in ('GITHUB_TOKEN', 'NPM_TOKEN'):
@@ -500,395 +444,121 @@ class DirectPromptTests(DeliveredIntakeFixture):
                 result = self.call('secret.rotate', name=name)
                 self.assertEqual(result.state, 'refused')
                 self.assertEqual(result.text, 'An envelope for ' + name + ' is already open.')
-                after = {table: [tuple(row) for row in self.store.db.execute('SELECT * FROM ' + table)] for table in tables}
+                after = {table: [tuple(row) for row in self.store.db.execute('SELECT * FROM ' + table)]
+                         for table in tables}
                 self.assertEqual(after, before)
 
-    def test_T14_no_envelope_reply_points_to_the_card(self):
-        self.assertEqual(self.accept(1, VALUE), 'envelope_reject')
-        self.assertEqual(self.replies()[-1], 'No envelope is waiting for a value, so I deleted your message. '
-                         'Tap Fill privately on an Envelope card first.')
 
-    def test_cancel_after_unswept_expiry_never_cancels_the_waiter(self):
-        self.ask()
-        self.ask('NPM_TOKEN')
-        self.expire_first()
-        self.assertEqual(self.accept(1, '/cancel'), 'envelope_reject')
-        self.assertEqual(self.envelope('NPM_TOKEN')['state'], 'open')
-        self.assertNotIn(prompt('NPM_TOKEN'), self.replies())
-        self.assertEqual(self.vault.values, {})
+class MisfileTests(DeliveredIntakeFixture):
+    """A plain message sent while an older prompted ask was open never fills a newer one."""
 
-    def test_cancel_after_service_expiry_never_cancels_the_waiter(self):
-        self.ask()
-        self.ask('NPM_TOKEN')
-        self.expire_first()
-        asyncio.run(self.service().envelopes_once())
-        self.assertEqual(self.accept(1, '/cancel'), 'envelope_reject')
-        self.assertEqual(self.envelope('NPM_TOKEN')['state'], 'open')
-        self.assertNotIn(prompt('NPM_TOKEN'), self.replies())
-
-    def test_start_after_unswept_expiry_prompts_the_waiter_only_once(self):
-        self.ask()
-        self.ask('NPM_TOKEN')
-        self.expire_first()
-        self.assertEqual(self.accept(1, '/start'), 'envelope_arm')
-        self.assertEqual(self.replies().count(prompt('NPM_TOKEN')), 1)
-        self.assertEqual(self.accept(2, VALUE + '-npm'), 'envelope_fill')
-        self.assertEqual(self.vault.values, {'NPM_TOKEN': VALUE + '-npm'})
-
-    def test_value_after_unswept_expiry_stores_nothing_and_prompts_no_waiter(self):
-        self.ask()
-        self.ask('NPM_TOKEN')
-        self.expire_first()
-        self.assertEqual(self.accept(1, VALUE), 'envelope_reject')
-        self.assertEqual(self.vault.values, {})
-        self.assertEqual(self.envelope('NPM_TOKEN')['state'], 'open')
-        self.assertNotIn(prompt('NPM_TOKEN'), self.replies())
-
-    def test_T5_bare_start_resends_the_armed_prompt(self):
-        self.ask()
-        self.assertEqual(self.accept(1, '/start'), 'envelope_arm')
-        self.assertEqual(self.replies(), [prompt('GITHUB_TOKEN')] * 2)
-        self.assertEqual([event for event, _, _ in self.events()], ['ask', 'arm'])
-
-    def test_T5_bare_start_arms_a_waiter_or_gives_the_original_reply(self):
-        self.ask()
-        self.expire_first()
-        with self.store.db:
-            envelopes.sweep(self.store)
-        self.ask('NPM_TOKEN')
-        self.assertEqual(self.accept(1, '/start'), 'envelope_arm')
-        self.assertEqual(self.replies()[-1], prompt('NPM_TOKEN'))
-        self.assertEqual(self.accept(2, VALUE), 'envelope_fill')
-        self.assertEqual(self.accept(3, '/start'), 'envelope_start')
-        self.assertEqual(self.replies()[-1], envelopes.REPLIES['bare_start'])
-
-    def test_T7_handoff_neither_joins_nor_blocks_the_queue(self):
-        with self.store.db:
-            handoff = envelopes.ask(self.store, TOPIC, envelopes.HANDOFF, 'Sign in', 'Claude')
-        self.assertEqual(self.effects(), [])
-        self.assertEqual(self.envelope(envelopes.HANDOFF)['state'], 'open')
-        card = self.outbox(self.envelope(envelopes.HANDOFF)['card_outbox'])
-        self.assertEqual(card['text'], 'Sign in\n3. Paste it here as one message within 10 minutes. I delete it at once.')
-        self.assertEqual(card['markup']['inline_keyboard'],
-                         [[{'text': 'Cancel', 'callback_data': 'envelope:%d:cancel' % handoff}]])
-        self.ask()
-        self.ask('NPM_TOKEN')
-        self.accept(1, VALUE)
-        self.assertEqual(self.envelope('NPM_TOKEN')['state'], 'armed')
-        self.assertEqual(self.envelope(envelopes.HANDOFF)['state'], 'open')
-        self.accept(2, VALUE + '-second')
-        self.assertEqual(self.replies()[-1].split(' stored.')[0], 'NPM_TOKEN')
-        self.assertEqual(self.envelope(envelopes.HANDOFF)['state'], 'open')
-        self.assertEqual([reply for reply in self.replies() if reply.startswith('Send')],
-                         [prompt('GITHUB_TOKEN'), prompt('NPM_TOKEN')])
-
-    def test_T8_non_owner_and_other_chat_fill_nothing(self):
-        self.ask()
-        before = self.effects()
-        for number, extra in enumerate(({'user': 99}, {'chat': 55}, {'sender_chat': {'id': 1}}), 1):
-            self.assertEqual(self.accept(number, VALUE, **extra), 'ignored')
-        group = private(4, VALUE)['message']
-        group['chat'] = {'id': OWNER, 'type': 'supergroup'}
-        intake = envelopes.prepare_private(self.store, group)
-        with self.store.db:
-            self.assertEqual(envelopes.accept_private(self.store, group, intake), 'ignored')
-        self.assertEqual(self.effects(), before)
-        self.assertEqual(self.vault.calls, [])
-        self.assertEqual(self.envelope()['state'], 'armed')
-        self.assert_value_absent()
-
-    def test_invalid_value_and_vault_failure_keep_the_current_slot(self):
-        self.ask()
-        self.ask('NPM_TOKEN')
-        for number, value in enumerate(('two\nlines-of-value', '/not-a-value-at-all', 'x' * 4097), 1):
-            self.assertEqual(self.accept(number, value), 'envelope_reject')
-        self.vault.fail_next = 'io'
-        self.assertEqual(self.accept(4, VALUE), 'envelope_reject')
-        self.assertEqual(self.envelope()['state'], 'armed')
-        self.assertEqual(self.envelope('NPM_TOKEN')['state'], 'open')
-        self.assertEqual(self.deletes(), [101, 102, 103, 104])
-        self.assertEqual(self.accept(5, VALUE), 'envelope_fill')
-        self.assertEqual(self.envelope('NPM_TOKEN')['state'], 'armed')
-        self.assert_value_absent()
-
-    def test_queue_and_prompt_survive_store_reopen(self):
-        self.ask()
-        self.ask('NPM_TOKEN')
-        self.store.close()
-        self.store = Store(self.root / 'state')
-        self.store.vault = self.vault
-        self.assertEqual(self.replies(), [prompt('GITHUB_TOKEN')])
-        self.assertEqual(self.accept(1, VALUE), 'envelope_fill')
-        self.assertEqual(self.replies()[-1], prompt('NPM_TOKEN'))
-        self.assertEqual(self.accept(2, VALUE + '-second'), 'envelope_fill')
-        self.assertEqual(self.vault.values, {'GITHUB_TOKEN': VALUE, 'NPM_TOKEN': VALUE + '-second'})
-
-    def test_duplicate_update_does_not_fill_the_next_envelope(self):
-        self.ask()
-        self.ask('NPM_TOKEN')
-        update = self.dated_update(1, VALUE)
-        self.assertEqual(self.store.accept(update), 'envelope_fill')
-        self.assertEqual(self.store.accept(update), 'duplicate')
-        self.assertEqual(self.envelope('NPM_TOKEN')['state'], 'armed')
-        self.assertEqual(self.vault.calls, [('put', 'GITHUB_TOKEN')])
-
-
-class SelfCloseTests(DeliveredIntakeFixture):
     def setUp(self):
         super().setUp()
-        self.number = 0
+        self.telegram.date = int(time.time()) - 1000
+        self.ask()
+        self.ask('NPM_TOKEN')
+        self.run_effects()
+        self.sent = self.telegram.date + 5
+        self.closed = self.telegram.date + 10
 
-    def send(self, text, **extra):
-        self.number += 1
-        return self.store.accept(self.dated_update(self.number, text, **extra))
+    def close_first(self, how):
+        if how == 'expire':
+            with self.store.db:
+                self.store.db.execute("UPDATE envelopes SET expires=? WHERE name='GITHUB_TOKEN'", (self.closed,))
+        elif how == 'sweep':
+            with self.store.db:
+                self.store.db.execute("UPDATE envelopes SET expires=? WHERE name='GITHUB_TOKEN'", (self.closed,))
+            asyncio.run(self.service().envelopes_once())
+        else:
+            with patch('coordinator.envelopes.time.time', return_value=self.closed), \
+                    patch('coordinator.store.time.time', return_value=self.closed):
+                if how == 'revoke':
+                    self.assertTrue(self.call('secret.revoke', name='GITHUB_TOKEN').ok)
+                    asyncio.run(self.service().controls_once())
+                else:
+                    with self.store.db:
+                        envelopes.cancel(self.store, self.envelope()['id'], 'cli')
 
-    def expire(self, name='GITHUB_TOKEN'):
+    def test_value_sent_while_the_older_ask_was_open_is_refused(self):
+        for how in ('expire', 'sweep', 'revoke', 'cli'):
+            with self.subTest(how=how):
+                self.setUp()
+                self.close_first(how)
+                self.assertEqual(self.send(VALUE, date=self.sent), 'envelope_reject')
+                self.assertEqual(self.events()[-1], ('reject', 'sent_while_open', 'intake'))
+                self.assertEqual(self.replies()[-1], 'That message was sent while I was still waiting for GITHUB_TOKEN. '
+                                 'I deleted it and stored nothing. Reply to the prompt you mean.')
+                self.assertNotIn(('put', 'NPM_TOKEN'), self.vault.calls)
+                self.assertEqual(self.envelope('NPM_TOKEN')['state'], 'armed')
+                self.assertEqual(self.send(VALUE + '-npm', date=self.closed + 1), 'envelope_fill')
+                self.assertEqual(self.vault.values, {'NPM_TOKEN': VALUE + '-npm'})
+                self.assert_value_absent()
+                self.tearDown()
+                self.doCleanups()
+
+    def test_closed_ask_posts_a_notice_in_the_private_chat(self):
+        self.close_first('sweep')
+        self.assertEqual(self.replies()[-1], "GITHUB_TOKEN expired, so I won't take a value for it.")
+
+    def test_owner_cancel_then_value_for_the_next_ask_fills_it(self):
+        self.assertEqual(self.send('/cancel', date=self.sent), 'envelope_cancel')
+        self.assertEqual(self.send(VALUE, date=int(time.time()) + 1), 'envelope_fill')
+        self.assertEqual(self.vault.values, {'NPM_TOKEN': VALUE})
+
+    def test_value_sent_before_the_older_ask_was_filled_is_refused(self):
+        self.assertEqual(self.send(VALUE, date=self.sent), 'envelope_fill')
+        self.assertEqual(self.send(VALUE + '-corrected', date=self.sent), 'envelope_reject')
+        self.assertEqual(self.events()[-1], ('reject', 'sent_while_open', 'intake'))
+        self.assertEqual(self.vault.values, {'GITHUB_TOKEN': VALUE})
+        self.assert_value_absent(VALUE + '-corrected')
+        self.assertEqual(self.send(VALUE + '-npm', date=int(time.time()) + 1), 'envelope_fill')
+        self.assertEqual(self.vault.values, {'GITHUB_TOKEN': VALUE, 'NPM_TOKEN': VALUE + '-npm'})
+
+    def test_value_in_flight_before_a_new_prompt_is_refused(self):
+        self.close_first('sweep')
+        self.ask('DEPLOY_TOKEN')
+        self.assertEqual(self.reply_to('NPM_TOKEN', VALUE + '-npm'), 'envelope_fill')
+        self.assertEqual(self.send(VALUE, date=self.telegram.date), 'envelope_reject')
+        self.assertEqual(self.events()[-1], ('reject', 'before_prompt', 'intake'))
+        self.assertEqual(self.vault.values, {'NPM_TOKEN': VALUE + '-npm'})
+
+
+class LifetimeTests(DeliveredIntakeFixture):
+    def test_ask_stays_open_for_a_day_then_expires_and_can_be_asked_again(self):
+        self.assertEqual(envelopes.LIFETIME, 24 * 3600)
+        self.ask()
+        envelope = self.envelope()
+        self.assertEqual(envelope['expires'], envelope['armed_at'] + envelopes.LIFETIME)
+        self.assertIn('within 24 hours', self.card()['text'])
+        self.assertIn('within 24 hours', self.replies()[-1])
         with self.store.db:
-            self.store.db.execute("UPDATE envelopes SET expires=? WHERE name=? AND state IN ('open','armed')",
-                                  (self.envelope(name)['created'] - 1, name))
-
-    def service(self):
-        return Service(self.store, self.telegram, object(), self.root, vault=self.vault)
-
-    def loop_once(self):
-        asyncio.run(self.service().envelopes_once())
-
-    def revoke(self):
-        self.assertTrue(self.call('secret.revoke', name='GITHUB_TOKEN').ok)
-        asyncio.run(self.service().controls_once())
-
-    def assert_rejected_value(self, value=VALUE):
-        before = list(self.vault.calls)
-        notices = self.count_notices()
-        self.assertEqual(self.send(value), 'envelope_reject')
-        self.assertEqual(self.vault.calls, before)
-        self.assertEqual(self.count_notices(), notices)
-        self.assertEqual(self.deletes()[-1], 100 + self.number)
-        self.assertIn('deleted your message', self.replies()[-1])
-        self.assert_value_absent(value)
-
-    def count_notices(self):
-        return self.store.db.execute("SELECT count(*) FROM messages WHERE kind='secret_filled'").fetchone()[0]
-
-    def worker_values(self, name='NPM_TOKEN'):
-        task = self.store.task_create(TOPIC, 'Uses ' + name, secrets=[name])
-        return envelopes.load_for_worker(self.store, self.vault, task)[0]
-
-    def assert_waits(self, name='NPM_TOKEN'):
-        self.assertEqual(self.envelope(name)['state'], 'open')
-        replies = [row[0] for row in self.store.db.execute(
-            "SELECT text FROM envelope_effects WHERE envelope=? AND kind='reply'", (self.envelope(name)['id'],))]
-        self.assertNotIn(prompt(name), replies)
-        with self.assertRaises(envelopes.SecretsPending):
-            self.worker_values(name)
-
-    def resume_and_fill(self, name='NPM_TOKEN'):
-        self.assertEqual(self.send('/start'), 'envelope_arm')
-        self.assertEqual(self.replies()[-1], prompt(name))
-        self.assertEqual(self.send(VALUE + '-for-' + name), 'envelope_fill')
-        self.assertEqual(self.worker_values(name), {name: VALUE + '-for-' + name})
-
-    def test_N1_owner_away_expiry_then_new_ask_cannot_take_either_answer(self):
-        self.ask()
-        self.expire()
-        self.loop_once()
-        self.assertTrue(self.ask('NPM_TOKEN').ok)
-        self.assert_rejected_value(VALUE + '-for-github')
-        self.assert_rejected_value(VALUE + '-for-npm')
-        self.assert_waits()
-        self.resume_and_fill()
-
-    def test_N2_in_flight_value_after_new_ask_sweeps_expiry_is_not_misfiled(self):
-        self.ask()
-        self.expire()
-        self.assertTrue(self.ask('NPM_TOKEN').ok)
-        self.assert_rejected_value()
-        self.assert_waits()
-        self.resume_and_fill()
-
-    def test_N3_revoke_then_new_ask_cannot_take_the_closed_prompts_value(self):
-        self.ask()
-        self.revoke()
-        self.assertTrue(self.ask('NPM_TOKEN').ok)
-        self.assert_rejected_value()
-        self.assert_waits()
-        self.resume_and_fill()
-
-    def test_N4_rotate_keeps_the_good_value_until_the_owner_resumes(self):
-        good = VALUE + '-original-npm'
-        self.ask('NPM_TOKEN')
-        self.assertEqual(self.send(good), 'envelope_fill')
-        self.ask()
-        self.expire()
-        self.loop_once()
-        self.assertTrue(self.call('secret.rotate', name='NPM_TOKEN').ok)
-        self.assert_rejected_value()
-        self.assertEqual(self.envelope('NPM_TOKEN')['state'], 'open')
-        self.assertEqual(self.worker_values(), {'NPM_TOKEN': good})
-        self.assertEqual(self.count_notices(), 1)
-        self.resume_and_fill()
-
-    def test_a2_new_ask_after_loop_expiry_does_not_send_a_prompt(self):
-        self.ask()
-        self.expire()
-        self.loop_once()
-        self.ask('NPM_TOKEN')
-        self.assert_waits()
-
-    def test_a3_new_ask_that_sweeps_expiry_does_not_send_a_prompt(self):
-        self.ask()
-        self.expire()
-        self.ask('NPM_TOKEN')
-        self.assert_waits()
-
-    def test_a4_new_ask_after_revoke_does_not_send_a_prompt(self):
-        self.ask()
-        self.revoke()
-        self.ask('NPM_TOKEN')
-        self.assert_waits()
-
-    def test_a6_waiting_cards_only_say_behind_while_another_ask_is_armed(self):
-        self.ask()
-        self.ask('NPM_TOKEN')
-        self.assertIn('behind another', self.outbox(self.envelope('NPM_TOKEN')['card_outbox'])['text'])
-        self.expire()
-        self.ask('DEPLOY_TOKEN')
-        for name in ('NPM_TOKEN', 'DEPLOY_TOKEN'):
-            card = self.outbox(self.envelope(name)['card_outbox'])
-            self.assertNotIn('behind another', card['text'])
-            self.assertIn('Tap Fill privately within 10 minutes', card['text'])
-            self.assertEqual([button['text'] for row in card['markup']['inline_keyboard'] for button in row],
-                             ['Fill privately', 'Cancel'])
-        self.assert_rejected_value()
-        self.assertEqual(self.send('/start'), 'envelope_arm')
-        self.assertIn('behind another', self.outbox(self.envelope('DEPLOY_TOKEN')['card_outbox'])['text'])
-
-    def test_b3_start_twice_with_no_waiter_is_truthful_and_lifts_the_pause(self):
-        self.ask()
-        self.expire()
-        self.loop_once()
-        for _ in range(2):
-            self.assertEqual(self.send('/start'), 'envelope_start')
-            self.assertEqual(self.replies()[-1], 'No credential asks are waiting.')
-        self.ask('NPM_TOKEN')
-        self.assertEqual(self.envelope('NPM_TOKEN')['state'], 'armed')
-        self.assertEqual(self.send(VALUE), 'envelope_fill')
-
-    def test_e2_only_waiter_expires_before_start_and_no_missing_button_is_offered(self):
-        self.ask()
-        self.ask('NPM_TOKEN')
-        self.expire()
-        self.loop_once()
-        self.expire('NPM_TOKEN')
-        for _ in range(2):
-            self.assertEqual(self.send('/start'), 'envelope_start')
-            self.assertEqual(self.replies()[-1], 'No credential asks are waiting.')
-        self.assertEqual(self.envelope('NPM_TOKEN')['state'], 'expired')
-        self.ask('DEPLOY_TOKEN')
-        self.assertEqual(self.envelope('DEPLOY_TOKEN')['state'], 'armed')
-
-    def assert_cancel_after_expiry(self):
-        self.assertEqual(self.send('/cancel'), 'envelope_reject')
-        self.assertEqual(self.replies()[-1],
-                         'No credential ask is taking a value. Another ask is waiting. Tap Fill privately on its card.')
-        self.assert_waits()
-        self.resume_and_fill()
-
-    def test_c1_cancel_just_after_unswept_expiry_mentions_the_waiter(self):
-        self.ask()
-        self.ask('NPM_TOKEN')
-        self.expire()
-        self.assert_cancel_after_expiry()
-
-    def test_c2_cancel_after_loop_expiry_mentions_the_waiter(self):
-        self.ask()
-        self.ask('NPM_TOKEN')
-        self.expire()
-        self.loop_once()
-        self.assert_cancel_after_expiry()
-
-    def test_pause_survives_a_store_reopen_before_a_new_ask(self):
-        self.ask()
-        self.expire()
-        self.loop_once()
-        self.store.close()
-        self.store = Store(self.root / 'state')
-        self.store.vault = self.vault
-        self.ask('NPM_TOKEN')
-        self.assert_rejected_value()
-        self.assert_waits()
-        self.resume_and_fill()
-
-    def test_pause_survives_the_last_waiter_expiring_before_a_new_ask(self):
-        self.ask()
-        self.ask('NPM_TOKEN')
-        self.expire()
-        self.loop_once()
-        self.expire('NPM_TOKEN')
-        self.ask('DEPLOY_TOKEN')
-        self.assert_rejected_value()
-        self.assert_waits('DEPLOY_TOKEN')
-        self.resume_and_fill('DEPLOY_TOKEN')
-
-    def test_same_name_rotation_also_requires_an_owner_exit(self):
-        self.ask()
-        self.expire()
-        self.loop_once()
-        self.assertTrue(self.call('secret.rotate', name='GITHUB_TOKEN').ok)
-        self.assert_rejected_value()
-        self.assert_waits('GITHUB_TOKEN')
-        self.resume_and_fill('GITHUB_TOKEN')
-
-    def test_nonowner_commands_cannot_lift_the_pause(self):
-        self.ask()
-        self.expire()
-        self.loop_once()
-        self.assertEqual(self.send('/start', user=99), 'ignored')
-        self.assertEqual(self.send('/cancel', user=99), 'ignored')
-        self.ask('NPM_TOKEN')
-        self.assert_waits()
-        self.assert_rejected_value()
-
-    def test_owner_cancel_acknowledges_closed_prompt_before_a_later_new_ask(self):
-        self.ask()
-        self.expire()
-        self.loop_once()
-        self.assertEqual(self.send('/cancel'), 'envelope_reject')
-        self.assertEqual(self.replies()[-1], 'No credential asks are waiting.')
-        self.ask('NPM_TOKEN')
-        self.assertEqual(self.envelope('NPM_TOKEN')['state'], 'armed')
+            self.assertEqual(envelopes.sweep(self.store, envelope['expires'] - 1), 0)
+            self.assertEqual(envelopes.sweep(self.store, envelope['expires']), 1)
+        self.assertEqual(self.envelope()['state'], 'expired')
+        self.assertEqual(self.replies()[-1], "GITHUB_TOKEN expired, so I won't take a value for it.")
+        card = self.card()
+        self.assertEqual(card['text'], 'Envelope: GITHUB_TOKEN\nExpired. Tap Ask again to request it again.')
+        self.assertEqual(card['markup']['inline_keyboard'],
+                         [[{'text': 'Ask again', 'callback_data': 'envelope:%d:again' % envelope['id']}]])
+        with self.store.db:
+            self.assertEqual(envelopes.again(self.store, envelope['id']), 'envelope_again')
+        self.assertEqual(self.envelope()['state'], 'armed')
+        self.assertEqual(self.replies()[-1], prompt('GITHUB_TOKEN'))
         self.assertEqual(self.send(VALUE), 'envelope_fill')
 
 
-class CardButtonTests(ValueDateFixture):
-    def card(self, name='GITHUB_TOKEN'):
-        return self.outbox(self.envelope(name)['card_outbox'])
-
-    def assert_callback(self, name):
-        envelope = self.envelope(name)
-        self.assertEqual(self.card(name)['markup']['inline_keyboard'], [
-            [{'text': 'Fill privately', 'callback_data': 'envelope:%d:fill' % envelope['id']}],
-            [{'text': 'Cancel', 'callback_data': 'envelope:%d:cancel' % envelope['id']}]])
-
-    def pause(self):
+class CardTests(DeliveredIntakeFixture):
+    def test_reply_in_the_topic_is_deleted_and_points_to_the_private_prompt(self):
         self.ask()
-        self.expire()
-        with self.store.db:
-            envelopes.sweep(self.store)
-
-    def test_F5_group_reply_to_waiting_card_still_points_to_its_button(self):
-        from tests.test_envelopes import topic_reply
-        self.pause()
-        self.ask('NPM_TOKEN')
-        self.assert_callback('NPM_TOKEN')
-        card = self.envelope('NPM_TOKEN')['card_outbox']
-        self.store.delivered(card, 903)
+        self.store.delivered(self.envelope()['card_outbox'], 903)
         self.assertEqual(self.store.accept(topic_reply(1, 903)), 'envelope_intercept')
         self.assertEqual(self.vault.values, {})
-        self.assertEqual(self.envelope('NPM_TOKEN')['state'], 'open')
+        self.assertIn(('delete', GROUP, 201, None, 'pending'), self.effects())
         notice = self.store.db.execute("SELECT text FROM outbox WHERE kind='report' ORDER BY id DESC").fetchone()[0]
-        self.assertEqual(notice, 'I removed your reply. Use Fill privately to send values.')
-        self.assert_callback('NPM_TOKEN')
+        self.assertEqual(notice, 'I removed your reply. Reply to its prompt in your private chat with me, '
+                         'or tap Fill privately.')
+        self.assertEqual(self.count('messages'), 0)
+        self.assert_value_absent()
 
 
 if __name__ == '__main__':

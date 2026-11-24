@@ -167,6 +167,7 @@ class TokenTerminalTests(unittest.TestCase):
             store = Store(root / 'state')
             globals_ = INSTALLER['setup'].__globals__
             async def check(path):
+                self.assertEqual(path.read_text().strip(), FAKE_TOKEN)
                 self.assertFalse(termios.tcgetattr(self.slave)[3] & termios.ECHO)
                 self.paste(FAKE_TOKEN)
                 self.assertFalse(select.select([self.master], [], [], 0.05)[0])
@@ -181,6 +182,9 @@ class TokenTerminalTests(unittest.TestCase):
                 await INSTALLER['connect_claude'](store)
             try:
                 with patch.object(terminal, 'interactive_mac', return_value=True), \
+                        patch.object(terminal, 'START_TIMEOUT', 10), \
+                        patch.object(terminal, 'READ_TIMEOUT', 10), \
+                        patch('coordinator.setup_terminal.print', side_effect=self.paste_on_fallback, create=True), \
                         patch.dict(globals_, check_bot=check), patch('asyncio.create_subprocess_exec', launch), \
                         patch('pathlib.Path.home', return_value=root), \
                         redirect_stdout(self.output):
@@ -472,7 +476,7 @@ class QrTests(unittest.TestCase):
         self.assertEqual(run.call_args.kwargs['input'], url.encode())
 
     def test_ssh_is_not_an_interactive_mac(self):
-        with patch('sys.platform', 'darwin'), patch('sys.stdin.isatty', return_value=True), \
+        with patch('coordinator.host_os.SYSTEM', 'darwin'), patch('sys.stdin.isatty', return_value=True), \
                 patch('sys.stdout.isatty', return_value=True), patch.dict(os.environ, {'SSH_CONNECTION': 'fake ssh'}):
             self.assertFalse(terminal.interactive_mac())
 

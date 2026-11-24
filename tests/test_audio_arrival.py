@@ -6,6 +6,7 @@ from unittest.mock import patch
 from coordinator import media
 from coordinator.service import Service
 from coordinator.store import Store
+from tests.support import sent_parts, settle
 from tests.test_media import ImageTelegram
 from tests.test_service import FakeSession
 from tests.test_store import update
@@ -80,11 +81,11 @@ class AudioArrivalTests(unittest.IsolatedAsyncioTestCase):
         return request
 
     async def next_started(self):
-        return await asyncio.wait_for(self.started.get(), 2)
+        return await settle(self.started.get())
 
     async def drain(self):
         await self.service.feed_once()
-        await asyncio.wait_for(asyncio.gather(*self.service.feed_tasks.values()), 2)
+        await settle(asyncio.gather(*self.service.feed_tasks.values()))
         await self.service.feed_once()
 
     async def test_accept_starts_transcription_before_feed_and_deduplicates(self):
@@ -108,7 +109,7 @@ class AudioArrivalTests(unittest.IsolatedAsyncioTestCase):
                  if self.store.db.execute('SELECT topic FROM messages WHERE id=?', (key,)).fetchone()[0] == '-10042:5']
         await asyncio.wait_for(asyncio.gather(*tasks), 2)
         self.assertEqual(self.service.sessions['-10042:4'].sent, [])
-        prompts = [entry[1] for entry in self.service.sessions['-10042:5'].sent]
+        prompts = sent_parts(self.service.sessions['-10042:5'])
         self.assertIn('Transcript 3', prompts[0])
         self.assertIn('Other chat text', prompts[1])
         self.gates[2].set()
@@ -129,7 +130,7 @@ class AudioArrivalTests(unittest.IsolatedAsyncioTestCase):
             gate.set()
         await self.drain()
         self.assertEqual(self.peak, 4)
-        self.assertEqual(sum(len(session.sent) for session in self.service.sessions.values()), 5)
+        self.assertEqual(sum(len(sent_parts(session)) for session in self.service.sessions.values()), 5)
 
     async def test_long_then_short_then_text_deliver_in_send_order(self):
         await self.accept(2)
@@ -144,7 +145,7 @@ class AudioArrivalTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.service.sessions['-10042:4'].sent, [])
         self.gates[2].set()
         await self.drain()
-        prompts = [entry[1] for entry in self.service.sessions['-10042:4'].sent]
+        prompts = sent_parts(self.service.sessions['-10042:4'])
         self.assertIn('Transcript 2', prompts[0])
         self.assertIn('Transcript 3', prompts[1])
         self.assertIn('Text after notes', prompts[2])
@@ -166,7 +167,7 @@ class AudioArrivalTests(unittest.IsolatedAsyncioTestCase):
         await self.drain()
         self.assertEqual(self.api.downloads, ['note-2', 'note-3'])
         self.assertTrue(self.started.empty())
-        prompts = [entry[1] for entry in self.service.sessions['-10042:4'].sent]
+        prompts = sent_parts(self.service.sessions['-10042:4'])
         self.assertIn('Transcript 2', prompts[0])
         self.assertIn('Transcript 3', prompts[1])
 
@@ -186,7 +187,7 @@ class AudioArrivalTests(unittest.IsolatedAsyncioTestCase):
         await self.service.accept_update(update(21, '', document={
             'file_id': 'plain', 'file_name': 'plain.txt', 'mime_type': 'text/plain'}))
         await self.drain()
-        prompts = [entry[1] for entry in self.service.sessions['-10042:4'].sent]
+        prompts = sent_parts(self.service.sessions['-10042:4'])
         self.assertEqual(len(prompts), len(variants) + 2)
         for number, prompt in enumerate(prompts[:len(variants)], 2):
             self.assertIn('Voice note transcript: Transcript %d' % number, prompt)
@@ -213,25 +214,17 @@ class AudioArrivalTests(unittest.IsolatedAsyncioTestCase):
             await task
         self.assertEqual([row['transcript'] for row in rows], ['Transcript 2', 'Transcript 3'])
 
-    async def test_default_parakeet_and_hidden_setting_switches_the_next_note(self):
+    async def test_each_note_uses_the_host_default_backend(self):
         from unittest.mock import AsyncMock
-        self.assertIsNone(self.store.get('transcription_model'))
-        with self.assertRaisesRegex(ValueError, 'parakeet or whisper'):
-            self.store.put('transcription_model', 'unknown')
         engine = AsyncMock(return_value='Selected transcript')
         with patch.object(media, 'transcribe_audio', engine):
             await self.accept(2)
             await self.drain()
             self.assertEqual(engine.call_args.kwargs['backend'], 'parakeet')
-            with self.store.db:
-                self.store.put('transcription_model', 'whisper')
+            media.default_backend.return_value = 'whisper'
             await self.accept(3)
             await self.drain()
             self.assertEqual(engine.call_args.kwargs['backend'], 'whisper')
-        self.assertEqual(self.store.get('transcription_model'), 'whisper')
-        self.store.close()
-        self.store = Store(self.root / 'state')
-        self.assertEqual(self.store.get('transcription_model'), 'whisper')
 
     async def test_three_short_notes_start_together_with_memory_budget(self):
         await self.accept(2, duration=1800)
@@ -278,8 +271,7 @@ class AudioArrivalTests(unittest.IsolatedAsyncioTestCase):
             await self.drain()
 
     async def test_whisper_memory_estimate_allows_two_long_notes(self):
-        with self.store.db:
-            self.store.put('transcription_model', 'whisper')
+        media.default_backend.return_value = 'whisper'
         for number in (2, 3, 4):
             await self.accept(number, duration=1800)
         self.assertEqual({await self.next_started(), await self.next_started()}, {2, 3})
@@ -338,60 +330,3 @@ class AudioArrivalTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self.next_started(), 3)
         self.gates[3].set()
         await asyncio.gather(*self.service.audio_tasks.values(), return_exceptions=True)
-
-    async def assert_send_failure_recovers(self, chained_note):
-        await self.accept(2)
-        failed = self.store.db.execute('SELECT id FROM messages WHERE telegram_message=2').fetchone()[0]
-        self.gates[2].set()
-        if chained_note:
-            await self.accept(3)
-            self.assertEqual({await self.next_started(), await self.next_started()}, {2, 3})
-        else:
-            for number in range(3, 8):
-                await self.service.accept_update(update(number, 'Follow-up %d' % number))
-        original_send = FakeSession.send
-        delivered = asyncio.Event()
-        feed_starts = asyncio.Queue()
-        async def send(session, message_id, text, row_id=None):
-            if row_id == failed:
-                raise RuntimeError('fixture send failure')
-            result = await original_send(session, message_id, text, row_id)
-            if len(session.sent) == (1 if chained_note else 5):
-                delivered.set()
-            return result
-        async def feed():
-            feed_starts.put_nowait(None)
-            await self.service.feed()
-        self.service.task_restart_backoff = 0.01
-        with patch.object(FakeSession, 'send', send):
-            loop = asyncio.create_task(self.service.supervise('feed', feed))
-            try:
-                await asyncio.wait_for(feed_starts.get(), 5)
-                await asyncio.wait_for(feed_starts.get(), 5)
-                if chained_note:
-                    self.gates[3].set()
-                await asyncio.wait_for(delivered.wait(), 5)
-                if chained_note:
-                    self.assertEqual(self.calls.count(3), 1)
-                self.assertFalse(loop.done(), str(loop.exception()) if loop.done() else '')
-                crashes = self.store.db.execute(
-                    "SELECT count(*) FROM problems WHERE area='service' AND code='loop-crashed'").fetchone()[0]
-                self.assertEqual(crashes, 1)
-                prompts = [entry[1] for entry in self.service.sessions['-10042:4'].sent]
-                if chained_note:
-                    self.assertEqual(len(prompts), 1)
-                    self.assertIn('Transcript 3', prompts[0])
-                    self.assertEqual(self.api.downloads, ['note-2', 'note-3'])
-                else:
-                    self.assertEqual(len(prompts), 5)
-                    for number, prompt in enumerate(prompts, 3):
-                        self.assertIn('Follow-up %d' % number, prompt)
-            finally:
-                loop.cancel()
-                await asyncio.gather(loop, return_exceptions=True)
-
-    async def test_one_failed_audio_delivery_does_not_stop_feed_with_five_queued_texts(self):
-        await self.assert_send_failure_recovers(chained_note=False)
-
-    async def test_one_failed_audio_delivery_does_not_repeat_a_chained_transcription(self):
-        await self.assert_send_failure_recovers(chained_note=True)

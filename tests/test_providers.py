@@ -1,13 +1,20 @@
 import asyncio
+import importlib.util
+from dataclasses import asdict
 import json
 import os
+import sqlite3
 from pathlib import Path
 import tempfile
+import subprocess
+import sys
 import unittest
 import uuid
 from unittest.mock import AsyncMock, patch
 
-from coordinator.providers import ProviderRunner
+from coordinator import host_os
+from coordinator.extension import available
+from coordinator.providers import ProviderRunner, retry_locked
 from coordinator.accounts import AccountBroker
 from coordinator.store import Store
 
@@ -28,13 +35,17 @@ class ProviderTestsSupport:
         environment.start()
         self.addCleanup(environment.stop)
         overrides = self.root / 'local-overrides.json'
-        overrides.write_text(json.dumps({'shared_mcp_servers': ['example-mcp', 'other-mcp']}))
+        overrides.write_text('{}')
         selection = patch('coordinator.accounts.LOCAL_OVERRIDES_PATH', overrides)
         selection.start()
         self.addCleanup(selection.stop)
         self.binary = self.root / 'fake'
         self.sid = str(uuid.uuid4())
         self.store = Store(self.root / 'state')
+        self.store.put('chat_config:home', {'mcp_servers': ['example-mcp', 'other-mcp']})
+        probe = patch('coordinator.providers.codex_inherited', new_callable=AsyncMock, return_value={})
+        probe.start()
+        self.addCleanup(probe.stop)
         self.profile = self.root / 'profile'
         self.profile.mkdir()
         self.store.put('accounts', {'profile': {'config_dir': str(self.profile), 'enabled': True}})
@@ -43,6 +54,11 @@ class ProviderTestsSupport:
         self.broker = AccountBroker(self.store)
         self.runner = ProviderRunner(self.root / 'state', binaries={'claude': str(self.binary), 'codex': str(self.binary)},
                                      account_broker=self.broker)
+        if importlib.util.find_spec('coordinator.worker_hooks'):
+            trust = patch('coordinator.worker_hooks.codex_trust_override', new_callable=AsyncMock,
+                          return_value='hooks.state."fixture".trusted_hash="sha256:fixture"')
+            trust.start()
+            self.addCleanup(trust.stop)
 
     def tearDown(self):
         self.store.close()
@@ -61,6 +77,7 @@ class ProviderTestsSupport:
         self.binary.chmod(0o700)
 
     async def run_provider(self, provider='claude', fresh=False, **kw):
+        kw.setdefault('topic', 'home')
         if provider == 'claude':
             kw.setdefault('account_alias', 'profile')
         return await self.runner.run(provider, 'private-prompt', self.root, None if fresh else self.sid, fresh=fresh, **kw)
@@ -82,8 +99,136 @@ print(json.dumps({'type':'result','subtype':'success','session_id':%r,'result':'
 
 
 class ProviderTests(ProviderTestsSupport, unittest.IsolatedAsyncioTestCase):
+    async def test_claude_worker_installs_account_hook_and_keeps_existing(self):
+        settings = self.profile / 'settings.json'
+        existing = {'matcher': 'Bash', 'hooks': [{'type': 'command', 'command': 'existing-guard'}]}
+        settings.write_text(json.dumps({'hooks': {'PreToolUse': [existing]}}))
+        self.fake([{'type': 'result', 'subtype': 'success', 'session_id': self.sid, 'result': 'done'}])
+        result = await asyncio.wait_for(self.run_provider(worker_id=12), 15)
+        self.assertTrue(result.success, result.error)
+        hooks = json.loads(settings.read_text())['hooks']['PreToolUse']
+        self.assertEqual(hooks[0], existing)
+        self.assertEqual(hooks[1]['matcher'], 'Bash|Read|Grep' + ('|Write' if available('docs') else ''))
+        self.assertIn('secret_guard.py', hooks[1]['hooks'][0]['command'])
+
+    async def test_retry_rolls_back_stale_snapshot(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = Store(Path(directory))
+            other = sqlite3.connect(str(Path(directory) / 'state.sqlite'), timeout=0.2)
+            try:
+                store.db.execute('BEGIN')
+                store.db.execute('SELECT count(*) FROM settings').fetchone()
+                other.execute("INSERT INTO settings(key,value) VALUES ('retry-test','1')")
+                other.commit()
+                def write():
+                    store.db.execute("INSERT INTO settings(key,value) VALUES ('retry-test-2','2')")
+                await asyncio.wait_for(retry_locked(write, retry_store=store), 5)
+                self.assertIsNotNone(store.db.execute("SELECT * FROM settings WHERE key='retry-test-2'").fetchone())
+                self.assertIsNotNone(store.db.execute("SELECT * FROM problems WHERE code='db-locked'").fetchone())
+            finally:
+                other.close()
+                store.db.close()
+
+    async def test_retry_stops_after_deadline(self):
+        def locked():
+            raise sqlite3.OperationalError('database is locked')
+        with patch('coordinator.providers.LOCK_RETRY_SECONDS', 0):
+            with self.assertRaises(sqlite3.OperationalError):
+                await retry_locked(locked)
+
+    async def test_worker_exit_reaps_pipe_holding_child_without_reporting(self):
+        from coordinator.host import alive
+        pidfile = self.root / 'child.pid'
+        self.binary.write_text('''#!/usr/bin/env python3
+import json,subprocess,sys
+from pathlib import Path
+sys.stdin.read()
+child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])
+Path(%r).write_text(str(child.pid))
+print(json.dumps({'type': 'result', 'subtype': 'success', 'session_id': %r, 'result': 'finished'}), flush=True)
+''' % (str(pidfile), self.sid))
+        self.binary.chmod(0o700)
+        result = await asyncio.wait_for(self.run_provider(worker_id=12), 10)
+        self.assertTrue(result.success, result.error)
+        self.assertEqual(result.text, 'finished')
+        self.assertFalse(alive(int(pidfile.read_text())))
+
+    async def test_background_reap_reporting_and_empty_run(self):
+        cases = [('claude', True, False), ('claude', False, False), ('codex', True, False)]
+        if host_os.macos():
+            cases.append(('claude', True, True))
+        for provider, spawn, detached in cases:
+            with self.subTest(provider=provider, spawn=spawn, detached=detached):
+                pidfile = self.root / ('child-%s-%s-%s' % (provider, spawn, detached))
+                self.binary.write_text('''#!/usr/bin/env python3
+import json,subprocess,sys
+from pathlib import Path
+sys.stdin.read()
+if %r:
+    child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'],
+        stdin=subprocess.DEVNULL, stdout=None, stderr=subprocess.DEVNULL,
+        start_new_session=%r)
+    Path(%r).write_text(str(child.pid))
+events = %r
+for event in events:
+    print(json.dumps(event),flush=True)
+''' % (spawn, detached, str(pidfile),
+       ([{'type': 'result', 'subtype': 'success', 'session_id': self.sid, 'result': 'finished'}]
+        if provider == 'claude' else [{'type': 'thread.started', 'thread_id': self.sid},
+              {'type': 'item.completed', 'item': {'type': 'agent_message', 'text': 'finished'}},
+              {'type': 'turn.completed'}])))
+                self.binary.chmod(0o700)
+                result = await asyncio.wait_for(self.run_provider(provider=provider, worker_id=12), 25)
+                self.assertTrue(result.success, result.error)
+                self.assertEqual(result.text, 'finished')
+                if spawn:
+                    pid = pidfile.read_text()
+                    self.assertEqual(result.failure_code, 'background_killed')
+                    self.assertIn(pid, result.failure_detail)
+                    self.assertIn(' -c ', result.failure_detail)
+                    state = subprocess.run(['/bin/ps', '-p', pid, '-o', 'stat='],
+                                           capture_output=True, text=True).stdout.strip()
+                    self.assertTrue(not state or state.startswith('Z'), state)
+                    with self.store.db:
+                        self.store.db.execute('INSERT INTO topics(id,chat,thread,name,cwd,enabled) VALUES (?,?,?,?,?,1)',
+                                              (pid, -100, int(pid), 'Test', str(self.root)))
+                        task = self.store.task_create(pid, 'Work', worktree=str(self.root))
+                        worker = self.store.db.execute('''INSERT INTO workers
+                            (task,topic,provider,prompt,cwd,workspace,created,updated)
+                            VALUES (?,?,?,?,?,?,1,1)''',
+                            (task['id'], pid, provider, 'work', str(self.root), '{}')).lastrowid
+                    message = self.store.worker_complete(worker, asdict(result))
+                    payload = json.loads(message['text'])
+                    self.assertEqual(payload['failure_code'], 'background_killed')
+                    self.assertIn(pid, payload['failure_detail'])
+                    self.assertTrue(payload['success'])
+                    self.assertEqual(payload['text'], 'finished')
+                else:
+                    self.assertIsNone(result.failure_code)
+                    self.assertIsNone(result.failure_detail)
+
+    async def test_background_reap_preserves_codex_failure_detail(self):
+        for quota in (False, True):
+            with self.subTest(quota=quota):
+                error = {'detail': 'original detail'}
+                if quota:
+                    error['codex_error_info'] = 'usage_limit_exceeded'
+                self.binary.write_text('''#!/usr/bin/env python3
+import json,subprocess,sys
+sys.stdin.read()
+subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+print(json.dumps({'type': 'thread.started', 'thread_id': %r}), flush=True)
+print(json.dumps({'type': 'turn.failed', 'error': %r}), flush=True)
+''' % (self.sid, error))
+                self.binary.chmod(0o700)
+                result = await asyncio.wait_for(self.run_provider('codex', worker_id=12), 25)
+                self.assertFalse(result.success)
+                self.assertEqual(result.failure_code, 'quota_limited' if quota else 'background_killed')
+                self.assertIn('original detail', result.failure_detail)
+                self.assertIn('background_killed:', result.failure_detail)
+
     async def test_c5_workers_never_receive_topic_management_tools(self):
-        (self.root / 'local-overrides.json').write_text('{}')
+        self.store.put('chat_config:home', {'mcp_servers': []})
         self.fake([{'type': 'result', 'subtype': 'success', 'session_id': self.sid, 'result': 'done'}])
         for provider in ('claude', 'codex'):
             with self.subTest(provider=provider):
@@ -95,7 +240,8 @@ class ProviderTests(ProviderTestsSupport, unittest.IsolatedAsyncioTestCase):
                 spec = json.loads((Path(result.log_path).parent / 'spec.json').read_text())
                 args = spec['argv']
                 self.assertFalse(any('mcp_servers.torii' in arg or arg in ('topic_create', 'topic_close', 'model_parent') for arg in args))
-                self.assertNotIn('--mcp-config', args)
+                if provider == 'claude':
+                    self.assertEqual(args[args.index('--mcp-config') + 1], '{"mcpServers":{}}')
 
     async def test_claude_resume_and_structured(self):
         self.fake([{'type':'result','subtype':'success','session_id':self.sid,'result':'done','structured_output':{'action':'report'}}])
@@ -113,6 +259,16 @@ class ProviderTests(ProviderTestsSupport, unittest.IsolatedAsyncioTestCase):
         self.assertEqual(json.loads(argv[argv.index('--settings') + 1]), {'ultracode': False,
             'claudeMdExcludes': [str(parent / name) for parent in Path.home().parents
                                 for name in ('CLAUDE.md', 'CLAUDE.local.md', '.claude/CLAUDE.md')]})
+
+    async def test_claude_worker_settings_carry_plugin_switches(self):
+        for plugins in (None, {'pstack@pstack-claude': True, 'other@market': False}):
+            with self.subTest(plugins=plugins):
+                self.fake([{'type': 'result', 'subtype': 'success', 'session_id': self.sid, 'result': 'done'}])
+                result = await self.run_provider(plugins=plugins)
+                self.assertTrue(result.success, result.error)
+                argv = json.loads(Path(result.log_path).read_text().splitlines()[0])['argv']
+                settings = json.loads(argv[argv.index('--settings') + 1])
+                self.assertEqual(settings.get('enabledPlugins'), plugins)
 
     async def test_claude_worker_launches_with_shared_mcp_on_fresh_and_resume(self):
         home = self.root / 'home'
@@ -142,6 +298,7 @@ print(json.dumps({'type':'result','subtype':'success','session_id':sid,'result':
                 spec = json.loads((host / 'spec.json').read_text())
                 shared_mcp_path = Path(spec['argv'][-1])
                 self.assertEqual(spec['argv'][-2], '--mcp-config')
+                self.assertNotIn('--strict-mcp-config', spec['argv'])
                 self.assertEqual(shared_mcp_path.parent, self.store.directory)
                 for path in host.iterdir():
                     if path.is_file():
@@ -151,6 +308,20 @@ print(json.dumps({'type':'result','subtype':'success','session_id':sid,'result':
         self.assertNotIn(value, json.dumps([tuple(row) for row in self.store.db.execute(
             'SELECT * FROM problems')]))
         self.assertNotIn(value, ''.join(self.store.db.iterdump()))
+
+    async def test_claude_worker_uses_only_its_topic_selection(self):
+        self.store.put('chat_config:home', {'mcp_servers': ['example-mcp']})
+        self.store.put('chat_config:other', {'mcp_servers': ['other-mcp']})
+        self.fake([{'type': 'result', 'subtype': 'success', 'session_id': self.sid, 'result': 'done'}])
+        selected = await self.run_provider()
+        self.assertTrue(selected.success, selected.error)
+        args = json.loads((Path(selected.log_path).parent / 'spec.json').read_text())['argv']
+        config = json.loads(Path(args[args.index('--mcp-config') + 1]).read_text())
+        self.assertEqual(list(config['mcpServers']), ['example-mcp'])
+        empty = await self.run_provider(topic='empty')
+        self.assertTrue(empty.success, empty.error)
+        args = json.loads((Path(empty.log_path).parent / 'spec.json').read_text())['argv']
+        self.assertEqual(json.loads(args[args.index('--mcp-config') + 1]), {'mcpServers': {}})
 
     async def test_codex_does_not_get_shared_mcp_config(self):
         home = self.root / 'home'
@@ -168,12 +339,12 @@ print(json.dumps({'type':'result','subtype':'success','session_id':sid,'result':
         self.assertNotIn('--mcp-config', codex_args)
 
     async def test_default_worker_omits_shared_config(self):
-        (self.root / 'local-overrides.json').write_text('{}')
+        self.store.put('chat_config:home', {'mcp_servers': []})
         self.fake([{'type': 'result', 'subtype': 'success', 'session_id': self.sid, 'result': 'done'}])
         result = await self.run_provider()
         self.assertTrue(result.success, result.error)
         args = json.loads((Path(result.log_path).parent / 'spec.json').read_text())['argv']
-        self.assertNotIn('--mcp-config', args)
+        self.assertEqual(args[args.index('--mcp-config') + 1], '{"mcpServers":{}}')
         self.assertEqual(self.store.db.execute('SELECT count(*) FROM problems').fetchone()[0], 0)
 
     async def test_missing_and_invalid_shared_mcp_source_omit_stale_config(self):
@@ -188,7 +359,7 @@ print(json.dumps({'type':'result','subtype':'success','session_id':sid,'result':
         for result in (missing, invalid):
             self.assertTrue(result.success, result.error)
             args = json.loads((Path(result.log_path).parent / 'spec.json').read_text())['argv']
-            self.assertNotIn('--mcp-config', args)
+            self.assertEqual(args[args.index('--mcp-config') + 1], '{"mcpServers":{}}')
         self.assertEqual([tuple(row) for row in self.store.db.execute(
             "SELECT area,code,detail FROM problems WHERE area='shared-mcp' ORDER BY id")], [
             ('shared-mcp', 'source-missing',
@@ -348,6 +519,18 @@ print(json.dumps({'type':'result','session_id':sid,'subtype':'error_during_execu
         self.assertFalse(result.success)
         with self.assertRaises(ProcessLookupError):
             os.kill(pids[0], 0)
+
+    async def test_locked_event_ack_retries_without_stopping_worker(self):
+        self.fake([{'type': 'result', 'subtype': 'success', 'session_id': self.sid, 'result': 'done'}])
+        calls = []
+        def on_seq(seq):
+            calls.append(seq)
+            if len(calls) == 1:
+                raise sqlite3.OperationalError('database is locked')
+        result = await asyncio.wait_for(self.run_provider(worker_id=12, on_seq=on_seq), 10)
+        self.assertTrue(result.success, result.error)
+        self.assertEqual(result.text, 'done')
+        self.assertEqual(calls[:2], [calls[0], calls[0]])
 
     async def test_transport_token_not_inherited(self):
         from unittest.mock import patch

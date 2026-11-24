@@ -18,6 +18,8 @@ from tests.test_group_setup import group_update, pair_group, GroupTelegram
 
 ROOT = Path(__file__).resolve().parents[1]
 INSTALLER = runpy.run_path(str(ROOT / 'scripts/setup.py'))
+from coordinator import host_os
+
 SERVICE_INSTALLER = runpy.run_path(str(ROOT / 'scripts/install-service.py'))
 
 
@@ -49,7 +51,7 @@ class SetupPrerequisiteTests(unittest.TestCase):
         self.addCleanup(run.stop)
 
     def test_codex_without_helper_stops_setup_with_the_repair(self):
-        with patch.dict(os.environ, {'PATH': str(self.binary.parent)}), patch('sys.platform', 'darwin'):
+        with patch.dict(os.environ, {'PATH': str(self.binary.parent)}), patch.object(host_os, 'SYSTEM', 'darwin'):
             rows, fatal = INSTALLER['check_prereqs']()
         self.assertTrue(fatal)
         self.assertIn('optional', dict(rows)['Claude CLI'])
@@ -61,7 +63,7 @@ class SetupPrerequisiteTests(unittest.TestCase):
         helper = self.binary.parent / 'codex-code-mode-host'
         helper.write_text('#!/bin/sh\nexit 0\n')
         helper.chmod(0o700)
-        with patch.dict(os.environ, {'PATH': str(self.binary.parent)}), patch('sys.platform', 'darwin'):
+        with patch.dict(os.environ, {'PATH': str(self.binary.parent)}), patch.object(host_os, 'SYSTEM', 'darwin'):
             rows, fatal = INSTALLER['check_prereqs']()
         self.assertFalse(fatal)
         self.assertEqual(dict(rows)['Codex CLI'], 'ok')
@@ -103,25 +105,22 @@ class SetupInstallerTests(SetupInstallerTestsSupport, unittest.IsolatedAsyncioTe
             await asyncio.create_subprocess_exec('/usr/bin/security')
 
     async def test_service_start_check_success_and_launchd_denial(self):
-        globals_ = SERVICE_INSTALLER['wait_for_start'].__globals__
-        with patch.dict(globals_, service_running=Mock(side_effect=[False, True])), \
-                patch('time.sleep'), patch('subprocess.run', side_effect=AssertionError('No launchctl on success')):
-            SERVICE_INSTALLER['wait_for_start'](self.root / 'state', 'gui/7', 'local.test', timeout=2)
+        with patch('time.sleep'), patch('subprocess.run', side_effect=AssertionError('No launchctl on success')):
+            host_os.wait_for_launchd_start(self.root / 'state', 'gui/7', 'local.test', Mock(side_effect=[False, True]), timeout=2)
         launchd = SimpleNamespace(returncode=0, stdout='pid = 123\nlast exit code = 78\n')
         with patch('subprocess.run', side_effect=[launchd, SimpleNamespace(returncode=0)]) as run:
             with self.assertRaisesRegex(ValueError, 'did not start.*Last exit status: 78'):
-                SERVICE_INSTALLER['wait_for_start'](self.root / 'state', 'gui/7', 'local.test', timeout=0)
+                host_os.wait_for_launchd_start(self.root / 'state', 'gui/7', 'local.test', Mock(), timeout=0)
         self.assertEqual(run.call_args.args[0], ['launchctl', 'bootout', 'gui/7/local.test'])
         with patch('subprocess.run', side_effect=[launchd, SimpleNamespace(returncode=0)]):
             with self.assertRaisesRegex(ValueError, 'external drives.*run scripts/run-service.sh'):
-                SERVICE_INSTALLER['wait_for_start'](Path('/Volumes/Torii/state'),
-                                                    'gui/7', 'local.test', timeout=0)
+                host_os.wait_for_launchd_start(Path('/Volumes/Torii/state'),
+                                                    'gui/7', 'local.test', Mock(), timeout=0)
 
     async def test_install_checks_bootstrap_result_before_success_message(self):
-        globals_ = SERVICE_INSTALLER['install'].__globals__
         checked = Mock()
-        with patch.dict(globals_, unload=Mock(), wait_for_start=checked), \
-                patch('coordinator.host_os.linux', return_value=False), patch('sys.platform', 'darwin'), \
+        with patch.object(host_os, 'unload_launchd'), patch.object(host_os, 'wait_for_launchd_start', checked), \
+                patch.object(host_os, 'SYSTEM', 'darwin'), \
                 patch('subprocess.run', return_value=SimpleNamespace(returncode=0)) as run, \
                 redirect_stdout(io.StringIO()) as out:
             SERVICE_INSTALLER['install'](True)
@@ -244,7 +243,7 @@ class SetupInstallerTests(SetupInstallerTestsSupport, unittest.IsolatedAsyncioTe
                 no_external(argv)
             return SimpleNamespace(returncode=0)
         with patch('shutil.which', side_effect=lambda name: '/fake/claude' if name == 'claude' else None), \
-                patch('subprocess.run', side_effect=fake_run), patch('sys.platform', 'darwin'):
+                patch('subprocess.run', side_effect=fake_run), patch.object(host_os, 'SYSTEM', 'darwin'):
             rows, fatal = INSTALLER['check_prereqs']()
             self.assertFalse(fatal)
             self.assertIn('optional', dict(rows)['Codex CLI'])
@@ -252,13 +251,13 @@ class SetupInstallerTests(SetupInstallerTestsSupport, unittest.IsolatedAsyncioTe
                 self.assertTrue(INSTALLER['check_prereqs']()[1])
             with patch('shutil.which', return_value=None):
                 self.assertTrue(INSTALLER['check_prereqs']()[1])
-            with patch('sys.platform', 'linux'), patch('os.getuid', return_value=0):
+            with patch.object(host_os, 'SYSTEM', 'linux'), patch('os.getuid', return_value=0):
                 self.assertTrue(INSTALLER['check_prereqs']()[1])
 
     def test_codex_alone_meets_prerequisites(self):
         with patch('shutil.which', side_effect=lambda name: '/fake/codex' if name == 'codex' else None), \
                 patch('subprocess.run', return_value=SimpleNamespace(returncode=0)), \
-                patch('sys.platform', 'darwin'):
+                patch.object(host_os, 'SYSTEM', 'darwin'):
             self.assertFalse(INSTALLER['check_prereqs']()[1])
 
     async def test_hidden_token_storage_reuse_and_webhook_refusal(self):
@@ -314,7 +313,7 @@ class SetupInstallerTests(SetupInstallerTestsSupport, unittest.IsolatedAsyncioTe
     async def test_open_link_uses_platform_display_and_always_prints_fallback(self):
         opener = INSTALLER['open_group_link']
         for platform, display, expected in (('darwin', '', 'open'), ('linux', ':0', 'xdg-open'), ('linux', '', None)):
-            with patch('sys.platform', platform), patch.dict(os.environ, {'DISPLAY': display, 'WAYLAND_DISPLAY': ''}, clear=True), \
+            with patch.object(host_os, 'SYSTEM', platform), patch.dict(os.environ, {'DISPLAY': display, 'WAYLAND_DISPLAY': ''}, clear=True), \
                     patch('subprocess.run', return_value=SimpleNamespace(returncode=0)) as run, patch('builtins.input', return_value=''), redirect_stdout(io.StringIO()) as out:
                 opener('test_bot', 'fake-link-code')
             self.assertIn('https://t.me/test_bot?startgroup=fake-link-code&admin=manage_topics+delete_messages+pin_messages', out.getvalue())
@@ -326,7 +325,7 @@ class SetupInstallerTests(SetupInstallerTestsSupport, unittest.IsolatedAsyncioTe
     async def test_open_link_uses_browsers_single_executable_when_set(self):
         opener = INSTALLER['open_group_link']
         browser = '/path with spaces/browser'
-        with patch('sys.platform', 'darwin'), patch.dict(os.environ, {'BROWSER': browser}, clear=True), \
+        with patch.object(host_os, 'SYSTEM', 'darwin'), patch.dict(os.environ, {'BROWSER': browser}, clear=True), \
                 patch('subprocess.run', return_value=SimpleNamespace(returncode=0)) as run, patch('builtins.input', return_value=''), redirect_stdout(io.StringIO()) as out:
             opener('test_bot', 'fake-link-code')
         self.assertEqual(run.call_args.args[0], [browser, 'https://t.me/test_bot?startgroup=fake-link-code&admin=manage_topics+delete_messages+pin_messages'])

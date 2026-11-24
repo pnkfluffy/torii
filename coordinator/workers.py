@@ -10,8 +10,9 @@ import re
 import time
 import uuid
 
-from . import extension, problems, opencode_accounts, process_ownership, worker_storage
+from . import extension, moves, problems, opencode_accounts, process_ownership, worker_storage
 from .accounts import LIMIT_CONTINUATION
+from .claude_settings import plugin_switches
 from .codex_accounts import CODEX_SKILLS_POINTER, CodexBroker, limit_windows
 from .envelopes import SecretsPending, declared, load_for_worker, record_use
 from .failures import TaskFailure, failure_state, internal_detail
@@ -20,20 +21,12 @@ from .native_protocol import RunControl, steer_wire
 from .providers import RunResult
 from .usage_notice import clear_unknown_limit_notice, queue_limit_notice
 from .opencode_runtime import OpenCodeBroker
-from .muse_accounts import MuseBroker
-from . import muse_runtime
-from .control_api import WORKER_PROVIDERS, Refused
-from .policy import DELETION_POLICY, JOB_STORAGE_POLICY, worker_usage_policy
 
-WORKER_POLICY = """This work comes from the sole authorized owner through Telegram.
-Follow this repository's AGENTS.md and installed workflow instructions. Report changes,
-checks actually run, artifacts, blockers, and remaining work. Preserve native history.
-The coordinator handles Telegram delivery. Never access the bot token.
-When resuming interrupted work, inspect actual state before repeating effects.
-Credentials arrive only as environment variables named in the task instructions.
-Never print, echo, log, write, commit, or report their values.
-Ending your turn ends your work, so do not stop to post a status update; keep working and wait for what you started until the task is done or truly blocked, then give one final report.
-""" + extension.active().worker_policy + "\n" + DELETION_POLICY + "\n" + JOB_STORAGE_POLICY
+antigravity_accounts = extension.optional('antigravity_accounts')
+antigravity_runtime = extension.optional('antigravity_runtime')
+usage_events = extension.optional('usage_events')
+from .adapters import CAPS
+from .control_api import BRIEF_LIMIT, WORKER_PROVIDERS, Refused
 
 RESTART_CONTINUATION = ('You were interrupted by a Torii restart and are being resumed. '
                         'Inspect your prior progress before continuing. Check actual state before repeating '
@@ -45,68 +38,137 @@ STEER_PREFIX = 'torii-v2-control-'
 STEER_OPS = ('workers.steer', 'workers.goal')
 
 
+STEER_SEPARATOR = '\n\nFollow-up:\n'
+STEER_ELISION = '\n\n[Earlier steers omitted.]'
+LOG_WARNING_BYTES = 200 * 1024 * 1024
+
+
+def remember_steer(store, worker, prompt, request):
+    row = store.db.execute('SELECT * FROM worker_briefs WHERE worker=?', (worker['id'],)).fetchone()
+    original = row['original'] if row else worker['prompt']
+    steers = json.loads(row['steers']) if row else []
+    if any(item['request'] == request for item in steers):
+        return
+    steers.append({'request': request, 'text': prompt})
+    if worker['task'] is not None:
+        from .records import add_refs, folder_refs
+        add_refs(store, worker['task'], folder_refs(prompt))
+    elided = bool(row and row['elided'])
+    size = sum(len(STEER_SEPARATOR) + len(item['text']) for item in steers)
+    while len(steers) > 1 and size + (len(STEER_ELISION) if elided else 0) > BRIEF_LIMIT:
+        size -= len(STEER_SEPARATOR) + len(steers.pop(0)['text'])
+        elided = True
+    if size + (len(STEER_ELISION) if elided else 0) > BRIEF_LIMIT:
+        elided = True
+        steers[-1]['text'] = steers[-1]['text'][-(BRIEF_LIMIT - len(STEER_ELISION) - len(STEER_SEPARATOR)):]
+    store.db.execute("""INSERT INTO worker_briefs(worker,original,steers,elided) VALUES (?,?,?,?)
+        ON CONFLICT(worker) DO UPDATE SET steers=excluded.steers,elided=excluded.elided""",
+        (worker['id'], original, json.dumps(steers), int(elided)))
+
+
+def continuation_brief(store, worker):
+    row = store.db.execute('SELECT * FROM worker_briefs WHERE worker=?', (worker['id'],)).fetchone()
+    if row is None:
+        return worker['prompt']
+    return (row['original'] + (STEER_ELISION if row['elided'] else '') +
+            ''.join(STEER_SEPARATOR + item['text'] for item in json.loads(row['steers'])))
+
+
 def _opencode_account_available(store):
     alias = store.get('opencode_active_account')
     accounts = store.get('opencode_accounts', {}) or {}
     return bool(alias and isinstance(accounts.get(alias), dict))
 
 
-SPAWN_REFUSALS = {
-    'opencode': ('OpenCode', _opencode_account_available, 'No OpenCode account is active.'),
-    'muse': ('Muse', lambda store: MuseBroker(store).available(), 'No Muse account is signed in.'),
-}
+def _opencode_refusal(store, model):
+    if not _opencode_account_available(store):
+        return 'No OpenCode account is active.'
+    alias = opencode_accounts.active(store)
+    try:
+        opencode_accounts.check_key(alias)
+    except Refused as error:
+        return str(error)
+    if model is not None and model != opencode_accounts.accounts(store)[alias].get('model'):
+        return 'OpenCode model must match the active account.'
+    return None
+
+
+def _antigravity_refusal(store, model):
+    if not antigravity_accounts.AntigravityBroker(store).capacity(None):
+        return 'No Antigravity account is signed in and available.'
+    return antigravity_accounts.model_refusal(store, model)
+
+
+ACCOUNT_REFUSALS = {'opencode': _opencode_refusal, 'antigravity': _antigravity_refusal}
 
 
 def spawn_refusal(store, provider, task, goal=None, model=None, *, fresh=True):
-    rule = SPAWN_REFUSALS.get(provider)
-    if rule is None:
+    caps = CAPS.get(provider)
+    if caps is None or not caps.switched or provider not in WORKER_PROVIDERS:
         return None
-    label, account_available, account_refusal = rule
     if store.get(provider + '_enabled', False) is not True:
-        return label + ' workers are off.'
-    if goal is not None:
-        return label + " workers don't take goals. Use Claude or Codex."
-    if any(declared(entry)[0] for entry in task['secrets']):
-        return label + " workers don't take vault secrets. Use a Claude worker."
-    if provider == 'opencode' and not fresh:
+        return caps.label + ' workers are off.'
+    if goal is not None and caps.goals is None:
+        return caps.label + " workers don't take goals. Use Claude or Codex."
+    if not caps.secrets and any(declared(entry)[0] for entry in task['secrets']):
+        return caps.label + " workers don't take vault secrets. Use a Claude worker."
+    if not fresh:
         return None
-    if provider == 'muse':
-        if not fresh:
-            return 'Muse workers require a fresh session until resume is supported.'
-        if model is not None and model not in muse_runtime.MODELS:
-            return 'Muse model is unavailable.'
-        try:
-            MuseBroker(store).run_ready()
-        except Refused as error:
-            return str(error)
-    if not account_available(store):
-        return account_refusal
-    if provider == 'opencode':
-        alias = opencode_accounts.active(store)
-        try:
-            opencode_accounts.check_key(alias)
-        except Refused as error:
-            return str(error)
-        if model is not None and model != opencode_accounts.accounts(store)[alias].get('model'):
-            return 'OpenCode model must match the active account.'
-    return None
+    return ACCOUNT_REFUSALS[provider](store, model)
 
 
 def host_directory(state_dir, worker):
     return Path(state_dir) / 'hosts' / (worker['host'] or 'worker-' + str(worker['id']))
 
 
+def log_sizes(store, rows):
+    from .session_storage import home_for, launch_spec, session_files
+    sizes = []
+    for worker in rows:
+        if worker['provider'] not in ('claude', 'codex') or not worker['session']:
+            continue
+        spec = launch_spec(host_directory(store.directory, worker) / 'spec.json')
+        home = home_for(worker['provider'], spec.get('env') or {})
+        if not home:
+            continue
+        root = Path(home) / ('projects' if worker['provider'] == 'claude' else 'sessions')
+        try:
+            files = session_files({'provider': worker['provider'], 'session': worker['session'],
+                                   'root': str(root.resolve())})
+        except (OSError, ValueError):
+            continue
+        if files:
+            sizes.append((worker['id'], worker['topic'], files[0]['bytes']))
+    return sizes
+
+
+def warn_log_sizes(store, sizes):
+    seen = store.get('worker_log_warning_steps', {}) or {}
+    for worker, topic, size in sizes:
+        if not store.db.execute("SELECT 1 FROM workers WHERE id=? AND topic=? AND status='running'",
+                                (worker, topic)).fetchone():
+            continue
+        step = size // LOG_WARNING_BYTES
+        key = str(worker)
+        if step and step > seen.get(key, 0):
+            with store.db:
+                store.enqueue_report(topic, "worker %d's log is %d MB, likely printing huge output" %
+                                     (worker, size // (1024 * 1024)))
+                seen[key] = step
+                store.put('worker_log_warning_steps', seen)
+
+
 def can_resume_finished(store, worker):
-    if worker['provider'] == 'muse':
+    caps = CAPS.get(worker['provider'])
+    if caps and caps.switched and store.get(worker['provider'] + '_enabled', False) is not True:
         return False
-    if worker['provider'] == 'opencode' and store.get('opencode_enabled', False) is not True:
+    if not (worker['provider'] in WORKER_PROVIDERS and worker['status'] == 'done'
+            and bool(worker['session']) and not worker['fresh'] and store.db.execute(
+                "SELECT 1 FROM tasks WHERE id=? AND status='open'", (worker['task'],)).fetchone() is not None):
         return False
-    auto = store.get('auto_resume', False) is True
-    if not (worker['provider'] in WORKER_PROVIDERS and worker['status'] in (('done', 'interrupted') if auto else ('done',))
-            and bool(worker['session']) and not worker['fresh'] and store.db.execute('''SELECT 1 FROM tasks
-                WHERE id=? AND (status='open' OR (? AND status='interrupted')) AND NOT EXISTS (
-                    SELECT 1 FROM workers WHERE task=? AND id>?)''',
-                (worker['task'], auto, worker['task'], worker['id'])).fetchone() is not None):
+    if store.db.execute('''SELECT 1 FROM workers WHERE id<>? AND provider=? AND session=?
+            AND status IN ('queued','running','waiting_for_secret','waiting_for_quota') LIMIT 1''',
+            (worker['id'], worker['provider'], worker['session'])).fetchone():
         return False
     if store.db.execute('''SELECT 1 FROM session_deletions WHERE provider=? AND session=? LIMIT 1''',
                         (worker['provider'], worker['session'])).fetchone():
@@ -156,7 +218,7 @@ def _arrived(store, worker, wires):
                     found.add(event.get('uuid'))
                 elif event.get('type') == 'command_lifecycle' and event.get('state') == 'started':
                     found.add(event.get('command_uuid'))
-    if worker['provider'] == 'opencode':
+    if CAPS[worker['provider']].steer == 'queued':
         writes = host_directory(store.directory, worker) / 'writes.jsonl'
         if writes.is_file():
             with writes.open(errors='replace') as stream:
@@ -179,7 +241,7 @@ def reconcile_steers(store, worker_id):
     rows = [row for row in store.db.execute(
         "SELECT id,op,params,result,state FROM service_requests WHERE (state='uncertain' OR (state='done' AND ?)) "
         "AND op IN (%s) AND json_extract(params,'$.worker')=? ORDER BY id"
-        % ','.join('?' for _ in STEER_OPS), (worker['provider'] == 'opencode', *STEER_OPS, worker_id))
+        % ','.join('?' for _ in STEER_OPS), (CAPS[worker['provider']].steer == 'queued', *STEER_OPS, worker_id))
             if not (json.loads(row['result'] or '{}') or {}).get('noted')
             and (row['state'] == 'uncertain'
                  or (json.loads(row['result'] or '{}') or {}).get('receipt') == 'queued')]
@@ -192,7 +254,7 @@ def reconcile_steers(store, worker_id):
             store.service_request_settle(request_id, 'done', {'receipt': 'received', 'reconciled': True})
         elif worker['status'] not in ('queued', 'waiting_for_secret', 'running'):
             store.service_request_settle(request_id, 'uncertain', {'receipt': 'uncertain', 'noted': True})
-            code = 'steer-uncertain' if worker['provider'] == 'opencode' else 'steer-not-arrived'
+            code = 'steer-uncertain' if CAPS[worker['provider']].steer == 'queued' else 'steer-not-arrived'
             problems.record(store, 'worker', code, 'request=%s status=%s' % (
                 request_id, worker['status']), topic=worker['topic'], task=worker['task'], worker=worker_id)
             store.message_save(worker['topic'], 'callback',
@@ -220,7 +282,9 @@ class WorkerPool:
         self.accounts = accounts
         self.codex_accounts = codex_accounts or CodexBroker(store)
         self.brokers = {'claude': self.accounts, 'codex': self.codex_accounts,
-                        'opencode': OpenCodeBroker(store), 'muse': MuseBroker(store)}
+                        'opencode': OpenCodeBroker(store)}
+        if antigravity_accounts is not None:
+            self.brokers['antigravity'] = antigravity_accounts.AntigravityBroker(store)
         if hasattr(runner, 'opencode_store'):
             runner.opencode_store = store
             if store.get('opencode_binary'):
@@ -246,7 +310,7 @@ class WorkerPool:
         return self.brokers[provider]
 
     def requeue_lost_host(self, worker, *, stopped=False):
-        if (worker['provider'] not in ('claude', 'codex') or not worker['session'] or worker['fresh']
+        if (not (worker['provider'] in CAPS and CAPS[worker['provider']].requeue_lost) or not worker['session'] or worker['fresh']
                 or worker['id'] in self.stopping):
             return False
         host = HostClient(host_directory(self.store.directory, worker))
@@ -254,11 +318,14 @@ class WorkerPool:
                 or host.child_pid and alive(host.child_pid)):
             return False
         with self.store.db:
-            return bool(self.store.db.execute("""UPDATE workers SET status='queued',pid=NULL,last_seq=0,
+            requeued = bool(self.store.db.execute("""UPDATE workers SET status='queued',pid=NULL,last_seq=0,
                 result=json_set(COALESCE(result,'{}'),'$.restart_resume',1),updated=?
                 WHERE id=? AND status='running' AND host IS ? AND EXISTS (
                     SELECT 1 FROM tasks WHERE tasks.id=workers.task AND tasks.status='open')""",
                 (time.time(), worker['id'], worker['host'])).rowcount)
+        if requeued:
+            self.store.consumed.pop(worker['id'], None)
+        return requeued
 
     async def codex_attached(self, worker, topic, result, options, account_selected):
         """Record a reattached Codex run. With automatic switching on, a rejected thread resumes on the next account."""
@@ -280,16 +347,28 @@ class WorkerPool:
             record_use(self.store, used, worker['id'])
         options.update(attach=False, last_seq=0, fresh=False, on_account=account_selected)
         return await self.codex_accounts.run(
-            self.runner.run, 'codex', LIMIT_CONTINUATION + worker['prompt'], Path(worker['cwd']),
+            self.runner.run, 'codex', LIMIT_CONTINUATION + continuation_brief(self.store, worker), Path(worker['cwd']),
             result.session_id or worker['session'], notice_topic=topic['id'], **options)
+
+    def can_move(self, worker):
+        """Whether a waiting worker can run on another route now."""
+        task = self.store.task_get(worker['task']) if worker['task'] else None
+        return task is not None and moves.next_route(self, worker, task) is not None
+
+    def check_recovery(self):
+        """Clear the credit notice and send each provider's back notice once its outage ends."""
+        with self.store.db:
+            self.codex_accounts.check_credit_recovery()
+            return moves.check_recovery(self)
 
     def codex_waiting(self, worker, until):
         broker = self.codex_accounts
         reset = (' until ' + time.strftime('%Y-%m-%d %H:%M UTC', time.gmtime(until))
                  if isinstance(until, (int, float)) else '')
         if broker.automatic():
-            return ('Worker %d is waiting: every enabled Codex account is unavailable%s. Automatic switching is on. '
-                    'The worker resumes the same thread when an account becomes available.' % (worker['id'], reset))
+            return ('Worker %d is waiting: every enabled Codex account and every other route of its work are '
+                    'unavailable%s. Automatic switching is on. The worker continues on the first route that '
+                    'has capacity again.' % (worker['id'], reset))
         active = broker.active()
         label = broker.label(active) if active else 'none'
         state = ('is at its usage limit' if active and broker.signed_in(active) else 'is not signed in or is disabled')
@@ -375,16 +454,24 @@ class WorkerPool:
         env = spec.get('env') or {}
         return self.runner.extension.state(env) == 'detached'
 
-    async def run(self, worker, topic):
+    async def run(self, worker, topic, prompt_suffix='', moved=False):
+        """Run one launch of a worker. moved means this launch already moved it once, so it does not move again."""
         worker = self.get(worker['id'])
         if worker['provider'] not in self.brokers:
             return worker
         if worker['status'] not in ('queued', 'running', 'waiting_for_secret'):
             return worker
         attaching = worker['status'] == 'running'
+        if not attaching and not moved and worker['task']:
+            task = self.store.task_get(worker['task'])
+            entry = moves.next_route(self, worker, task) if task and task['status'] == 'open' else None
+            if entry is not None and moves.move(self, worker, entry):
+                worker = self.get(worker['id'])
+                moved = True
         previous_result = json.loads(worker['result'] or '{}')
         self.tasks[worker['id']] = asyncio.current_task()
         result = None
+        model = worker['model']
         cleanup_error = None
         try:
             task = self.store.task_get(worker['task']) if worker['task'] else None
@@ -393,18 +480,46 @@ class WorkerPool:
                     self.store.db.execute("""UPDATE workers SET status='interrupted',updated=?
                         WHERE id=? AND status IN ('queued','waiting_for_secret')""", (time.time(), worker['id']))
                 return self.get(worker['id'])
-            if not attaching and (not task or not task['worktree'] or not Path(task['worktree']).is_dir()):
+            workspace = json.loads(worker['workspace'] or '{}')
+            from .close_saves import scratch
+            scratch_worker = workspace.get('scratch') is True and worker['work'] == 'research'
+            if not attaching and workspace.get('pending_worktree') is True:
+                from .workspaces import prepare_task_workspace
+                try:
+                    if not task['worktree'] or not Path(task['worktree']).is_dir():
+                        workspace_store = {'store': self.store}
+                        if self.store.get('cow_worktrees', False) is True:
+                            workspace_store['cow'] = True
+                        created = await prepare_task_workspace(Path(topic['cwd']), self.store.directory, task['id'],
+                                                               saved_cwd=task['worktree'], **workspace_store)
+                        self.store.task_update(task['id'], worktree=created['cwd'])
+                        task = self.store.task_get(task['id'])
+                    worker['cwd'] = task['worktree']
+                    worker['workspace'] = json.dumps({'cwd': worker['cwd'], 'isolated': True})
+                    with self.store.db:
+                        self.store.db.execute('UPDATE workers SET cwd=?,workspace=? WHERE id=?',
+                                              (worker['cwd'], worker['workspace'], worker['id']))
+                except (OSError, RuntimeError, ValueError, asyncio.TimeoutError) as error:
+                    raise TaskFailure('The job worktree could not be created: ' + str(error),
+                                      'Use worktree.create before resuming.') from error
+            if not attaching and scratch_worker:
+                expected = str(scratch(self.store, task['id'], create=True))
+                if worker['cwd'] != expected or workspace.get('cwd') != expected:
+                    raise TaskFailure('Worker scratch folder differs from its job.', 'Inspect the saved job before resuming.')
+            if not attaching and not scratch_worker and (not task or not task['worktree'] or not Path(task['worktree']).is_dir()):
                 from .workspaces import prepare_task_workspace
                 try:
                     if not task or not task['worktree'] or not topic.get('cwd'):
                         raise ValueError('The saved job folder is unavailable')
-                    workspace_store = {'store': self.store} if self.store.get('close_clears_space', False) is True else {}
+                    workspace_store = {'store': self.store}
+                    if self.store.get('cow_worktrees', False) is True:
+                        workspace_store['cow'] = True
                     await prepare_task_workspace(Path(topic['cwd']), self.store.directory, task['id'],
                                                  saved_cwd=task['worktree'], **workspace_store)
                 except (OSError, RuntimeError, ValueError, asyncio.TimeoutError) as error:
                     raise TaskFailure('The job worktree is unavailable. Use worktree.create to restore it: ' + str(error),
                                       'Use worktree.create before resuming.') from error
-            if not attaching and worker['cwd'] != task['worktree']:
+            if not attaching and not scratch_worker and worker['cwd'] != task['worktree']:
                 raise TaskFailure('Worker folder differs from its job worktree.', 'Inspect the saved job before resuming.')
             if not attaching:
                 saved_subscription = (worker['provider'] == 'opencode' and
@@ -416,7 +531,7 @@ class WorkerPool:
             broker = self.broker(worker['provider'])
             if attaching and not worker.get('account_alias'):
                 spec = json.loads((host_directory(self.store.directory, worker) / 'spec.json').read_text())
-                worker['account_alias'] = (spec.get('account') if worker['provider'] in ('opencode', 'muse')
+                worker['account_alias'] = (spec.get('account') if worker['provider'] in ('opencode', 'antigravity')
                                            else broker.alias_for_environment(spec.get('env', {})))
             if not attaching and worker['provider'] == 'codex':
                 if not self.store.get('codex_enabled', True):
@@ -440,10 +555,10 @@ class WorkerPool:
             self.controls[worker['id']] = control
             if not attaching:
                 with self.store.db:
-                    running = self.store.db.execute("""UPDATE workers SET status='running',session=?,updated=?
+                    running = self.store.db.execute("""UPDATE workers SET status='running',session=?,updated=?,started_at=?,no_handoff=NULL
                         WHERE id=? AND status IN ('queued','waiting_for_secret') AND EXISTS (
                             SELECT 1 FROM tasks WHERE tasks.id=workers.task AND tasks.status='open')""",
-                        (worker['session'], time.time(), worker['id'])).rowcount
+                        (worker['session'], time.time(), time.time(), worker['id'])).rowcount
                     if not running:
                         if (self.store.task_get(worker['task']) or {}).get('status') != 'open':
                             self.store.db.execute("""UPDATE workers SET status='interrupted',updated=?
@@ -465,6 +580,7 @@ class WorkerPool:
             def host_started(name):
                 self.launching.add(worker['id'])
                 worker.update(host=name, last_seq=0)
+                self.store.consumed.pop(worker['id'], None)
                 self.storage.register_host(worker['id'], name)
                 with self.store.db:
                     self.store.db.execute('UPDATE workers SET host=?,last_seq=0,updated=? WHERE id=?',
@@ -498,31 +614,55 @@ class WorkerPool:
                     opencode_alias, {}).get('provider') != 'opencode-go'):
                 opencode_alias = opencode_accounts.active(self.store)
             models = {'claude': self.store.get('worker_model', 'opus'),
-                      'codex': self.store.get('codex_model') or 'gpt-6.1-sol',
-                      'muse': muse_runtime.DEFAULT_MODEL,
+                      'codex': self.store.get('codex_model') or 'gpt-6.2-sol',
+                      'antigravity': antigravity_accounts.DEFAULT_MODEL if antigravity_accounts else None,
                       'opencode': opencode_accounts.accounts(self.store).get(opencode_alias, {}).get('model')}
             model = worker['model'] or models[worker['provider']]
-            if self.store.get('auto_resume', False) is True and worker['model'] is None:
-                with self.store.db:
-                    self.store.db.execute('UPDATE workers SET model=? WHERE id=?', (model, worker['id']))
+            if worker['provider'] == 'antigravity' and worker['model'] is None and worker['session'] and not worker['fresh']:
+                model = None
             instructions = None
             if not attaching:
                 job = {'id': task['id'], 'number': task['number'], 'topic': topic['name'],
                        'worktree': task['worktree']}
-                from .close_saves import enabled, scratch
-                if enabled(self.store):
-                    job['scratch'] = str(scratch(self.store, task['id'], create=True))
+                if scratch_worker:
+                    job['scratch'] = worker['cwd']
+                    job['project'] = task['worktree'] or topic['cwd']
+                from .close_saves import scratch
+                job['scratch'] = str(scratch(self.store, task['id'], create=True))
                 results = worker_storage.results_directory(self.store, task['id'], create=True)
                 if worker['provider'] != 'opencode':
                     job['results'] = results
-                instructions = (WORKER_POLICY + '\nCurrent usage policy:\n' + worker_usage_policy(self.store.directory) +
-                                '\nJob: ' + json.dumps(job))
+                from .policy import instructions as rule_instructions
+                from .parent import session_key
+                fixed, layered = rule_instructions(self.store, session_key(self.store, topic['cwd'], worker['topic']), 'worker')
+                instructions = (fixed + '\nCurrent usage policy:\n' + layered +
+                                '\nJob: ' + json.dumps(job) +
+                                '\nFile a follow-up with the CLI from Tools: followup.propose parent=' + str(worker['task']) +
+                                ' title=... why=...')
+                instructions += ('\nBefore you end, update ' + results + '/HANDOFF.md in at most 60 lines. '
+                                 'Use these sections: goal, state now, done with proof paths, in flight, '
+                                 'next step, do not redo, open questions.'
+                                 '\nEnd your final reply with one line: RESULT: done, RESULT: blocked <why> '
+                                 'or RESULT: partial <what is left>.')
+                if worker['provider'] == 'opencode':
+                    instructions += '\nUse bash to update HANDOFF.md; external directory file tools are denied.'
+                if worker['provider'] == 'antigravity' and antigravity_runtime.sandboxed(self.store):
+                    instructions += ('\nYou run inside a write boundary. You can write the job worktree, the results '
+                                     'and scratch folders and $TMPDIR. /tmp and all other folders are read-only. '
+                                     'Git commit, fetch and push work; ignore git messages about packed-refs.lock '
+                                     'and the config lock.')
+                if worker['provider'] == 'antigravity':
+                    instructions += '\nTorii copies images that you generate into ' + results + '/images when your turn ends.'
+                if worker.get('handoff'):
+                    instructions += '\nJob handoff at spawn:\n' + worker['handoff']
+                if scratch_worker:
+                    instructions += ('\nRead the project folder only. Do not write to it. '
+                                     'The OS does not enforce read-only access.')
+                if self.store.db.execute('SELECT 1 FROM idle_trim_workers WHERE worker=?', (worker['id'],)).fetchone():
+                    instructions += '\nDependency or cache output was removed during idle trim. Reinstall dependencies per the repository instructions before tests or builds.'
             if not attaching:
-                instructions += ("\n$TMPDIR is this worker's own temp folder; Torii deletes it when the worker finishes. "
-                                 "Files there may be deleted outright.")
-                if worker['provider'] != 'opencode':
-                    instructions += "\nKeep reports, logs and proofs in the job's results folder."
-            if not attaching and self.store.get('close_clears_space', False) is True:
+                instructions += '\nSave a final with the CLI from Tools: keep.save task=%s path=PATH reason=REASON.' % task['id']
+            if not attaching:
                 saved_round = self.store.db.execute('SELECT rebuild_seconds FROM task_iterations WHERE task=? AND k=?',
                                                     (task['id'], task['iteration'])).fetchone()
                 if saved_round and saved_round['rebuild_seconds'] is not None:
@@ -538,14 +678,19 @@ class WorkerPool:
             if not attaching:
                 host_id = re.sub(r'(?:\.[0-9]+)+\Z', '', host_id)
             options = dict(fresh=bool(worker['fresh']), model=model, effort=worker['effort'], instructions=instructions,
+                           topic=worker['topic'],
                            worker_id=worker['id'], on_start=started, on_session=session_started, control=control,
                            initial_steer=initial_steer,
                            host_id=host_id,
                            on_host=host_started,
                            on_account=account_selected,
-                           attach=attaching, last_seq=worker['last_seq'] if attaching else 0,
-                           on_seq=lambda seq: self.store.worker_event_consumed(worker['id'], seq),
+                           attach=attaching,
+                           last_seq=max(worker['last_seq'], self.store.consumed.get(worker['id'], 0)) if attaching else 0,
+                           on_seq=self.store.consumer(worker['id']),
                            secrets=secrets or None, on_problem=problem)
+            plugins = plugin_switches(self.store, worker['topic'])
+            if plugins and CAPS[worker['provider']].plugins:
+                options['plugins'] = plugins
             if worker['provider'] == 'codex':
                 secret_names = {declared(entry)[0] for entry in task['secrets']}
                 secret_names.update(self.store.get('host_log_secret_names:' + str(worker['id']), []))
@@ -560,7 +705,7 @@ class WorkerPool:
                                stopped=lambda: worker['id'] in self.stopping,
                                current_goal=lambda: self.get(worker['id'])['goal'],
                                reload_secrets=lambda: load_for_worker(self.store, self.vault, task)[0])
-            if worker['provider'] in ('opencode', 'muse'):
+            if worker['provider'] in ('opencode', 'antigravity'):
                 options.update(account_alias=worker.get('account_alias'),
                                stopped=lambda: worker['id'] in self.stopping,
                                on_cancel=cancel_ready)
@@ -585,12 +730,9 @@ class WorkerPool:
                 waited = previous_result.get('status') == 'waiting_for_quota'
                 continuation = (RESTART_CONTINUATION if previous_result.get('restart_resume')
                                 else LIMIT_CONTINUATION if waited else '')
-                prompt = continuation + worker['prompt'] if not worker['fresh'] else worker['prompt']
-                if worker['provider'] == 'opencode' and waited and not worker['fresh']:
-                    options['instructions'] = None
-                    remaining = worker['prompt'][previous_result.get('prompt_chars', 0):]
-                    prompt = ('Continue the current task from where it stopped.' +
-                              ('\n\n' + remaining if remaining else ''))
+                prompt = (continuation + continuation_brief(self.store, worker) if continuation and not worker['fresh']
+                          else worker['prompt'])
+                prompt += prompt_suffix
                 if worker['provider'] in ('claude', 'codex'):
                     options['stopped'] = lambda: worker['id'] in self.stopping
                 result = await broker.run(self.runner.run, worker['provider'], prompt,
@@ -599,6 +741,8 @@ class WorkerPool:
                 result = await self.codex_attached(worker, topic, result, options, account_selected)
             if attaching and worker['provider'] == 'opencode':
                 broker.record_result(worker.get('account_alias'), result, worker['id'])
+            if attaching and worker['provider'] == 'antigravity':
+                await broker.record_result(worker.get('account_alias'), result, worker['id'])
             if attaching and result.failure_code == 'start_failed' and HostClient(
                     host_directory(self.store.directory, worker)).state == 'dead':
                 result.failure_code = 'interrupted'
@@ -611,13 +755,12 @@ class WorkerPool:
                                           (time.time(), worker['id']))
             raise
         except Exception as error:
-            logger.exception('worker failed worker=%s type=%s', worker['id'], type(error).__name__)
+            if not isinstance(error, TaskFailure):
+                problems.record(self.store, 'worker', 'start-failed', type(error).__name__, worker=worker['id'], level=logging.ERROR, every=3600)
             failure = error if isinstance(error, TaskFailure) else TaskFailure('Worker could not start.', '')
             _, detail = failure_state(error, failure)
             result = RunResult(worker['session'], error=str(error) if isinstance(error, TaskFailure) else
                                'Worker could not start: ' + detail, failure_code='start_failed', failure_detail=detail)
-            if self.store.get('auto_resume', False) is True and isinstance(error, TaskFailure):
-                result.failure_code = 'spawn_refused'
         finally:
             try:
                 directory = host_directory(self.store.directory, worker)
@@ -652,6 +795,8 @@ class WorkerPool:
                 self.tasks.pop(worker['id'], None)
                 self.launching.discard(worker['id'])
                 self.stopping.discard(worker['id'])
+        if result is not None and usage_events is not None:
+            usage_events.record(self.store, worker, result, model)
         if isinstance(cleanup_error, CleanupFailed):
             return self.cleanup_failed(worker, cleanup_error)
         current = self.get(worker['id'])
@@ -663,22 +808,26 @@ class WorkerPool:
                 and self.requeue_lost_host(worker)):
             return self.get(worker['id'])
         result.session_id = result.session_id or worker['session']
-        waits = worker['provider'] in ('claude', 'opencode') or (worker['provider'] == 'codex'
-                                                               and self.codex_accounts.managed())
-        if (waits and not result.success and result.failure_code != 'owner_stopped' and
-                (result.quota_limited or result.failure_code == 'accounts_unavailable' or
-                 worker['provider'] == 'claude' and result.failure_code == 'launch_moved')):
-            until = (broker.earliest_reset(worker.get('account_alias'), worker['id']) if worker['provider'] == 'opencode'
-                     else broker.earliest_reset())
+        waits = worker['provider'] in ('claude', 'opencode', 'antigravity') or (worker['provider'] == 'codex'
+                                                                              and self.codex_accounts.managed())
+        pinned = worker.get('account_alias') if result.session_id else None
+        out = (not result.success and result.failure_code != 'owner_stopped' and
+               (result.quota_limited or result.failure_code == 'accounts_unavailable' or
+                worker['provider'] == 'claude' and result.failure_code == 'launch_moved'))
+        if out and not moved and waits:
+            started = (result.session_id if worker['provider'] in ('opencode', 'antigravity')
+                       else result.transcript_path)
+            limited = dict(worker, session=result.session_id, fresh=bool(worker['fresh']) and not started)
+            entry = moves.next_route(self, limited, self.store.task_get(worker['task']), failed=True)
+            if entry is not None and moves.move(self, limited, entry, asdict(result)):
+                return await self.run(self.get(worker['id']), topic, prompt_suffix, moved=True)
+        if waits and out:
+            until = broker.reset(dict(worker, model=model, session=result.session_id, fresh=0))
             payload = asdict(result)
             payload.update(waiting_until=until, status='waiting_for_quota')
             if previous_result.get('restart_resume'):
                 payload['restart_resume'] = True
-            if self.store.get('auto_resume', False) is True and not getattr(self.store, 'network_available', True):
-                payload['network_down'] = True
             if worker['provider'] == 'opencode':
-                payload['prompt_chars'] = (len(worker['prompt']) if result.prompt_sent else
-                                           previous_result.get('prompt_chars', 0))
                 block = broker.block(worker.get('account_alias'), worker['id'])
                 payload['retry_seconds'] = (block.get('retry_seconds', 0) if block.get('worker_id') == worker['id']
                                              else previous_result.get('retry_seconds', 0))
@@ -686,18 +835,22 @@ class WorkerPool:
                 changed = self.store.db.execute(
                     "UPDATE workers SET status='waiting_for_quota',pid=NULL,session=?,fresh=fresh AND ?,result=?,"
                     "updated=? WHERE id=? AND status='running'",
-                    (result.session_id, not (result.session_id if worker['provider'] == 'opencode' else result.transcript_path),
+                    (result.session_id, not (result.session_id if worker['provider'] in ('opencode', 'antigravity')
+                                             else result.transcript_path),
                      json.dumps(payload), time.time(),
                      worker['id'])).rowcount
                 selected = (broker.select(worker.get('account_alias'), worker['id'])
-                            if worker['provider'] == 'opencode' else broker.select())
+                            if worker['provider'] == 'opencode' else broker.select(pinned, model=model) if worker['provider'] == 'antigravity'
+                            else broker.select(model=model) if worker['provider'] == 'claude' else broker.select())
                 if changed and not selected and not (worker['provider'] == 'opencode'
                                                      and previous_result.get('status') == 'waiting_for_quota'):
                     reset = (' at ' + time.strftime('%Y-%m-%d %H:%M UTC', time.gmtime(until))
                              if isinstance(until, (int, float)) else ' when an account becomes available')
                     text = (
                         'Worker %d is waiting for Claude usage to reset%s.' % (worker['id'], reset)
-                        if worker['provider'] == 'claude' else (
+                        if worker['provider'] == 'claude' else
+                        'Worker %d is waiting for Antigravity usage to reset%s.' % (worker['id'], reset)
+                        if worker['provider'] == 'antigravity' else (
                             self.opencode_waiting(worker, result, reset)
                             if worker['provider'] == 'opencode' else self.codex_waiting(worker, until)))
                     alias = worker.get('account_alias')
@@ -719,6 +872,12 @@ class WorkerPool:
             result.success = False
             result.failure_code = 'goal_unmet'
             result.failure_detail = result.goal_status['status']
+        from .lifecycle import REPORTED, result_line
+        report = result_line(asdict(result)) if result.success and not result.failure_code else None
+        if report in REPORTED:
+            result.success = False
+            result.failure_code = report
+            result.failure_detail = result.text.strip().splitlines()[-1].strip()[:300]
         status = ('interrupted' if result.failure_code in ('interrupted', 'owner_stopped')
                   else 'done')
         self.store.worker_complete(worker['id'], asdict(result), status)

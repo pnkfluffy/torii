@@ -1,6 +1,8 @@
 import asyncio
 import json
 import os
+import sqlite3
+from types import SimpleNamespace
 from pathlib import Path
 import tempfile
 import time
@@ -10,7 +12,7 @@ import uuid
 
 from coordinator.native_protocol import NativeProtocol, RunControl
 from coordinator.accounts import AccountBroker
-from coordinator.providers import ProviderRunner
+from coordinator.providers import ProviderRunner, retry_locked
 from coordinator.store import Store
 from tests.support import SCALE, SETTLE, isolate_shared_mcp_home, settle, until_exists, stop_test_hosts
 
@@ -92,6 +94,22 @@ ack={'id':r['id'],'result':{'turnId':'turn-1'}}
 
 
 class NativeProtocolTests(NativeProtocolTestsSupport, unittest.IsolatedAsyncioTestCase):
+    async def test_locked_outcome_is_applied_after_retry(self):
+        applied = []
+        def on_outcome(message_id, state):
+            if not applied:
+                applied.append(None)
+                raise sqlite3.OperationalError('database is locked')
+            applied.append((message_id, state))
+        protocol = NativeProtocol('claude', SimpleNamespace(stdin=Mock(wait_closed=AsyncMock())), RunControl(on_outcome=on_outcome), None, lambda sid: sid)
+        protocol.wires['wire-1'] = 'steer:7'
+        protocol.unstarted.add('wire-1')
+        event = {'type': 'command_lifecycle', 'command_uuid': 'wire-1', 'state': 'cancelled'}
+        await retry_locked(protocol.handle, event)
+        self.assertEqual(applied, [None, ('steer:7', 'uncertain')])
+        self.assertNotIn('wire-1', protocol.wires)
+        self.assertNotIn('wire-1', protocol.unstarted)
+
     async def test_codex_reattach_preserves_journaled_resume_options(self):
         for excluded in (None, True):
             with self.subTest(excluded=excluded):
@@ -260,7 +278,7 @@ emit({'type':'system','subtype':'init','session_id':sid})
 emit({'type':'system','subtype':'background_tasks_changed','session_id':sid,
       'tasks':[{'task_id':'a1','task_type':'local_agent','description':'review'}]})
 emit({'type':'rate_limit_event','session_id':sid,'rate_limit_info':
-      {'status':'rejected','rateLimitType':'five_hour','resetsAt':9999999999}})
+      {'status':'rejected','rateLimitType':'seven_day','resetsAt':9999999999}})
 emit({'type':'assistant','session_id':sid,'error':'rate_limit','is_api_error_message':True,
       'message':{'stop_reason':'stop_sequence'}})
 emit({'type':'result','subtype':'success','session_id':sid,'is_error':True,
@@ -271,7 +289,7 @@ assert sys.stdin.read()==''
         result = await settle(self.run_native('claude', RunControl()), 3)
         self.assertFalse(result.success)
         self.assertTrue(result.quota_limited)
-        self.assertEqual(result.rate_limit_info['rateLimitType'], 'five_hour')
+        self.assertEqual(result.rate_limit_info['rateLimitType'], 'seven_day')
         self.assertNotEqual(result.failure_code, 'pending_work')
 
     async def test_claude_task_notification_failure_ends_with_background_work(self):
@@ -840,6 +858,39 @@ class CodexWorkerTurnTests(unittest.IsolatedAsyncioTestCase):
                 protocol = self.protocol()
                 with self.assertRaisesRegex(RuntimeError, 'Provider changed the active turn'):
                     protocol.handle(self.event(method, 'unknown-turn'))
+
+    def command(self, method, turn_id, status):
+        return {'method': method, 'params': {'threadId': 'test-thread', 'turnId': turn_id,
+                                             'item': {'type': 'commandExecution', 'status': status}}}
+
+    async def test_background_command_finishing_after_its_turn_leaves_the_goal_turn_running(self):
+        protocol = self.protocol()
+        protocol.handle({'method': 'thread/goal/updated', 'params': {
+            'threadId': 'test-thread', 'goal': {'status': 'active'}}})
+        protocol.handle(self.event('turn/started', 'turn-1'))
+        protocol.handle(self.command('item/started', 'turn-1', 'inProgress'))
+        protocol.handle(self.event('turn/completed', 'turn-1'), replay=True)
+        protocol.handle(self.event('turn/started', 'turn-2'))
+        protocol.handle(self.command('item/started', 'turn-2', 'inProgress'))
+        protocol.handle(self.command('item/completed', 'turn-2', 'completed'))
+        self.assertIsNone(protocol.handle(self.command('item/completed', 'turn-1', 'completed')))
+        self.assertIsNone(protocol.handle(self.event('item/completed', 'turn-1')))
+        self.assertEqual(protocol.turn_id, 'turn-2')
+        self.assertFalse(protocol.terminal)
+        with self.assertRaisesRegex(RuntimeError, 'Provider changed the active turn'):
+            protocol.handle(self.event('turn/started', 'turn-1'))
+        self.assertEqual(protocol.handle(self.event('turn/completed', 'turn-2'), replay=True),
+                         {'type': 'turn.completed'})
+
+    async def test_background_command_finishing_after_the_last_turn_is_ignored(self):
+        protocol = self.protocol()
+        protocol.handle(self.event('turn/started', 'turn-1'))
+        protocol.handle(self.command('item/started', 'turn-1', 'inProgress'))
+        protocol.handle(self.event('turn/completed', 'turn-1'))
+        self.assertTrue(protocol.terminal)
+        self.assertIsNone(protocol.handle(self.command('item/completed', 'turn-1', 'completed')))
+        self.assertIsNone(protocol.turn_id)
+        self.assertTrue(protocol.terminal)
 
     async def test_active_goal_accepts_provider_turns_without_the_previous_completion(self):
         for method in ('turn/started', 'item/started', 'item/completed', 'turn/completed'):

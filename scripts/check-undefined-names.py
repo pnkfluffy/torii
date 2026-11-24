@@ -19,6 +19,7 @@ ROOT = Path(__file__).resolve().parents[1]
 MODULE_NAMES = {'__name__', '__doc__', '__package__', '__loader__', '__spec__',
                 '__file__', '__cached__', '__builtins__', '__annotations__'}
 SKIPPED_DIRS = {'.git', '__pycache__', '.venv', 'venv', 'node_modules', 'build', 'dist'}
+INLINED = {'listcomp', 'setcomp', 'dictcomp'}
 
 
 def tracked_files(root):
@@ -56,15 +57,41 @@ class GlobalReads(ast.NodeVisitor):
         self.class_name = ''
         self.results = []
 
+    def child_scope(self, node, names):
+        return next((child for child in self.table.get_children()
+                     if child.get_name() in names and child.get_lineno() == node.lineno
+                     and child.get_id() not in self.used_scopes), None)
+
     def scope(self, node, name, body):
+        """Visit body in the compiler's scope for node.
+
+        Python 3.12 and later inline list, set and dict comprehensions into the
+        enclosing scope, and 3.13 names lambdas and generators in angle brackets.
+        """
         parent = self.table
-        child = next(child for child in parent.get_children()
-                     if child.get_name() == name and child.get_lineno() == node.lineno
-                     and child.get_id() not in self.used_scopes)
+        child = self.child_scope(node, (name, '<' + name + '>'))
+        if child is None and name in INLINED:
+            for item in body:
+                self.visit(item)
+            return
+        if child is None:
+            raise LookupError('No compiler scope for %s at line %d' % (name, node.lineno))
         self.used_scopes.add(child.get_id())
         self.table = child
         for item in body:
             self.visit(item)
+        self.table = parent
+
+    def annotations(self, node, values):
+        """Python 3.14 evaluates annotations in their own scope."""
+        parent = self.table
+        child = self.child_scope(node, ('__annotate__',))
+        if child is not None:
+            self.used_scopes.add(child.get_id())
+            self.table = child
+        for value in values:
+            if value is not None:
+                self.visit(value)
         self.table = parent
 
     def visit_Name(self, node):
@@ -88,9 +115,7 @@ class GlobalReads(ast.NodeVisitor):
             arguments = node.args.posonlyargs + node.args.args
             arguments += [arg for arg in (node.args.vararg, node.args.kwarg) if arg is not None]
             arguments += node.args.kwonlyargs
-            for value in [arg.annotation for arg in arguments] + [node.returns]:
-                if value is not None:
-                    self.visit(value)
+            self.annotations(node, [arg.annotation for arg in arguments] + [node.returns])
         self.scope(node, node.name, node.body)
 
     visit_AsyncFunctionDef = visit_FunctionDef

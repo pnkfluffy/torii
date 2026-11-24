@@ -79,7 +79,7 @@ class CodexInstallTests(unittest.TestCase):
                 binary.parent.mkdir(parents=True)
                 binary.write_text('fake native binary')
                 helper = binary.parent / 'codex-code-mode-host'
-                with patch('sys.platform', 'darwin'), patch('platform.machine', return_value='arm64'):
+                with patch('coordinator.host_os.SYSTEM', 'darwin'), patch('platform.machine', return_value='arm64'):
                     self.assertIsNotNone(isolation.codex_install_problem(str(launcher)))
                     helper.write_text('fake helper')
                     helper.chmod(0o600)
@@ -152,7 +152,7 @@ class CodexInstallTests(unittest.TestCase):
         blocked.mkdir()
         blocked.chmod(0)
         self.addCleanup(blocked.chmod, 0o700)
-        with patch('sys.platform', 'darwin'), patch('platform.machine', return_value='arm64'), \
+        with patch('coordinator.host_os.SYSTEM', 'darwin'), patch('platform.machine', return_value='arm64'), \
                 patch('pathlib.Path.is_file', side_effect=PermissionError(13, 'Permission denied', str(blocked))):
             self.assertIsNone(isolation.codex_install_problem(str(launcher)))
 
@@ -176,7 +176,7 @@ class CodexInstallTests(unittest.TestCase):
                 launcher.write_text('fake npm launcher')
                 launcher.chmod(0o700)
                 (package / 'package.json').write_text(json.dumps({'version': version}))
-                with patch('sys.platform', 'darwin'), patch('platform.machine', return_value='arm64'):
+                with patch('coordinator.host_os.SYSTEM', 'darwin'), patch('platform.machine', return_value='arm64'):
                     problem = isolation.codex_install_problem(str(launcher))
                 if version.startswith(('0.132.', '0.142.')):
                     self.assertIsNone(problem)
@@ -185,7 +185,7 @@ class CodexInstallTests(unittest.TestCase):
 
     def test_pnpm_codex_only_prerequisites_are_not_fatal(self):
         shim = self.pnpm_shim()
-        with patch.dict(os.environ, {'PATH': str(shim.parent)}), patch('sys.platform', 'darwin'), \
+        with patch.dict(os.environ, {'PATH': str(shim.parent)}), patch('coordinator.host_os.SYSTEM', 'darwin'), \
                 patch('subprocess.run', return_value=SimpleNamespace(returncode=0)) as run:
             rows, fatal = SETUP['check_prereqs']()
         run.assert_called_once_with([str(shim), '--version'], capture_output=True, timeout=10)
@@ -217,7 +217,7 @@ class NormalInstallerTests(unittest.IsolatedAsyncioTestCase):
                                      'CLAUDE_CONFIG_DIR': str(self.home / '.claude')})
         env.start()
         self.addCleanup(env.stop)
-        for name, value in (('pathlib.Path.home', self.home), ('sys.platform', 'darwin'),
+        for name, value in (('pathlib.Path.home', self.home), ('coordinator.host_os.SYSTEM', 'darwin'),
                             ('coordinator.host_os.SYSTEM', 'darwin')):
             handle = patch(name, return_value=value) if name.endswith('.home') else patch(name, value)
             handle.start()
@@ -274,15 +274,6 @@ class NormalInstallerTests(unittest.IsolatedAsyncioTestCase):
         plist = plistlib.loads((self.home / 'Library/LaunchAgents/local.telegram-agent-coordinator.plist').read_bytes())
         self.assertEqual(plist['EnvironmentVariables'], {
             'PATH': '/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin', 'BROWSER': browser})
-
-    def test_legacy_token_installer_keeps_temporary_files_out_of_config(self):
-        legacy = runpy.run_path(str(ROOT / 'scripts/setup-telegram.py'))
-        with self.forbid_foreign_access(), patch('getpass.getpass', return_value='fake-test-token'), \
-                patch.dict(legacy['main'].__globals__, state_dir=lambda: self.store.directory), \
-                redirect_stdout(io.StringIO()):
-            self.assertEqual(legacy['main'](), 0)
-        self.assertEqual(list((self.home / '.config/telegram-agent-coordinator').iterdir()),
-                         [self.home / '.config/telegram-agent-coordinator/bot-token'])
 
 
 

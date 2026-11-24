@@ -81,6 +81,8 @@ host.main(str(directory))
 
 class WorkerLaunchStopTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
+        from tests.support import fake_codex_hook_trust
+        fake_codex_hook_trust(self)
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
@@ -105,7 +107,7 @@ class WorkerLaunchStopTests(unittest.IsolatedAsyncioTestCase):
             'identity': {'email': 'primary@example.com', 'logged_in': True}, 'observed_at': time.time(),
             'usage': {'seven_day': {'utilization': 10, 'resets_at': time.time() + 3600}}}})
         for target, options in (
-                ('coordinator.providers.platform', {'new': 'linux'}),
+                ('coordinator.host_os.uses_worker_coalitions', {'new': lambda: False}),
                 ('coordinator.opencode_accounts.account_home', {'return_value': self.key_home})):
             patched = patch(target, **options)
             patched.start()

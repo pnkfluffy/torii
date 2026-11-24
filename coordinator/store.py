@@ -1,16 +1,22 @@
 """Durable owner intake, tasks, messages, and reports."""
 
 import hashlib
+from collections import Counter
 from contextlib import contextmanager
 import json
 import logging
+import os
 from pathlib import Path
+import pwd
 import secrets
 import sqlite3
+import stat
 import time
 import re
 
-from . import extension, problems
+from . import extension, problems, records
+from .scrub import Scrubber, TOKEN
+from .outbox_files import Connection, remove as remove_outbox_file
 from .control_api import FINISHES, STAGES
 from .formatting import FENCE, entities_to_markdown, html_to_text, inline_spans, markdown_to_html
 from .waits import WaitStore
@@ -33,6 +39,51 @@ def retry_delay(attempts, retry_after=None):
 
 MESSAGE_LIMIT = 4096
 CLI_CALL_LIMIT = 1000
+
+
+def _secret_homes():
+    home = Path.home()
+    homes = {home}
+    try:
+        native = Path(pwd.getpwuid(os.getuid()).pw_dir)
+        home.resolve().relative_to(native.resolve())
+        homes.add(native)
+    except (KeyError, ValueError, OSError):
+        pass
+    return homes
+
+
+def _known_token_scrubber(vault=None, strict=False, min_length=16):
+    """A scrubber for the vault values and token files. With `strict`, a vault that cannot load raises VaultError."""
+    values = {}
+    if vault is not None and hasattr(vault, 'scrub_values'):
+        from .vault import VaultError
+        try:
+            for value in vault.scrub_values():
+                if isinstance(value, str) and len(value) >= min_length:
+                    values[str(len(values))] = value
+        except VaultError:
+            if strict:
+                raise
+    paths = (path for home in _secret_homes() for path in (home / '.config' / 'torii-secrets').glob('*.token'))
+    for path in paths:
+        try:
+            descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+            with os.fdopen(descriptor, 'rb') as stream:
+                if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+                    continue
+                value = stream.read().decode('utf-8').strip()
+            if len(value) >= 16:
+                values[str(len(values))] = value
+        except (OSError, UnicodeError):
+            continue
+    forms = Scrubber(values).forms
+    return Scrubber.of((form, '[token]') for form, _ in forms)
+
+
+def _redact_known_tokens(text, vault=None):
+    clean = _known_token_scrubber(vault)(text)
+    return clean, clean != text
 
 
 def _open_fence_at(text, cut):
@@ -129,32 +180,48 @@ def finish_default(store, topic):
 
 
 class Store(WaitStore):
-    def __init__(self, directory: Path, token_file=None, read_only=False):
+    def __init__(self, directory: Path, token_file=None, read_only=False, existing=False):
         self.directory = directory.resolve()
+        self.record_pending = set()
+        self.consumed = {}
+        self.consumed_changes = 0
         self.vault = None
         self.token_file = Path(token_file or Path.home() / '.config/telegram-agent-coordinator/bot-token').resolve()
         if read_only:
             self.db = sqlite3.connect((self.directory / 'state.sqlite').as_uri() + '?mode=ro', uri=True)
             self.db.row_factory = sqlite3.Row
             return
+        if existing:
+            self.db = sqlite3.connect((self.directory / 'state.sqlite').as_uri() + '?mode=rw', uri=True, timeout=30, factory=Connection)
+            self.db.row_factory = sqlite3.Row
+            self.db._outbox_owner = self
+            self.db.execute('PRAGMA secure_delete=ON')
+            self.db.execute('PRAGMA foreign_keys=ON')
+            self.code_requests = extension.optional('code_requests')
+            return
         directory.mkdir(parents=True, exist_ok=True, mode=0o700)
         directory.chmod(0o700)
-        usage = self.directory / 'USAGE.md'
-        if not usage.exists():
-            usage.write_text((Path(__file__).parent / 'defaults' / 'USAGE.md').read_text())
-            usage.chmod(0o600)
         path = directory / "state.sqlite"
-        self.db = sqlite3.connect(path)
+        self.db = sqlite3.connect(path, factory=Connection)
+        self.db._outbox_owner = self
         self.db.execute('PRAGMA busy_timeout=30000')
         path.chmod(0o600)
         self.db.row_factory = sqlite3.Row
         self.db.execute('PRAGMA journal_mode=WAL')
         self.db.execute('PRAGMA secure_delete=ON')
         self.db.execute('PRAGMA foreign_keys=OFF')
+        started = None
         try:
             self.db.execute('BEGIN IMMEDIATE')
+            started = time.monotonic()
             schema = """
                 CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS idle_trims (task INTEGER PRIMARY KEY, idle_since REAL NOT NULL, active INTEGER NOT NULL DEFAULT 0, trimmed INTEGER NOT NULL DEFAULT 0);
+                CREATE TABLE IF NOT EXISTS idle_trim_workers (worker INTEGER PRIMARY KEY);
+                CREATE TABLE IF NOT EXISTS job_size_alarms (task INTEGER PRIMARY KEY, base INTEGER NOT NULL);
+                CREATE TABLE IF NOT EXISTS job_results_sizes (task INTEGER PRIMARY KEY, bytes INTEGER NOT NULL, measured REAL NOT NULL);
+                CREATE TABLE IF NOT EXISTS stale_records (task INTEGER PRIMARY KEY, version INTEGER NOT NULL, since REAL);
+                CREATE TABLE IF NOT EXISTS restored_record_asks (task INTEGER PRIMARY KEY, text TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS topics (
                     id TEXT PRIMARY KEY, chat INTEGER NOT NULL, thread INTEGER NOT NULL,
                     name TEXT NOT NULL, telegram_title TEXT, cwd TEXT NOT NULL, provider TEXT,
@@ -164,10 +231,31 @@ class Store(WaitStore):
                 CREATE TABLE IF NOT EXISTS tasks (
                     id INTEGER PRIMARY KEY, topic TEXT NOT NULL REFERENCES topics(id),
                     number INTEGER NOT NULL, title TEXT NOT NULL,
-                    status TEXT NOT NULL DEFAULT 'open' CHECK(status IN ('open','done','dropped')),
+                    status TEXT NOT NULL DEFAULT 'open'
+                        CHECK(status IN ('open','interrupted','waiting','done','dropped','proposed','expired')),
                     worktree TEXT, notes TEXT, created REAL NOT NULL, updated REAL NOT NULL,
-                    secrets TEXT, origin INTEGER REFERENCES messages(id),
+                    secrets TEXT, origin INTEGER REFERENCES messages(id), pr TEXT,
+                    iteration INTEGER NOT NULL DEFAULT 0 CHECK(iteration>=0),
+                    finish TEXT CHECK(finish IN ('merged','live','answered','delivered')), reason TEXT,
+                    copy TEXT NOT NULL DEFAULT 'present' CHECK(copy IN ('present','saving','held','cleared')),
+                    copy_reason TEXT, parent INTEGER REFERENCES tasks(id), uid TEXT, record_path TEXT, log TEXT,
                     UNIQUE(topic,number));
+                CREATE TABLE IF NOT EXISTS task_iterations (
+                    id INTEGER PRIMARY KEY, task INTEGER NOT NULL REFERENCES tasks(id),
+                    k INTEGER NOT NULL CHECK(k>=0), opened REAL NOT NULL, closed REAL,
+                    opened_by TEXT NOT NULL CHECK(opened_by IN ('create','owner','wait','coordinator','resume','migration')),
+                    origin INTEGER REFERENCES messages(id),
+                    outcome TEXT CHECK(outcome IN ('done','waiting','interrupted','dropped')), reason TEXT,
+                    cause TEXT CHECK(cause IN ('crash','unfinished','quota','account','offline','config')),
+                    attempts INTEGER NOT NULL DEFAULT 0, resume_at REAL, progress_head TEXT,
+                    nudged INTEGER NOT NULL DEFAULT 0, last_worker INTEGER REFERENCES workers(id),
+                    head TEXT, saved TEXT, rebuild_seconds REAL, bytes_freed INTEGER,
+                    space_outbox_after INTEGER NOT NULL DEFAULT 0, summary TEXT, wait INTEGER REFERENCES waits(id),
+                    UNIQUE(task,k));
+                CREATE TABLE IF NOT EXISTS task_links (
+                    task INTEGER NOT NULL REFERENCES tasks(id), target INTEGER NOT NULL REFERENCES tasks(id),
+                    kind TEXT NOT NULL CHECK(kind IN ('blocked_by','related','discovered_from','replaces')),
+                    PRIMARY KEY(task,target,kind), CHECK(task != target));
                 CREATE TABLE IF NOT EXISTS workers (
                     id INTEGER PRIMARY KEY, task INTEGER REFERENCES tasks(id),
                     topic TEXT NOT NULL REFERENCES topics(id), provider TEXT NOT NULL,
@@ -176,7 +264,15 @@ class Store(WaitStore):
                     pid INTEGER, result TEXT, goal TEXT, model TEXT, effort TEXT NOT NULL DEFAULT 'medium', account_alias TEXT,
                     last_seq INTEGER NOT NULL DEFAULT 0,
                     created REAL NOT NULL, updated REAL NOT NULL,
-                    host TEXT, work TEXT NOT NULL DEFAULT 'research');
+                    host TEXT, work TEXT NOT NULL DEFAULT 'research', started_at REAL, no_handoff INTEGER,
+                    handoff TEXT, kind TEXT, routed_from TEXT,
+                    iteration INTEGER NOT NULL DEFAULT 0 CHECK(iteration>=0),
+                    resume_of INTEGER REFERENCES workers(id));
+                CREATE UNIQUE INDEX IF NOT EXISTS workers_resume_of ON workers(resume_of) WHERE resume_of IS NOT NULL;
+                CREATE TABLE IF NOT EXISTS worker_briefs (
+                    worker INTEGER PRIMARY KEY REFERENCES workers(id) ON DELETE CASCADE,
+                    original TEXT NOT NULL, steers TEXT NOT NULL DEFAULT '[]',
+                    elided INTEGER NOT NULL DEFAULT 0);
                 CREATE TABLE IF NOT EXISTS worker_temp_state (
                     worker INTEGER PRIMARY KEY REFERENCES workers(id), path TEXT,
                     finished INTEGER NOT NULL DEFAULT 0, pending INTEGER NOT NULL DEFAULT 0,
@@ -208,12 +304,13 @@ class Store(WaitStore):
                     retired INTEGER NOT NULL DEFAULT 0, reaction_desired TEXT, reaction_sent TEXT,
                     reaction_state TEXT NOT NULL DEFAULT 'sent', reaction_retry REAL NOT NULL DEFAULT 0,
                     reaction_attempts INTEGER NOT NULL DEFAULT 0, reaction_first_failed REAL,
-                    as_document INTEGER NOT NULL DEFAULT 0);
+                    as_document INTEGER NOT NULL DEFAULT 0, created REAL NOT NULL DEFAULT 0,
+                    image_source TEXT, task INTEGER, sender TEXT);
                 CREATE TABLE IF NOT EXISTS attachments (
                     id INTEGER PRIMARY KEY, topic TEXT NOT NULL REFERENCES topics(id),
                     message INTEGER NOT NULL, file_id TEXT NOT NULL, mime TEXT NOT NULL,
                     size INTEGER, group_id TEXT, path TEXT, created REAL NOT NULL,
-                    name TEXT, error TEXT, kind TEXT, UNIQUE(topic,message));
+                    name TEXT, error TEXT, kind TEXT, duration INTEGER, UNIQUE(topic,message));
                 CREATE TABLE IF NOT EXISTS service_requests (
                     id INTEGER PRIMARY KEY, op TEXT NOT NULL, params TEXT NOT NULL,
                     state TEXT NOT NULL DEFAULT 'queued', result TEXT,
@@ -227,7 +324,8 @@ class Store(WaitStore):
                     token_hash TEXT, chat INTEGER, card_outbox INTEGER,
                     state TEXT NOT NULL CHECK(state IN ('open','armed','filled','superseded','cancelled','expired','revoked')),
                     created REAL NOT NULL, expires REAL NOT NULL, armed_at REAL, filled_at REAL,
-                    length INTEGER, fingerprint TEXT, updated REAL NOT NULL, arm_thread INTEGER);
+                    length INTEGER, fingerprint TEXT, updated REAL NOT NULL, arm_thread INTEGER,
+                    prompt_effect INTEGER, prompt_message INTEGER, prompt_date INTEGER);
                 CREATE TABLE IF NOT EXISTS envelope_events (
                     id INTEGER PRIMARY KEY, envelope INTEGER REFERENCES envelopes(id), name TEXT,
                     event TEXT NOT NULL CHECK(event IN ('ask','arm','fill','reject','use','cancel','expire','revoke','delete_failed')),
@@ -242,6 +340,9 @@ class Store(WaitStore):
                 CREATE TABLE IF NOT EXISTS problems (
                     id INTEGER PRIMARY KEY, created REAL NOT NULL, area TEXT NOT NULL, code TEXT NOT NULL,
                     detail TEXT, topic TEXT, task INTEGER, worker INTEGER, message INTEGER, attachment INTEGER);
+                CREATE TABLE IF NOT EXISTS sweep_failures (
+                    sweep TEXT NOT NULL, item TEXT NOT NULL, failures INTEGER NOT NULL, since REAL NOT NULL,
+                    failed REAL NOT NULL, retry REAL NOT NULL, detail TEXT, PRIMARY KEY(sweep, item));
                 CREATE TABLE IF NOT EXISTS host_log_hosts (
                     name TEXT PRIMARY KEY, worker INTEGER NOT NULL REFERENCES workers(id));
                 CREATE INDEX IF NOT EXISTS host_log_hosts_worker ON host_log_hosts(worker);
@@ -251,9 +352,12 @@ class Store(WaitStore):
                 CREATE TABLE IF NOT EXISTS task_stamps (
                     id INTEGER PRIMARY KEY, task INTEGER NOT NULL REFERENCES tasks(id),
                     stage TEXT NOT NULL CHECK(stage IN ('ready','reviewed','ci','merged','live')),
-                    created REAL NOT NULL);
+                    created REAL NOT NULL, iteration INTEGER NOT NULL DEFAULT 0 CHECK(iteration>=0));
                 CREATE INDEX IF NOT EXISTS task_stamps_task ON task_stamps(task,id);
                 CREATE INDEX IF NOT EXISTS task_stamps_created ON task_stamps(created);
+                CREATE TABLE IF NOT EXISTS worker_ledger_pending (
+                    message INTEGER PRIMARY KEY REFERENCES messages(id), worker INTEGER NOT NULL REFERENCES workers(id),
+                    attempted REAL NOT NULL DEFAULT 0);
             """
             for statement in schema.split(';'):
                 if statement.strip():
@@ -269,56 +373,38 @@ class Store(WaitStore):
             self.code_requests = extension.optional('code_requests')
             if self.code_requests is not None:
                 self.code_requests.install_schema(self)
-            if 'pr' not in self._columns('tasks'):
-                self.db.execute('ALTER TABLE tasks ADD COLUMN pr TEXT')
-            self._migrate_job_iterations()
+            for name, kind in (('started_at', 'REAL'), ('no_handoff', 'INTEGER'), ('handoff', 'TEXT'), ('kind', 'TEXT'), ('routed_from', 'TEXT')):
+                if name not in self._columns('workers'):
+                    self.db.execute('ALTER TABLE workers ADD COLUMN ' + name + ' ' + kind)
+            self._migrate_task_uids()
+            self._migrate_followups()
+            initial_chat_mcp = extension.optional('chat_mcp_initial')
+            private_install = initial_chat_mcp is not None and initial_chat_mcp.install(self)
+            from .chat_mcp import migrate_shared
+            migrate_shared(self)
+            usage_events = extension.optional('usage_events')
+            if usage_events is not None:
+                usage_events.install(self)
             from .session_storage import install as install_session_storage
             install_session_storage(self)
             from .close_saves import migrate
             migrate(self)
+            from .records import install_history, install_keep
+            install_keep(self)
+            install_history(self)
             from .waits import install_schema as install_waits
             install_waits(self)
-            if 'duration' not in self._columns('attachments'):
-                self.db.execute('ALTER TABLE attachments ADD COLUMN duration INTEGER')
-            self._migrate_mode()
-            message_schema = self.db.execute(
-                "SELECT sql FROM sqlite_master WHERE type='table' AND name='messages'").fetchone()[0]
-            if 'forwarded' not in message_schema:
-                indexes = [row[0] for row in self.db.execute(
-                    "SELECT sql FROM sqlite_master WHERE type='index' AND tbl_name='messages' AND sql IS NOT NULL")]
-                self.db.execute('''CREATE TABLE messages_new (
-                    id INTEGER PRIMARY KEY, topic TEXT NOT NULL REFERENCES topics(id),
-                    kind TEXT NOT NULL CHECK(kind IN ('owner','forwarded','worker_result','restarted','callback','secret_filled','event')),
-                    telegram_message INTEGER, text TEXT NOT NULL,
-                    source_worker INTEGER REFERENCES workers(id), images TEXT,
-                    source_envelope INTEGER REFERENCES envelopes(id),
-                    delivered TEXT NOT NULL DEFAULT 'pending'
-                        CHECK(delivered IN ('pending','sent','received','uncertain')),
-                    receipt TEXT, reaction_state TEXT NOT NULL DEFAULT 'sent',
-                    reaction_desired TEXT, reaction_sent TEXT, turn_started REAL,
-                    turn_outbox INTEGER, turn_eyes INTEGER NOT NULL DEFAULT 0,
-                    turn_tools INTEGER NOT NULL DEFAULT 0, reacted_to INTEGER,
-                    reaction_retry REAL NOT NULL DEFAULT 0,
-                    reaction_attempts INTEGER NOT NULL DEFAULT 0,
-                    created REAL NOT NULL, updated REAL NOT NULL, from_name TEXT,
-                    reaction_first_failed REAL, batch_id INTEGER)''')
-                columns = ','.join(self._columns('messages'))
-                self.db.execute('INSERT INTO messages_new (' + columns + ') SELECT ' + columns + ' FROM messages')
-                self.db.execute('DROP TABLE messages')
-                self.db.execute('ALTER TABLE messages_new RENAME TO messages')
-                for statement in indexes:
-                    self.db.execute(statement)
-            if 'from_name' not in self._columns('messages'):
-                self.db.execute('ALTER TABLE messages ADD COLUMN from_name TEXT')
-            for table in ('messages', 'outbox'):
-                if 'reaction_first_failed' not in self._columns(table):
-                    self.db.execute('ALTER TABLE ' + table + ' ADD COLUMN reaction_first_failed REAL')
-            if 'batch_id' not in self._columns('messages'):
-                self.db.execute('ALTER TABLE messages ADD COLUMN batch_id INTEGER')
-            if 'as_document' not in self._columns('outbox'):
-                self.db.execute('ALTER TABLE outbox ADD COLUMN as_document INTEGER NOT NULL DEFAULT 0')
-            if 'created' not in self._columns('outbox'):
-                self.db.execute('ALTER TABLE outbox ADD COLUMN created REAL NOT NULL DEFAULT 0')
+            if 'image_source' not in self._columns('outbox'):
+                self.db.execute('ALTER TABLE outbox ADD COLUMN image_source TEXT')
+            if 'task' not in self._columns('outbox'):
+                self.db.execute('ALTER TABLE outbox ADD COLUMN task INTEGER')
+            if 'sender' not in self._columns('outbox'):
+                self.db.execute('ALTER TABLE outbox ADD COLUMN sender TEXT')
+            for column in ('prompt_effect', 'prompt_message', 'prompt_date'):
+                if column not in self._columns('envelopes'):
+                    self.db.execute('ALTER TABLE envelopes ADD COLUMN ' + column + ' INTEGER')
+            self.db.execute('DROP INDEX IF EXISTS envelopes_armed_chat')
+            self.db.execute("DELETE FROM settings WHERE key IN ('envelope_prompt_exit','envelope_prompt_date')")
             self.db.execute('''CREATE TABLE IF NOT EXISTS parent_reply_turns (
                 host TEXT NOT NULL, turn TEXT NOT NULL, provider TEXT NOT NULL,
                 topic TEXT NOT NULL REFERENCES topics(id) ON UPDATE CASCADE, outbox_start INTEGER NOT NULL,
@@ -333,6 +419,7 @@ class Store(WaitStore):
                 'CREATE UNIQUE INDEX IF NOT EXISTS messages_telegram ON messages(topic,telegram_message) WHERE telegram_message IS NOT NULL',
                 'CREATE INDEX IF NOT EXISTS messages_workers ON messages(source_worker)',
                 'CREATE INDEX IF NOT EXISTS messages_batches ON messages(batch_id) WHERE batch_id IS NOT NULL',
+                "CREATE INDEX IF NOT EXISTS messages_pending ON messages(id) WHERE delivered='pending'",
                 'CREATE UNIQUE INDEX IF NOT EXISTS messages_envelopes ON messages(source_envelope) WHERE source_envelope IS NOT NULL',
                 'CREATE INDEX IF NOT EXISTS workers_tasks ON workers(task,id)',
                 'CREATE INDEX IF NOT EXISTS workers_states ON workers(status,id)',
@@ -344,63 +431,62 @@ class Store(WaitStore):
                 'CREATE INDEX IF NOT EXISTS outbox_topic_pending ON outbox(topic,id) WHERE delivered=0',
                 "CREATE UNIQUE INDEX IF NOT EXISTS envelopes_live_name ON envelopes(name) WHERE state IN ('open','armed')",
                 "CREATE UNIQUE INDEX IF NOT EXISTS envelopes_filled_name ON envelopes(name) WHERE state='filled'",
-                "CREATE UNIQUE INDEX IF NOT EXISTS envelopes_armed_chat ON envelopes(chat) WHERE state='armed'",
                 'CREATE UNIQUE INDEX IF NOT EXISTS envelopes_token ON envelopes(token_hash) WHERE token_hash IS NOT NULL',
                 'CREATE INDEX IF NOT EXISTS problems_created ON problems(created)',
             ):
                 self.db.execute(statement)
-            self.db.execute("""UPDATE workers SET status='done',updated=?
-                WHERE status='needs_input'""", (time.time(),))
             problems = self.db.execute('PRAGMA foreign_key_check').fetchall()
             if problems:
                 raise sqlite3.IntegrityError('Migration left invalid foreign keys')
+            if not private_install:
+                from .legacy_rules import migrate as migrate_legacy_rules
+                migrate_legacy_rules(self)
             self.db.commit()
         except Exception:
             self.db.rollback()
             self.db.execute('PRAGMA foreign_keys=ON')
             self.db.close()
             raise
+        finally:
+            elapsed = time.monotonic() - started if started is not None else 0
+            if elapsed >= 5:
+                logger.warning('slow store initialization seconds=%.3f pid=%s', elapsed, os.getpid())
         self.db.execute('PRAGMA foreign_keys=ON')
 
-    def _migrate_job_iterations(self):
-        if 'iteration' not in self._columns('tasks'):
+    def _migrate_task_uids(self):
+        from .records import path
+        if 'uid' not in self._columns('tasks'):
+            self.db.execute('ALTER TABLE tasks ADD COLUMN uid TEXT')
+        if 'record_path' not in self._columns('tasks'):
+            self.db.execute('ALTER TABLE tasks ADD COLUMN record_path TEXT')
+        self.db.execute('CREATE UNIQUE INDEX IF NOT EXISTS tasks_uid ON tasks(uid)')
+        for row in self.db.execute('SELECT id FROM tasks WHERE uid IS NULL').fetchall():
+            self.db.execute('UPDATE tasks SET uid=? WHERE id=?', (self._new_task_uid(), row['id']))
+        for row in self.db.execute('SELECT id,topic,number FROM tasks WHERE record_path IS NULL').fetchall():
+            self.db.execute('UPDATE tasks SET record_path=? WHERE id=?',
+                            (str(path(self.directory, dict(row)).relative_to(self.directory)), row['id']))
+
+    def _new_task_uid(self):
+        while True:
+            uid = secrets.token_hex(4)
+            if not self.db.execute('SELECT 1 FROM tasks WHERE uid=?', (uid,)).fetchone():
+                return uid
+
+    def _migrate_followups(self):
+        schema = self.db.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='tasks'").fetchone()[0]
+        if "'proposed'" not in schema:
             objects = [row[0] for row in self.db.execute(
                 "SELECT sql FROM sqlite_master WHERE tbl_name='tasks' AND type IN ('index','trigger') AND sql IS NOT NULL")]
-            self.db.execute('''CREATE TABLE tasks_new (
-                id INTEGER PRIMARY KEY, topic TEXT NOT NULL REFERENCES topics(id),
-                number INTEGER NOT NULL, title TEXT NOT NULL,
-                status TEXT NOT NULL DEFAULT 'open' CHECK(status IN ('open','interrupted','waiting','done','dropped')),
-                worktree TEXT, notes TEXT, created REAL NOT NULL, updated REAL NOT NULL,
-                secrets TEXT, origin INTEGER REFERENCES messages(id), pr TEXT,
-                iteration INTEGER NOT NULL DEFAULT 0 CHECK(iteration>=0),
-                finish TEXT CHECK(finish IN ('merged','live','answered','delivered')), reason TEXT,
-                copy TEXT NOT NULL DEFAULT 'present' CHECK(copy IN ('present','saving','held','cleared')),
-                copy_reason TEXT, parent INTEGER REFERENCES tasks(id), UNIQUE(topic,number))''')
+            schema = re.sub(r'^CREATE TABLE (?:"tasks"|tasks)', 'CREATE TABLE tasks_new', schema, count=1)
+            schema = schema.replace("'open','interrupted','waiting','done','dropped'",
+                                    "'open','interrupted','waiting','done','dropped','proposed','expired'")
+            self.db.execute(schema)
             columns = ','.join(self._columns('tasks'))
             self.db.execute('INSERT INTO tasks_new (' + columns + ') SELECT ' + columns + ' FROM tasks')
             self.db.execute('DROP TABLE tasks')
             self.db.execute('ALTER TABLE tasks_new RENAME TO tasks')
             for statement in objects:
                 self.db.execute(statement)
-        self.db.execute('''CREATE TABLE IF NOT EXISTS task_iterations (
-            id INTEGER PRIMARY KEY, task INTEGER NOT NULL REFERENCES tasks(id),
-            k INTEGER NOT NULL CHECK(k>=0), opened REAL NOT NULL, closed REAL,
-            opened_by TEXT NOT NULL CHECK(opened_by IN ('create','owner','wait','coordinator','resume','migration')),
-            origin INTEGER REFERENCES messages(id),
-            outcome TEXT CHECK(outcome IN ('done','waiting','interrupted','dropped')), reason TEXT,
-            UNIQUE(task,k))''')
-        self.db.execute('''INSERT OR IGNORE INTO task_iterations(task,k,opened,closed,opened_by,origin,outcome)
-            SELECT id,0,created,CASE WHEN status IN ('done','dropped') THEN updated END,'migration',origin,
-                CASE WHEN status IN ('done','dropped') THEN status END FROM tasks''')
-        for table in ('workers', 'task_stamps'):
-            if 'iteration' not in self._columns(table):
-                self.db.execute('ALTER TABLE ' + table + ' ADD COLUMN iteration INTEGER NOT NULL DEFAULT 0 CHECK(iteration>=0)')
-        from .lifecycle import install_schema
-        install_schema(self)
-
-    def _migrate_mode(self):
-        from .setup_flow import restore_control_topic
-        restore_control_topic(self)
 
     def chat(self):
         return self.get('group')
@@ -437,8 +523,6 @@ class Store(WaitStore):
         return json.loads(row[0]) if row else default
 
     def put(self, key, value):
-        if key == 'transcription_model' and value not in ('parakeet', 'whisper'):
-            raise ValueError('transcription_model must be parakeet or whisper')
         previous = self.get(key) if key.endswith('_host') else None
         self.db.execute("INSERT OR REPLACE INTO settings VALUES (?,?)", (key, json.dumps(value)))
         if isinstance(previous, dict) and previous.get('id') != (value or {}).get('id'):
@@ -481,6 +565,8 @@ class Store(WaitStore):
     def transaction(self):
         nested = self.db.in_transaction
         self.db.execute('SAVEPOINT store_change' if nested else 'BEGIN IMMEDIATE')
+        started = time.monotonic()
+        pending = set()
         try:
             yield
         except BaseException:
@@ -495,13 +581,23 @@ class Store(WaitStore):
                 self.db.execute('RELEASE store_change')
             else:
                 self.db.commit()
+                pending, self.record_pending = self.record_pending, set()
+        finally:
+            elapsed = time.monotonic() - started
+            if not nested and elapsed >= 5:
+                import sys
+                caller = sys._getframe(2)
+                logger.warning('slow transaction seconds=%.3f caller=%s:%s function=%s pid=%s',
+                               elapsed, Path(caller.f_code.co_filename).name, caller.f_lineno,
+                               caller.f_code.co_name, os.getpid())
+        if pending:
+            from .records import sweep
+            sweep(self, task_ids=pending)
 
     def topics(self):
         return [dict(r) for r in self.db.execute("SELECT * FROM topics ORDER BY id")]
 
     def wait_hook(self, code, action, *args, **kwargs):
-        if self.get('waits_enabled', False) is not True:
-            return None
         try:
             with self.transaction():
                 return action(*args, **kwargs)
@@ -509,7 +605,9 @@ class Store(WaitStore):
             problems.record(self, 'waits', code, type(error).__name__)
             return None
 
-    def task_create(self, topic, title, worktree=None, notes=None, secrets=None, origin=None, finish=None, parent=None):
+    def task_create(self, topic, title, worktree=None, notes=None, secrets=None, origin=None, finish=None, parent=None, status='open', blocked_by=()):
+        if status not in ('open', 'proposed'):
+            raise ValueError('Invalid initial job status')
         if not self.topic(topic):
             raise ValueError('Unknown channel')
         if not isinstance(title, str) or not title.strip():
@@ -524,15 +622,32 @@ class Store(WaitStore):
         with self.transaction():
             if self.get('topic_lifecycle:' + topic):
                 raise ValueError('This chat is closing or closed')
-            row = self.db.execute('''INSERT INTO tasks(topic,number,title,worktree,notes,secrets,origin,created,updated,finish,parent)
-                VALUES (?,(SELECT COALESCE(MAX(number),0)+1 FROM tasks WHERE topic=?),?,?,?,?,?,?,?,?,?)''',
-                                  (topic, topic, title.strip(), worktree, notes,
-                                   json.dumps(secrets) if secrets else None, origin, now, now, finish, parent))
+            for blocker in blocked_by:
+                if type(blocker) is not int or not self.task_get(blocker):
+                    raise ValueError('Unknown blocking job')
+            from . import records
+            task_id = self.db.execute('SELECT COALESCE(MAX(id),0)+1 FROM tasks').fetchone()[0]
+            number = self.db.execute('SELECT COALESCE(MAX(number),0)+1 FROM tasks WHERE topic=?', (topic,)).fetchone()[0]
+            task = dict(id=task_id, topic=topic, number=number, title=title.strip(), status=status,
+                        notes=notes, origin=origin, created=now, updated=now, finish=finish, parent=parent,
+                        uid=self._new_task_uid(), pr=None)
+            record_path = str(records.path(self.directory, task).relative_to(self.directory))
+            row = self.db.execute('''INSERT INTO tasks(id,topic,number,title,worktree,notes,secrets,origin,created,updated,finish,parent,uid,record_path,status)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
+                                  (task_id, topic, number, title.strip(), worktree, notes,
+                                   json.dumps(secrets) if secrets else None, origin, now, now, finish, parent,
+                                   task['uid'], record_path, status))
+            self.db.executemany("INSERT INTO task_links(task,target,kind) VALUES (?,?,'blocked_by')",
+                                [(task_id, blocker) for blocker in set(blocked_by)])
+            records.add_refs(self, task_id, records.folder_refs(title + '\n' + (notes or '')))
+            if parent is not None:
+                self.record_mark_stale(parent)
             self.db.execute('''INSERT INTO task_iterations(task,k,opened,opened_by,origin)
                 VALUES (?,0,?,'create',?)''', (row.lastrowid, now, origin))
+            self.record_mark_stale(task_id)
             from .reactions import set_desired
             set_desired(self, origin, '👀')
-        if self.get('close_clears_space', False) is True:
+        if status == 'open':
             from .close_saves import scratch
             scratch(self, row.lastrowid, create=True)
         return self.task_get(row.lastrowid)
@@ -543,12 +658,63 @@ class Store(WaitStore):
                 or PR.fullmatch(pr).group(1).split('/')[-1] in ('.', '..')):
             raise ValueError('pr must be a GitHub pull request URL.')
 
-    def task_update(self, task_id, **fields):
+    def task_update(self, task_id, by='torii', **fields):
         with self.transaction():
-            return self._task_update(task_id, **fields)
+            return self._task_update(task_id, by, **fields)
 
-    def _task_update(self, task_id, **fields):
-        allowed = {'title', 'status', 'worktree', 'notes', 'note', 'secrets', 'stage', 'pr', 'finish'}
+    def task_note(self, task_id, text, by='torii', blob=True):
+        """Record one note in the job journal. With blob, also append it to tasks.notes and never fail on the journal.
+        Without blob, the note is the caller's only copy: a long note or a failed append raises.
+        A note by Torii itself is housekeeping: it goes to tasks.notes and the log, never to the journal."""
+        text = text.strip() if isinstance(text, str) else ''
+        if not text:
+            raise ValueError('Job note must not be empty')
+        if not blob and len(text) > records.NOTE_LIMIT:
+            raise ValueError('A note has at most %d characters (this one has %d). Put the text in results/ and note the path.'
+                             % (records.NOTE_LIMIT, len(text)))
+        with self.transaction():
+            task = self.task_get(task_id)
+            if not task:
+                raise ValueError('Unknown job')
+            now = time.time()
+            records.add_refs(self, task_id, records.folder_refs(text))
+            if blob:
+                self.task_row_write(task_id, {'notes': (task['notes'] + '\n' if task['notes'] else '') + text})
+            else:
+                self.db.execute('UPDATE tasks SET updated=? WHERE id=?', (now, task_id))
+            if by == 'torii' and blob:
+                logger.info('Job %s note: %s', task_id, records.clip(text, 300))
+                return dict(at=records.timestamp(now), by=by, kind='note', text=text, task=task_id, journal=None, redacted=0)
+            clean, count = records.scrub(self, records.clip(text))
+            entry = dict(at=records.timestamp(now), by=by, kind='note', text=clean)
+            try:
+                records.import_notes(self, task)
+                path = records.journal_append(self, task, [entry])
+            except (OSError, ValueError) as error:
+                if not blob:
+                    raise
+                problems.record(self, 'records', 'journal-failed', type(error).__name__, task=task_id, every=3600)
+                path = None
+        return dict(entry, task=task_id, journal=str(path) if path else None, redacted=count)
+
+    def task_row_write(self, task_id, fields):
+        if not self.db.in_transaction:
+            self.db.execute('BEGIN IMMEDIATE')
+        assignments = ','.join(name + '=?' for name in fields)
+        self.db.execute('UPDATE tasks SET ' + assignments + ' WHERE id=?', (*fields.values(), task_id))
+        if fields.get('status') in records.CLOSED:
+            self.db.execute('INSERT OR REPLACE INTO record_compactions(task,since) VALUES (?,?)', (task_id, time.time()))
+        elif 'status' in fields:
+            self.db.execute('DELETE FROM record_compactions WHERE task=?', (task_id,))
+        self.record_mark_stale(task_id)
+
+    def record_mark_stale(self, task_id):
+        self.db.execute('''INSERT INTO stale_records(task,version,since) VALUES (?,1,?)
+            ON CONFLICT(task) DO UPDATE SET version=version+1''', (task_id, time.time()))
+        self.record_pending.add(task_id)
+
+    def _task_update(self, task_id, by, **fields):
+        allowed = {'title', 'status', 'worktree', 'notes', 'note', 'secrets', 'stage', 'pr', 'finish', 'summary'}
         if not fields or set(fields) - allowed:
             raise ValueError('Unknown job field')
         if 'note' in fields and 'notes' in fields:
@@ -565,6 +731,10 @@ class Store(WaitStore):
         task = self.task_get(task_id)
         if not task:
             raise ValueError('Unknown job')
+        if task['status'] == 'expired' and 'status' in fields:
+            raise ValueError('Expired proposals cannot be reopened')
+        if task['status'] == 'proposed' and fields.get('status') == 'done':
+            raise ValueError('Promote or drop a proposal')
         if task['status'] == 'waiting' and fields.get('status') == 'open':
             raise ValueError('Use workers.spawn or pending.fire to reopen a waiting job.')
         if 'finish' in fields:
@@ -575,36 +745,52 @@ class Store(WaitStore):
         if 'pr' in fields:
             self.validate_task_pr(fields['pr'])
         link = self.code_requests.validate_job_update(self, task, fields, stage) if self.code_requests is not None else None
-        reason = fields.get('note')
-        if 'note' in fields:
-            note = fields.pop('note').strip()
-            old = task['notes']
-            fields['notes'] = (old + '\n' if old else '') + note
+        reason = fields.pop('note', None)
+        summary = fields.pop('summary', None)
+        if summary is not None and fields.get('status') not in ('done', 'dropped'):
+            raise ValueError('summary goes with status=done or dropped.')
+        current = self.task_get(task_id) if summary is not None else None
+        if current and current['status'] == fields['status'] and summary != self.task_iterations(task_id)[-1]['summary']:
+            raise ValueError('This job is already %s, so the summary was not saved. To change it, reopen the job with '
+                             'tasks.update status=open, then close it again with summary=.' % fields['status'])
+        if summary is not None and len(summary) > records.SUMMARY_LIMIT:
+            raise ValueError('A summary has at most %d characters (this one has %d). Put the rest in results/ and name the path.'
+                             % (records.SUMMARY_LIMIT, len(summary)))
         if 'title' in fields:
             fields['title'] = fields['title'].strip()
         if 'secrets' in fields:
             fields['secrets'] = json.dumps(fields['secrets']) if fields['secrets'] else None
         fields['updated'] = time.time()
-        assignments = ','.join(name + '=?' for name in fields)
         with self.transaction():
-            self.db.execute('UPDATE tasks SET ' + assignments + ' WHERE id=?',
-                            (*fields.values(), task_id))
+            if reason is not None:
+                self.task_note(task_id, reason, by)
+            if fields.get('notes'):
+                records.add_refs(self, task_id, records.folder_refs(fields['notes']))
+            self.task_row_write(task_id, fields)
             if stage is not None:
                 self.db.execute('INSERT INTO task_stamps(task,stage,created,iteration) VALUES (?,?,?,?)',
                                 (task_id, stage, fields['updated'], task['iteration']))
             if 'status' in fields and fields['status'] != task['status']:
                 closed = fields['status'] in ('done', 'dropped')
-                self.db.execute('''UPDATE task_iterations SET closed=?,outcome=?,reason=? WHERE task=? AND k=?''',
-                                (fields['updated'] if closed else None, fields['status'] if closed else None,
-                                 reason if closed else None, task_id, task['iteration']))
+                self.db.execute('''UPDATE task_iterations SET closed=?,outcome=?,reason=?,summary=COALESCE(?,summary)
+                    WHERE task=? AND k=?''', (fields['updated'] if closed else None, fields['status'] if closed else None,
+                                             reason if closed else None, summary, task_id, task['iteration']))
+                if summary:
+                    records.add_refs(self, task_id, records.refs_in(summary))
                 from .reactions import set_desired
                 set_desired(self, task['origin'], {'open': '👀', 'done': '👌', 'dropped': None}[fields['status']])
                 current = self.task_iterations(task_id)[-1]
                 if current['origin'] != task['origin']:
                     set_desired(self, current['origin'], {'open': '👀', 'done': '👌', 'dropped': None}[fields['status']])
+            if fields.get('status') == 'done' and task['status'] != 'done':
+                replaced = self.db.execute("""SELECT t.id,t.topic FROM task_links l JOIN tasks t ON t.id=l.target
+                    WHERE l.task=? AND l.kind='replaces' ORDER BY t.id""", (task_id,)).fetchall()
+                if replaced:
+                    text = 'Job %d is done. Close the replaced jobs: %s.' % (
+                        task_id, ', '.join(str(row['id']) for row in replaced))
+                    for topic in {task['topic']} | {row['topic'] for row in replaced}:
+                        self.message_event(topic, text)
             if fields.get('status') in ('done', 'dropped'):
-                from .session_storage import request as request_session_cleanup
-                request_session_cleanup(self)
                 cancelled = self.db.execute("""SELECT * FROM workers WHERE task=?
                     AND status IN ('queued','waiting_for_secret','waiting_for_quota')""", (task_id,)).fetchall()
                 self.db.execute("""UPDATE workers SET status='interrupted',updated=?
@@ -619,10 +805,12 @@ class Store(WaitStore):
                                       error='The job closed before this worker completed.')
                         self.worker_complete(worker['id'], result, 'interrupted')
                 self.host_logs_changed(task=task_id)
-                from .workspaces import request_closed_copy_cleanup
-                request_closed_copy_cleanup(self, task_id)
+                antigravity = extension.optional('antigravity_runtime')
+                if antigravity:
+                    antigravity.request_recovery(self, task_id)
+                from .close_saves import request
                 for worker in cancelled:
-                    request_closed_copy_cleanup(self, cwd=worker['cwd'])
+                    request(self, cwd=worker['cwd'])
             from .close_saves import request
             request(self, task_id)
             if self.code_requests is not None:
@@ -633,11 +821,33 @@ class Store(WaitStore):
             self.wait_hook('card-refresh-failed', self.refresh_owner_waiting)
         return self.task_get(task_id)
 
-    @staticmethod
-    def _task(row):
+    def _task(self, row):
         task = dict(row)
+        task['blocked_by'] = [item[0] for item in self.db.execute(
+            "SELECT target FROM task_links WHERE task=? AND kind='blocked_by' ORDER BY target", (task['id'],))]
         task['secrets'] = json.loads(task['secrets']) if task.get('secrets') else []
         return task
+
+    def task_link(self, task_id, target, kind, remove=False):
+        if kind not in ('blocked_by', 'related', 'discovered_from', 'replaces'):
+            raise ValueError('Unknown link kind')
+        with self.transaction():
+            if not self.task_get(task_id) or not self.task_get(target):
+                raise ValueError('Unknown job')
+            if task_id == target:
+                raise ValueError('A job cannot link to itself')
+            if not remove and kind == 'blocked_by':
+                cycle = self.db.execute("""WITH RECURSIVE ancestors(id) AS (
+                    SELECT ? UNION SELECT l.target FROM task_links l JOIN ancestors a ON l.task=a.id
+                    WHERE l.kind='blocked_by') SELECT 1 FROM ancestors WHERE id=?""", (target, task_id)).fetchone()
+                if cycle:
+                    raise ValueError('A blocking link cannot create a cycle')
+            if remove:
+                self.db.execute('DELETE FROM task_links WHERE task=? AND target=? AND kind=?', (task_id, target, kind))
+            else:
+                self.db.execute('INSERT OR IGNORE INTO task_links VALUES (?,?,?)', (task_id, target, kind))
+            self.record_mark_stale(task_id)
+            self.record_mark_stale(target)
 
     def task_get(self, task_id):
         row = self.db.execute('SELECT * FROM tasks WHERE id=?', (task_id,)).fetchone()
@@ -648,8 +858,8 @@ class Store(WaitStore):
             'SELECT * FROM task_iterations WHERE task=? ORDER BY k', (task_id,))]
 
     def tasks_list(self, topic=None, status=None):
-        if status is not None and status not in ('open', 'interrupted', 'waiting', 'done', 'dropped'):
-            raise ValueError('Job status must be open, interrupted, waiting, done, or dropped')
+        if status is not None and status not in ('open', 'interrupted', 'waiting', 'done', 'dropped', 'proposed', 'expired'):
+            raise ValueError('Unknown job status')
         return [self._task(row) for row in self.db.execute(
             'SELECT * FROM tasks WHERE (? IS NULL OR topic=?) AND (? IS NULL OR status=?) ORDER BY topic,number',
             (topic, topic, status, status))]
@@ -689,16 +899,17 @@ class Store(WaitStore):
         self.wait_hook('secret-trigger-failed', self.wait_secret_filled, topic, row['id'])
         return dict(row)
 
-    def message_event(self, topic, text, from_name=None, preview=True):
+    def message_event(self, topic, text, from_name=None, preview=True, source_worker=None):
+        """Post an event silently, or show the owner a note when from_name is set."""
         if not self.db.in_transaction:
             with self.db:
                 self.db.execute('BEGIN IMMEDIATE')
-                return self.message_event(topic, text, from_name, preview)
+                return self.message_event(topic, text, from_name, preview, source_worker)
         if not self.topic(topic):
             raise ValueError('Unknown channel')
         now = time.time()
-        self.db.execute("INSERT INTO messages(topic,kind,text,created,updated,from_name) VALUES (?,'event',?,?,?,?)",
-                        (topic, text, now, now, from_name))
+        self.db.execute("INSERT INTO messages(topic,kind,text,created,updated,from_name,source_worker) VALUES (?,'event',?,?,?,?,?)",
+                        (topic, text, now, now, from_name, source_worker))
         event = dict(self.db.execute('SELECT * FROM messages WHERE id=last_insert_rowid()').fetchone())
         if preview and from_name is not None and not self.get('topic_lifecycle:' + topic):
             preview = text
@@ -737,6 +948,9 @@ class Store(WaitStore):
             'SELECT id FROM messages WHERE batch_id=? OR id=?', (anchor, anchor))}
 
     def reconcile_message_batches(self):
+        pending = self.messages_pending()
+        if all(row['batch_id'] is None for row in pending):
+            return pending
         with self.transaction():
             pending = self.messages_pending()
             batches = {}
@@ -816,47 +1030,83 @@ class Store(WaitStore):
             worker = self.db.execute('SELECT * FROM workers WHERE id=?', (worker_id,)).fetchone()
             if not worker:
                 raise ValueError('Unknown worker')
-            saved = self.db.execute('SELECT * FROM messages WHERE source_worker=? ORDER BY id DESC LIMIT 1',
+            saved = self.db.execute("SELECT * FROM messages WHERE source_worker=? AND kind='worker_result' ORDER BY id DESC LIMIT 1",
                                     (worker_id,)).fetchone()
             if saved and saved['created'] >= worker['updated']:
                 return dict(saved)
             now = time.time()
+            from .worker_storage import handoff_missing
+            missing = handoff_missing(self, worker['task'], worker['started_at'])
+            self.db.execute('UPDATE workers SET no_handoff=? WHERE id=?', (missing, worker_id))
             payload = dict(result)
-            if self.get('auto_resume', False) is True and not getattr(self, 'network_available', True):
-                payload['network_down'] = True
-            if self.get('auto_resume', False) is True and payload.get('failure_code') == 'owner_stopped':
-                stop = self.db.execute("""SELECT params FROM service_requests WHERE op='workers.stop'
-                    AND json_extract(params,'$.worker')=? ORDER BY id DESC LIMIT 1""", (worker_id,)).fetchone()
-                if stop and json.loads(stop['params']).get('_stop_source') == 'mcp':
-                    payload.update(failure_code='coordinator_stopped', error='The coordinator stopped this worker.')
             payload.update(worker=worker_id, task=worker['task'], topic=worker['topic'],
                            provider=worker['provider'], status=status, cwd=worker['cwd'])
             self.db.execute('UPDATE workers SET status=?,pid=NULL,session=?,fresh=?,result=?,updated=? WHERE id=?',
                             (status, payload.get('session_id') or worker['session'],
                              int(bool(worker['fresh']) and not payload.get('success') and not payload.get('transcript_path')),
                              json.dumps(payload), now, worker_id))
+            payload.pop('rate_limit_info', None)
+            payload['no_handoff'] = missing
             cursor = self.db.execute('''INSERT INTO messages
                 (topic,kind,text,source_worker,created,updated) VALUES (?,?,?,?,?,?)''',
                 (worker['topic'], 'worker_result', json.dumps(payload, default=str), worker_id, now, now))
-            if not payload.get('success'):
+            if not payload.get('success') and payload.get('failure_code') not in ('blocked', 'partial'):
                 problems.record(self, 'worker', payload.get('failure_code') or 'unsuccessful',
                                 payload.get('failure_detail') or payload.get('error'),
                                 every=60 if payload.get('failure_code') == 'cleanup_failed' else None,
                                 topic=worker['topic'], task=worker['task'], worker=worker_id)
             job = self.task_get(worker['task'])
-            from .session_storage import request as request_session_cleanup
-            request_session_cleanup(self)
+            if job:
+                self.db.execute('INSERT INTO worker_ledger_pending(message,worker) VALUES (?,?)', (cursor.lastrowid, worker_id))
             self.host_logs_changed(**({'task': worker['task']} if job and job['status'] in ('done', 'dropped')
                                       else {'worker': worker_id}))
             if status in ('done', 'interrupted'):
-                from .workspaces import request_closed_copy_cleanup
-                request_closed_copy_cleanup(self, worker['task'], worker['cwd'])
+                if worker['provider'] == 'antigravity' and job and job['status'] in ('done', 'dropped'):
+                    antigravity = extension.optional('antigravity_runtime')
+                    if antigravity:
+                        antigravity.request_recovery(self, job['id'])
+                from .close_saves import request
+                request(self, worker['task'], worker['cwd'])
             return dict(self.db.execute('SELECT * FROM messages WHERE id=?', (cursor.lastrowid,)).fetchone())
 
-    def worker_event_consumed(self, worker_id, seq):
-        with self.db:
-            self.db.execute('UPDATE workers SET last_seq=MAX(last_seq,?),updated=? WHERE id=?',
-                            (seq, time.time(), worker_id))
+    def consumer(self, owner):
+        """Return the callback that remembers the last stream event a worker (its id) or a coordinator
+        session (its settings key) consumed. consumed_flush saves the sequences together, at the latest
+        a few seconds later. An event is saved at once when the database changed since the previous
+        save, so an event that had a saved effect is not replayed after a crash; that save waits for a
+        locked database like any other write. The host client calls the callback's flush before it writes
+        to the provider."""
+        def consumed(seq):
+            self.consumed[owner] = seq
+            if self.db.total_changes != self.consumed_changes:
+                self.consumed_flush(wait=True)
+        consumed.flush = lambda: self.consumed_flush(wait=True)
+        return consumed
+
+    def consumed_flush(self, wait=False):
+        """Save the buffered sequences in one transaction. Without wait, a locked database is not waited
+        for. A failed save keeps the sequences buffered for the next call."""
+        if not self.consumed or self.db.in_transaction:
+            return
+        timeout = self.db.execute('PRAGMA busy_timeout').fetchone()[0]
+        if not wait:
+            self.db.execute('PRAGMA busy_timeout=0')
+        try:
+            with self.db:
+                for owner, seq in self.consumed.items():
+                    if isinstance(owner, int):
+                        self.db.execute('UPDATE workers SET last_seq=MAX(last_seq,?),updated=? WHERE id=?',
+                                        (seq, time.time(), owner))
+                    else:
+                        self.put(owner, seq)
+        except sqlite3.OperationalError as error:
+            if 'locked' not in str(error).lower():
+                raise
+            return
+        finally:
+            self.db.execute('PRAGMA busy_timeout=%d' % timeout)
+        self.consumed.clear()
+        self.consumed_changes = self.db.total_changes
 
     def requests_uncertain(self):
         with self.db:
@@ -927,16 +1177,23 @@ class Store(WaitStore):
                 self.put('coordinator_home_topic', topic_id)
             logger.info("topic bound topic=%s cwd=%s", topic_id, cwd)
 
-    def rename_topic(self, topic_id, name):
-        previous = self.topic(topic_id)
-        self.db.execute("UPDATE topics SET name=? WHERE id=?", (name, topic_id))
-        logger.info("topic renamed topic=%s", topic_id)
-        return previous["name"]
-
     def enqueue_report(self, topic, text, kind="report", reply_to=None, reply_markup=None, edit=None,
-                       image=None, as_document=False):
+                       image=None, as_document=False, image_source=None, task=None, sender=None):
         """Queue text for a topic. `edit` names a delivered card to replace in place when the text fits one message."""
         text = text.strip() or "Finished with no text result."
+        text, known_hit = _redact_known_tokens(text, self.vault)
+        labels = Counter()
+        text, count = records.redact(text, counts=labels, replacement='[token]', assignments=False, outbound=True)
+        text, shapes = TOKEN.subn('[token]', text)
+        rotation = ''
+        if known_hit or count or shapes:
+            if known_hit:
+                labels['known'] += 1
+            if shapes:
+                labels['shape'] += 1
+            problems.record(self, 'secrets', 'outbound-token', 'labels=' + ','.join(sorted(labels)))
+            rotation = '\n\nA credential was redacted. Rotate it.'
+            text += rotation
         if image:
             first, remaining = _take_rendered(text, 1024, next_limit=MESSAGE_LIMIT)
             parts = [first]
@@ -945,17 +1202,18 @@ class Store(WaitStore):
         else:
             parts = _split_rendered(text, MESSAGE_LIMIT)
         if kind == 'parent-reply' and len(parts) > 4:
-            notice = "\n\n(Cut here. The rest is in this chat's own history.)"
+            notice = "\n\n(Cut here. The rest is in this chat's own history.)" + rotation
             parts = parts[:3] + [_split_rendered(parts[3], MESSAGE_LIMIT - len(notice))[0] + notice]
         edit = edit if len(parts) == 1 and not image else None
         for index, part in enumerate(parts):
             markup = json.dumps(reply_markup) if reply_markup and index == len(parts) - 1 else None
             cursor = self.db.execute("""INSERT INTO outbox
-                (topic,kind,text,reply_to,reply_markup,edit_message,image,as_document,created,retired) VALUES (?,?,?,?,?,?,?,?,?,
-                EXISTS(SELECT 1 FROM settings WHERE key=? AND json_extract(value,'$.state') IS NOT NULL))""",
+                (topic,kind,text,reply_to,reply_markup,edit_message,image,as_document,created,retired,image_source,task,
+                sender) VALUES (?,?,?,?,?,?,?,?,?,
+                EXISTS(SELECT 1 FROM settings WHERE key=? AND json_extract(value,'$.state') IS NOT NULL),?,?,?)""",
                                      (topic, kind, part, None if edit else reply_to, markup, edit,
                                       image if index == 0 else None, int(bool(as_document and image and index == 0)),
-                                      time.time(), 'topic_lifecycle:' + topic))
+                                      time.time(), 'topic_lifecycle:' + topic, image_source if index == 0 else None, task, sender))
         return cursor.lastrowid
 
     def _forwarded_from(self, message):
@@ -1253,14 +1511,11 @@ class Store(WaitStore):
             return None
         row = self.db.execute("""SELECT o.*,t.chat,t.thread FROM outbox o JOIN topics t ON t.id=o.topic
             WHERE o.delivered=0 AND o.retired=0 AND (t.chat=? OR o.kind='group-setup') AND o.next_attempt<=?
-            AND (o.kind NOT IN ('wait-ask','owner-waiting') OR ?=1)
             AND (o.kind!='local-note' OR NOT EXISTS
                 (SELECT 1 FROM settings WHERE key='topic_lifecycle:'||o.topic AND json_extract(value,'$.state') IS NOT NULL))
             AND (? != 'topics_off' OR t.thread=0) AND NOT EXISTS
-            (SELECT 1 FROM outbox p WHERE p.topic=o.topic AND p.delivered=0 AND p.retired=0 AND p.id<o.id
-                AND (p.kind NOT IN ('wait-ask','owner-waiting') OR ?=1))
-            ORDER BY o.id LIMIT 1""", (self.chat(), time.time(), int(self.get('waits_enabled', False) is True),
-                                       self.get('setup_problem') or '', int(self.get('waits_enabled', False) is True))).fetchone()
+            (SELECT 1 FROM outbox p WHERE p.topic=o.topic AND p.delivered=0 AND p.retired=0 AND p.id<o.id)
+            ORDER BY o.id LIMIT 1""", (self.chat(), time.time(), self.get('setup_problem') or '')).fetchone()
         if row is None:
             return None
         result = dict(row)
@@ -1270,9 +1525,8 @@ class Store(WaitStore):
         if self.get('owner') is None or self.chat() is None:
             return False
         return self.db.execute('''SELECT 1 FROM outbox o JOIN topics t ON t.id=o.topic
-            WHERE o.delivered=0 AND o.retired=0 AND t.chat=?
-                AND (o.kind NOT IN ('wait-ask','owner-waiting') OR ?=1) LIMIT 1''',
-                               (self.chat(), int(self.get('waits_enabled', False) is True))).fetchone() is not None
+            WHERE o.delivered=0 AND o.retired=0 AND t.chat=? LIMIT 1''',
+                               (self.chat(),)).fetchone() is not None
 
     def delivered(self, row_id, telegram_message):
         with self.db:
@@ -1287,12 +1541,22 @@ class Store(WaitStore):
                                AND topic=(SELECT topic FROM outbox WHERE id=?)""", (telegram_message, row_id, row_id))
             self.db.execute("UPDATE outbox SET delivered=1,telegram_message=? WHERE id=?", (telegram_message, row_id))
             from .close_saves import request
-            image = self.db.execute('SELECT image FROM outbox WHERE id=?', (row_id,)).fetchone()
+            image = self.db.execute('SELECT image,image_source FROM outbox WHERE id=?', (row_id,)).fetchone()
             if image and image['image']:
-                request(self, cwd=image['image'])
+                request(self, cwd=image['image_source'] or image['image'])
             from .parent_replies import delivered
             delivered(self, row_id)
             logger.info("outbox delivered id=%s", row_id)
+        if image and image['image']:
+            path = Path(image['image'])
+            root = self.directory / 'outbox-attachments'
+            if path.parent.parent == root:
+                try:
+                    from .close_saves import capture_sent_attachment
+                    capture_sent_attachment(self, image['image_source'], path)
+                    remove_outbox_file(path, root, self)
+                except (OSError, ValueError) as error:
+                    problems.record(self, 'outbox', 'attachment-proof-failed', type(error).__name__, message=row_id, level=logging.ERROR, every=3600)
 
     def effect_failed(self, effect, retry_after=None):
         """Schedule an envelope effect again. The caller owns the transaction."""
@@ -1306,9 +1570,12 @@ class Store(WaitStore):
 
     def image_unavailable(self, row_id):
         with self.db:
+            image = self.db.execute('SELECT image FROM outbox WHERE id=?', (row_id,)).fetchone()
             self.db.execute("""UPDATE outbox SET image=NULL,edit_message=NULL,
                 text='The image could not be sent because the file is unavailable.' || char(10,10) || text
                 WHERE id=? AND image IS NOT NULL""", (row_id,))
+            if image and image['image']:
+                self.db.cleanup_outbox_file(image['image'], self.directory / 'outbox-attachments')
 
     def delivery_failed(self, row, retry_after=None):
         delay = retry_delay(row["attempts"], retry_after)

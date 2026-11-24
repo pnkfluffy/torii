@@ -1,10 +1,17 @@
+import asyncio
 import json
+from pathlib import Path
+import subprocess
+import fcntl
+import os
+import time
 from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from coordinator import control_api, mcp, topics
 from coordinator.service import Service
+from coordinator.providers import RunResult
 from coordinator.store import Store
 from tests.test_service import ServiceTestsSupport, TOPIC, owner_update
 
@@ -12,10 +19,16 @@ from tests.test_service import ServiceTestsSupport, TOPIC, owner_update
 class WaitTests(ServiceTestsSupport, unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         await super().asyncSetUp()
-        self.store.put('waits_enabled', True)
         self.origin = self.store.message_save(TOPIC, 'owner', 'Build the job', telegram_message=405)
 
     def call(self, op, context_topic=TOPIC, **params):
+        if op == 'tasks.update' and params.get('status') == 'dropped':
+            params.setdefault('note', 'No longer needed')
+        if op == 'tasks.update' and params.get('status') == 'done':
+            job = self.store.task_get(params['task'])
+            if not self.store.db.execute('SELECT 1 FROM outbox WHERE task=?', (job['id'],)).fetchone():
+                with self.store.db:
+                    self.store.enqueue_report(job['topic'], 'Result', task=job['id'])
         result = control_api.call(self.store, op, params, topic=context_topic)
         self.assertTrue(result.ok, result.text)
         return result
@@ -56,6 +69,18 @@ class WaitTests(ServiceTestsSupport, unittest.IsolatedAsyncioTestCase):
             'message': {'message_id': telegram_message, 'message_thread_id': target['thread'],
                         'chat': {'id': target['chat'], 'type': 'supergroup'}}}}
 
+    async def test_declared_dev_worker_starts_despite_queued_steer(self):
+        task = self.job()
+        first = self.call('workers.spawn', task=task['id'], provider='codex', prompt='First', work='dev')
+        self.call('workers.steer', worker=first.data['worker'], prompt='Continue')
+        self.store.db.execute("UPDATE workers SET status='done' WHERE id=?", (first.data['worker'],))
+        wait = self.wait(task, kind='time', at='1970-01-01T00:00:01Z',
+                         then_provider='codex', then_prompt='After wait', then_work='dev')
+        await self.service.waits_once()
+        self.assertEqual(self.store.wait_get(wait['id'])['state'], 'fired')
+        rows = self.store.db.execute('SELECT prompt FROM workers WHERE task=? ORDER BY id', (task['id'],)).fetchall()
+        self.assertEqual([row['prompt'] for row in rows], ['First', 'After wait'])
+
     async def test_reply_to_ask_fires_owner_wait_once(self):
         task = self.job()
         wait = self.wait(task)
@@ -75,6 +100,44 @@ class WaitTests(ServiceTestsSupport, unittest.IsolatedAsyncioTestCase):
                          ('wait', wait['id'], reply['id']))
         self.assertEqual(self.store.accept(update), 'duplicate')
         self.assertEqual(len(self.store.task_iterations(task['id'])), 2)
+
+    async def test_then_prompt_folders_are_recorded_on_the_linked_job(self):
+        task = self.job()
+        self.wait(task, then_provider='codex', then_prompt='Then use scratch/task-55/build')
+        self.assertEqual([row[0] for row in self.store.db.execute('SELECT ref FROM task_refs WHERE task=?', (task['id'],))],
+                         ['scratch/task-55/build'])
+
+    async def test_then_prompt_receives_owner_reply(self):
+        task = self.job()
+        wait = self.wait(task, then_provider='codex', then_prompt='Use the answer: {answer}')
+        ask = await self.deliver_ask(wait)
+        self.store.accept(owner_update(901, 'Use B', reply=ask['telegram_message']))
+        worker = self.store.db.execute('SELECT prompt FROM workers WHERE task=?', (task['id'],)).fetchone()
+        self.assertEqual(worker['prompt'], 'Use the answer: Use B')
+
+    async def test_then_prompt_appends_button_choice_without_placeholder(self):
+        task = self.job()
+        wait = self.wait(task, buttons=[[{'text': 'B', 'callback_data': 'B'}]],
+                         then_provider='codex', then_prompt='Continue')
+        ask = await self.deliver_ask(wait)
+        self.store.accept(self.callback(wait, ask['telegram_message']))
+        worker = self.store.db.execute('SELECT prompt FROM workers WHERE task=?', (task['id'],)).fetchone()
+        self.assertEqual(worker['prompt'], 'Continue\n\nOwner answer: B')
+
+    async def test_photo_reply_reaches_declared_worker(self):
+        task = self.job()
+        wait = self.wait(task, then_provider='codex', then_prompt='Inspect the answer')
+        ask = await self.deliver_ask(wait)
+        update = owner_update(901, '', reply=ask['telegram_message'])
+        update['message']['photo'] = [{'file_id': 'photo-1', 'width': 100, 'height': 100}]
+        self.telegram.download_file = AsyncMock(return_value=b'\x89PNG\r\n\x1a\nphoto contents')
+        self.assertEqual(self.store.accept(update), 'queued')
+        await self.service.workers_once()
+        await asyncio.gather(*self.service.worker_tasks.values())
+        attachment = self.store.db.execute('SELECT path FROM attachments WHERE message=901').fetchone()
+        self.assertTrue(attachment['path'])
+        self.assertEqual(Path(attachment['path']).read_bytes(), b'\x89PNG\r\n\x1a\nphoto contents')
+        self.assertIn(attachment['path'], self.runner.calls[0][1])
 
     async def test_button_fires_owner_wait_with_choice_and_rejects_other_users(self):
         task = self.job()
@@ -156,6 +219,107 @@ class WaitTests(ServiceTestsSupport, unittest.IsolatedAsyncioTestCase):
                          ('fired', 'waiting'))
         self.assertEqual(self.store.task_get(task['id'])['status'], 'open')
 
+    async def test_cross_chat_job_wait_allows_workers_and_notifies_when_dependency_finishes(self):
+        dependency = self.job('Dependency', self.other_topic())
+        task = self.job('Waiter')
+        spawned = self.call('workers.spawn', task=task['id'], provider='codex', prompt='First')
+        worker = spawned.data['worker']
+        with self.store.db:
+            self.store.db.execute("UPDATE workers SET status='done',session='saved-session',fresh=0 WHERE id=?", (worker,))
+        wait = self.wait(task, kind='job', ask='Dependency is ready', job=dependency['id'],
+                         then_provider='codex', then_prompt='Follow dependency')
+        self.assertEqual(self.store.task_get(task['id'])['status'], 'open')
+        self.call('workers.steer', worker=worker, prompt='Continue')
+        self.call('workers.spawn', task=task['id'], provider='codex', prompt='Other work')
+        self.call('tasks.update', task=dependency['id'], status='done', summary='Closed in test.')
+        self.assertEqual(self.store.wait_get(wait['id'])['state'], 'fired')
+        self.assertIsNotNone(self.store.db.execute("SELECT id FROM workers WHERE task=? AND prompt='Follow dependency'",
+                                                  (task['id'],)).fetchone())
+        callbacks = [row['text'] for row in self.store.messages_pending() if row['kind'] == 'callback']
+        self.assertTrue(any('Dependency is ready' in text for text in callbacks))
+
+    async def test_cross_chat_dependency_respects_closed_and_interrupted_jobs(self):
+        other = self.other_topic()
+        for status in ('dropped', 'done', 'interrupted'):
+            with self.subTest(status=status):
+                dependency = self.job('Dependency', other)
+                task = self.job('Waiter')
+                wait = self.wait(task, kind='job', ask='Dependency is ready', job=dependency['id'],
+                                 then_provider='codex', then_prompt='Follow dependency')
+                if status == 'interrupted':
+                    with self.store.db:
+                        self.store.db.execute("UPDATE tasks SET status='interrupted' WHERE id=?", (task['id'],))
+                else:
+                    self.call('tasks.update', task=task['id'], status=status, **({'summary': 'Closed in test.'} if status in ('done', 'dropped') else {}))
+                self.assertEqual(self.store.wait_get(wait['id'])['state'], 'armed')
+                self.call('tasks.update', task=dependency['id'], status='done', summary='Closed in test.')
+                self.assertEqual(self.store.task_get(task['id'])['status'], status)
+                self.assertEqual(self.store.db.execute('SELECT COUNT(*) FROM workers WHERE task=?',
+                                                       (task['id'],)).fetchone()[0], 0)
+                if status == 'interrupted':
+                    self.assertEqual(self.store.wait_get(wait['id'])['state'], 'armed')
+                    self.call('tasks.update', task=task['id'], status='open')
+                    with patch('coordinator.waits.time.time', return_value=time.time() + 6):
+                        await self.service.waits_once()
+                    self.assertEqual(self.store.wait_get(wait['id'])['state'], 'fired')
+                    self.assertEqual(self.store.db.execute('SELECT prompt FROM workers WHERE task=?',
+                                                           (task['id'],)).fetchone()[0], 'Follow dependency')
+                else:
+                    self.assertEqual(self.store.wait_get(wait['id'])['state'], 'fired')
+                    callbacks = [row['text'] for row in self.store.messages_pending() if row['kind'] == 'callback']
+                    self.assertIn('The dependency is done. Dependency is ready\nJob %s (%s). Decide the next step.'
+                                  % (task['number'], status), callbacks)
+
+    async def test_closed_job_signal_watch_notifies_without_reopening_or_starting_worker(self):
+        for status in ('done', 'dropped'):
+            with self.subTest(status=status):
+                task = self.job('Closed ' + status)
+                self.call('tasks.update', task=task['id'], status=status, **({'summary': 'Closed in test.'} if status in ('done', 'dropped') else {}))
+                wait = self.wait(task, kind='signal', ask='Check the result', signal='ready', watch=True,
+                                 then_provider='codex', then_prompt='Follow signal')
+                self.call('pending.signal', name='ready')
+                self.assertEqual(self.store.wait_get(wait['id'])['state'], 'fired')
+                self.assertEqual(self.store.task_get(task['id'])['status'], status)
+                self.assertEqual(len(self.store.task_iterations(task['id'])), 1)
+                self.assertEqual(self.store.db.execute('SELECT COUNT(*) FROM workers WHERE task=?',
+                                                       (task['id'],)).fetchone()[0], 0)
+                callbacks = [row for row in self.store.messages_pending() if row['kind'] == 'callback']
+                expected = 'Job %s (%s): Signal ready received. Check the result. Decide the next step.' % (task['number'], status)
+                callback = next(row for row in callbacks if row['text'] == expected)
+                self.assertEqual(self.store.wait_get(wait['id'])['fired_by'], str(callback['id']))
+
+    async def test_signal_watch_armed_before_close_notifies_without_reopening(self):
+        for status in ('done', 'dropped'):
+            with self.subTest(status=status):
+                task = self.job('Watch ' + status)
+                self.call('tasks.update', task=task['id'], status='done', summary='Closed in test.')
+                wait = self.wait(task, kind='signal', ask='Check the result', signal='ready', watch=True,
+                                 then_provider='codex', then_prompt='Follow signal')
+                self.call('tasks.update', task=task['id'], status='open')
+                self.call('tasks.update', task=task['id'], status=status, **({'summary': 'Closed in test.'} if status in ('done', 'dropped') else {}))
+                self.assertEqual(self.store.wait_get(wait['id'])['state'], 'armed')
+                before = len([row for row in self.store.messages_pending() if row['kind'] == 'callback'])
+                self.call('pending.signal', name='ready')
+                self.assertEqual(self.store.wait_get(wait['id'])['state'], 'fired')
+                self.assertEqual(self.store.task_get(task['id'])['status'], status)
+                self.assertEqual(len(self.store.task_iterations(task['id'])), 1)
+                self.assertEqual(self.store.db.execute('SELECT COUNT(*) FROM workers WHERE task=?',
+                                                       (task['id'],)).fetchone()[0], 0)
+                callbacks = [row for row in self.store.messages_pending() if row['kind'] == 'callback'][before:]
+                expected = 'Job %s (%s): Signal ready received. Check the result. Decide the next step.' % (task['number'], status)
+                self.assertEqual([row['text'] for row in callbacks], [expected])
+                self.assertEqual(self.store.wait_get(wait['id'])['fired_by'], str(callbacks[0]['id']))
+
+    async def test_cross_chat_dependency_does_not_override_owner_wait(self):
+        dependency = self.job('Dependency', self.other_topic())
+        task = self.job('Waiter')
+        job_wait = self.wait(task, kind='job', ask='Dependency is ready', job=dependency['id'])
+        owner_wait = self.wait(task, ask='Choose the next step')
+        self.call('tasks.update', task=dependency['id'], status='done', summary='Closed in test.')
+        self.assertEqual(self.store.wait_get(job_wait['id'])['state'], 'fired')
+        self.assertEqual(self.store.wait_get(owner_wait['id'])['state'], 'armed')
+        self.assertEqual(self.store.task_get(task['id'])['status'], 'waiting')
+
     async def test_declared_worker_refusal_still_fires_and_wakes_coordinator(self):
         task = self.job()
         wait = self.wait(task, kind='time', at='1970-01-01T00:00:01Z',
@@ -167,6 +331,74 @@ class WaitTests(ServiceTestsSupport, unittest.IsolatedAsyncioTestCase):
         callbacks = [row for row in self.store.messages_pending() if row['kind'] == 'callback']
         self.assertEqual(len(callbacks), 1)
         self.assertIn('OpenCode workers are off.', callbacks[0]['text'])
+
+    async def test_due_wait_retries_after_active_idle_trim(self):
+        from coordinator import idle_trim
+        task = self.job()
+        wait = self.wait(task, kind='time', at='1970-01-01T00:00:01Z',
+                         then_provider='opencode', then_prompt='Continue')
+        fd = idle_trim.lock_file(self.store.directory, task['id'])
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            with self.store.db:
+                self.store.db.execute('INSERT INTO idle_trims(task,idle_since,active) VALUES (?,0,1)', (task['id'],))
+            await self.service.waits_once()
+            self.assertEqual(self.store.wait_get(wait['id'])['state'], 'armed')
+            self.assertEqual(self.store.task_get(task['id'])['status'], 'waiting')
+        finally:
+            os.close(fd)
+        with self.store.db:
+            self.store.db.execute('UPDATE waits SET next_check=0 WHERE id=?', (wait['id'],))
+        await self.service.waits_once()
+        self.assertEqual(self.store.wait_get(wait['id'])['state'], 'fired')
+
+    async def test_job_wait_retries_after_active_idle_trim(self):
+        from coordinator import idle_trim
+        dependency = self.job('Dependency')
+        task = self.job('Waiter')
+        wait = self.wait(task, kind='job', job=dependency['id'], on='done',
+                         then_provider='codex', then_prompt='Continue')
+        fd = idle_trim.lock_file(self.store.directory, task['id'])
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            with self.store.db:
+                self.store.db.execute('INSERT INTO idle_trims(task,idle_since,active) VALUES (?,0,1)', (task['id'],))
+            self.call('tasks.update', task=dependency['id'], status='done', summary='Closed in test.')
+            self.assertEqual(self.store.wait_get(wait['id'])['state'], 'armed')
+        finally:
+            os.close(fd)
+        with patch('coordinator.waits.time.time', return_value=time.time() + 6):
+            for unused in range(3):
+                await self.service.waits_once()
+                await self.service.controls_once()
+        self.assertEqual((self.store.wait_get(wait['id'])['state'], self.store.wait_get(wait['id'])['outcome']),
+                         ('fired', 'done'))
+        self.assertEqual(self.store.task_get(task['id'])['status'], 'open')
+        self.assertEqual(self.store.db.execute('SELECT provider FROM workers WHERE task=?', (task['id'],)).fetchone()[0], 'codex')
+
+    async def test_owner_reply_retries_after_active_idle_trim(self):
+        from coordinator import idle_trim
+        task = self.job()
+        wait = self.wait(task, then_provider='codex', then_prompt='Continue')
+        ask = await self.deliver_ask(wait)
+        fd = idle_trim.lock_file(self.store.directory, task['id'])
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            with self.store.db:
+                self.store.db.execute('INSERT INTO idle_trims(task,idle_since,active) VALUES (?,0,1)', (task['id'],))
+            self.assertEqual(self.store.accept(owner_update(901, 'Use A', reply=ask['telegram_message'])), 'queued')
+            reply = self.store.db.execute('SELECT id FROM messages WHERE telegram_message=901').fetchone()[0]
+            self.assertEqual(self.store.wait_get(wait['id'])['state'], 'armed')
+        finally:
+            os.close(fd)
+        with patch('coordinator.waits.time.time', return_value=time.time() + 6):
+            for unused in range(3):
+                await self.service.waits_once()
+                await self.service.controls_once()
+        self.assertEqual((self.store.wait_get(wait['id'])['state'], self.store.wait_get(wait['id'])['outcome']),
+                         ('fired', 'answered'))
+        self.assertEqual(self.store.task_iterations(task['id'])[-1]['origin'], reply)
+        self.assertEqual(self.store.db.execute('SELECT provider FROM workers WHERE task=?', (task['id'],)).fetchone()[0], 'codex')
 
     async def test_failed_round_creation_rolls_back_firing_and_callback(self):
         task = self.job()
@@ -206,7 +438,7 @@ class WaitTests(ServiceTestsSupport, unittest.IsolatedAsyncioTestCase):
                 task = self.job('Waiter ' + status)
                 wait = self.wait(task, kind='job', ask='Wait for the dependency',
                                  job=dependency['id'], on='done')
-                self.call('tasks.update', task=dependency['id'], status=status, note='Dependency ' + status)
+                self.call('tasks.update', task=dependency['id'], status=status, **({'summary': 'Closed in test.'} if status in ('done', 'dropped') else {}), note='Dependency ' + status)
                 fired = self.store.wait_get(wait['id'])
                 self.assertEqual((fired['state'], fired['outcome']), ('fired', status))
                 self.assertEqual((self.store.task_get(task['id'])['status'],
@@ -341,18 +573,42 @@ class WaitTests(ServiceTestsSupport, unittest.IsolatedAsyncioTestCase):
         task = self.job()
         wait = self.wait(task, kind='time', ask='Run the planned check', at='1970-01-01T00:33:20+00:00',
                          then_provider='codex', then_prompt='Check the saved result',
-                         then_model='gpt-6.1-sol', then_effort='max', then_work='research')
+                         then_model='gpt-6.1-sol', then_effort='xhigh', then_work='research')
         with patch('coordinator.store.time.time', return_value=2000):
             await self.service.waits_once()
             await self.service.waits_once()
         workers = [dict(row) for row in self.store.db.execute('SELECT * FROM workers WHERE task=?', (task['id'],))]
         self.assertEqual([(row['provider'], row['prompt'], row['model'], row['effort'], row['work'],
                            row['iteration'], row['status']) for row in workers],
-                         [('codex', 'Check the saved result', 'gpt-6.1-sol', 'max', 'research', 1, 'queued')])
+                         [('codex', 'Check the saved result', 'gpt-6.1-sol', 'xhigh', 'research', 1, 'queued')])
         self.assertEqual(self.store.wait_get(wait['id'])['state'], 'fired')
         current = self.store.task_iterations(task['id'])[-1]
         origin = dict(self.store.db.execute('SELECT * FROM messages WHERE id=?', (current['origin'],)).fetchone())
         self.assertEqual((current['opened_by'], current['wait'], origin['kind']), ('wait', wait['id'], 'callback'))
+
+    async def test_time_wait_dev_creates_worktree_before_worker_launch(self):
+        project = self.root / 'project'
+        project.mkdir()
+        for args in (('init', '-q'), ('config', 'user.name', 'Test'), ('config', 'user.email', 'test@example.invalid')):
+            subprocess.run(('git', '-C', str(project), *args), check=True)
+        (project / 'file').write_text('base')
+        subprocess.run(('git', '-C', str(project), 'add', 'file'), check=True)
+        subprocess.run(('git', '-C', str(project), 'commit', '-qm', 'base'), check=True)
+        self.store.db.execute('UPDATE topics SET cwd=? WHERE id=?', (str(project), TOPIC))
+        task = self.store.task_create(TOPIC, 'Dev', origin=self.origin['id'])
+        wait = self.wait(task, kind='time', at='1970-01-01T00:00:01Z', then_provider='codex',
+                         then_prompt='Build it', then_work='dev')
+        await self.service.waits_once()
+        self.assertEqual(self.store.wait_get(wait['id'])['state'], 'fired')
+        worker = dict(self.store.db.execute('SELECT * FROM workers WHERE task=?', (task['id'],)).fetchone())
+        self.assertTrue(json.loads(worker['workspace'])['pending_worktree'])
+        self.service.workers.runner.run = AsyncMock(return_value=RunResult(
+            '00000000-0000-4000-8000-000000000001', text='done', success=True))
+        done = await self.service.workers.run(worker, self.store.topic(TOPIC))
+        self.assertTrue(json.loads(done['result'])['success'])
+        self.assertEqual(done['cwd'], self.store.task_get(task['id'])['worktree'])
+        self.assertTrue(Path(done['cwd']).is_dir())
+        self.assertEqual(self.service.workers.runner.run.call_args.args[2], Path(done['cwd']))
 
     async def test_owner_list_filters_time_waits_and_includes_held_copies(self):
         owner = self.wait(self.job())
@@ -410,9 +666,9 @@ class WaitTests(ServiceTestsSupport, unittest.IsolatedAsyncioTestCase):
         other_text = self.store.db.execute('SELECT text FROM outbox WHERE reply_to=914').fetchone()[0]
         self.assertEqual(other_text, 'Waiting on you\nOther · Other job: Choose the other job')
 
-    async def test_time_watch_reopens_done_job_without_changing_its_previous_outcome(self):
+    async def test_time_watch_does_not_reopen_done_job(self):
         task = self.job()
-        self.call('tasks.update', task=task['id'], status='done')
+        self.call('tasks.update', task=task['id'], status='done', summary='Closed in test.')
         previous = self.store.task_iterations(task['id'])[0]
         wait = self.wait(task, kind='time', ask='Check the delivered result',
                          at='1970-01-01T00:33:20+00:00', watch=True)
@@ -420,7 +676,8 @@ class WaitTests(ServiceTestsSupport, unittest.IsolatedAsyncioTestCase):
         with patch('coordinator.store.time.time', return_value=2000):
             await self.service.waits_once()
         self.assertEqual((self.store.task_get(task['id'])['status'], self.store.task_get(task['id'])['iteration']),
-                         ('open', 1))
+                         ('done', 0))
+        self.assertEqual(self.store.wait_get(wait['id'])['state'], 'fired')
         self.assertEqual(self.store.task_iterations(task['id'])[0], previous)
 
     async def test_invalid_waits_and_unrelated_fire_messages_are_refused_without_mutation(self):
@@ -450,7 +707,7 @@ class WaitTests(ServiceTestsSupport, unittest.IsolatedAsyncioTestCase):
         result = mcp.dispatch(self.store, {'method': 'tools/call', 'params': {
             'name': 'tasks_wait', 'arguments': {'task': task['id'], 'kind': 'owner', 'ask': 'Pick A or B'}}}, topic=TOPIC)
         self.assertFalse(result.get('isError', False), result)
-        wait = json.loads(result['content'][0]['text'].splitlines()[-1])
+        wait = self.store.wait_get(json.loads(result['content'][0]['text'].splitlines()[-1])['id'])
         self.assertEqual((wait['kind'], wait['state']), ('owner', 'armed'))
         other = self.wait(self.job('Other job', self.other_topic()))
         listed = mcp.dispatch(self.store, {'method': 'tools/call', 'params': {

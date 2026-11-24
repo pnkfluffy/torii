@@ -1,4 +1,5 @@
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
 import fcntl
 import hashlib
 import io
@@ -11,6 +12,7 @@ import time
 from pathlib import Path
 import tarfile
 import tempfile
+import threading
 import unittest
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -22,18 +24,144 @@ class SetupTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name).resolve()
-        self.mac_version = patch.object(transcription.platform, 'mac_ver', return_value=('14.0', ('', '', ''), 'arm64'))
+        self.mac_version = patch.object(transcription.host_os.platform, 'mac_ver', return_value=('14.0', ('', '', ''), 'arm64'))
         self.mac_version.start()
 
     def tearDown(self):
         self.mac_version.stop()
         self.temp.cleanup()
 
+    def test_setup_migrates_cached_model_to_state_without_removing_original(self):
+        home = self.root / 'home'
+        old = home / '.cache/huggingface/hub/models--mlx-community--whisper-large-v3-turbo'
+        (old / 'blobs').mkdir(parents=True)
+        (old / 'blobs/weights').write_bytes(b'model')
+        (old / 'snapshots/revision').mkdir(parents=True)
+        (old / 'snapshots/revision/weights.safetensors').symlink_to('../../blobs/weights')
+        env = {'HOME': str(home), 'PATH': '/fake/bin'}
+        def run(command, **kwargs):
+            if 'venv' in command:
+                python = Path(command[-1]) / 'bin/python'
+                python.parent.mkdir(parents=True)
+                python.write_text('fixture')
+            self.assertEqual(kwargs['env']['HF_HOME'], str(self.root / 'state/transcription/huggingface'))
+        with patch.object(transcription.host_os.platform, 'system', return_value='Darwin'), \
+                patch.object(transcription.host_os.platform, 'machine', return_value='arm64'), \
+                patch.object(transcription, 'uv_binary', return_value='/fake/uv'), \
+                patch.object(transcription.subprocess, 'run', side_effect=run):
+            transcription.prepare_environment(self.root / 'state', env, backend='whisper')
+        migrated = self.root / 'state/transcription/huggingface/hub' / old.name
+        self.assertEqual((migrated / 'snapshots/revision/weights.safetensors').read_bytes(), b'model')
+        self.assertEqual((old / 'blobs/weights').read_bytes(), b'model')
+
+    def test_migration_retries_after_partial_staging(self):
+        home = self.root / 'home'
+        name = 'models--mlx-community--whisper-large-v3-turbo'
+        old = home / '.cache/huggingface/hub' / name
+        (old / 'blobs').mkdir(parents=True)
+        (old / 'blobs/weights').write_bytes(b'model')
+        (old / 'snapshots/revision').mkdir(parents=True)
+        (old / 'snapshots/revision/weights').symlink_to('../../blobs/weights')
+        hub = self.root / 'state/transcription/huggingface/hub'
+        staging = hub / (name + '.migrating')
+        (staging / 'snapshots/revision').mkdir(parents=True)
+        (staging / 'snapshots/revision/weights').symlink_to('../../blobs/weights')
+        def run(command, **kwargs):
+            if 'venv' in command:
+                python = Path(command[-1]) / 'bin/python'
+                python.parent.mkdir(parents=True)
+                python.write_text('fixture')
+        with patch.object(transcription.host_os.platform, 'system', return_value='Darwin'), \
+                patch.object(transcription.host_os.platform, 'machine', return_value='arm64'), \
+                patch.object(transcription, 'uv_binary', return_value='/fake/uv'), \
+                patch.object(transcription.subprocess, 'run', side_effect=run):
+            transcription.prepare_environment(self.root / 'state', {'HOME': str(home), 'PATH': '/fake/bin'}, backend='whisper')
+        self.assertEqual((hub / name / 'snapshots/revision/weights').read_bytes(), b'model')
+        self.assertFalse(staging.exists())
+
+    def test_migration_failure_cleans_staging_and_uses_old_cache(self):
+        self.assert_legacy_fallback(copy_failure=True)
+
+    def test_low_disk_space_uses_old_cache(self):
+        self.assert_legacy_fallback(copy_failure=False)
+
+    def test_setup_returns_old_cache_after_migration_failure(self):
+        home = self.root / 'home'
+        process = Mock(returncode=0, pid=123)
+        process.communicate = AsyncMock(return_value=(b'model-cache-fallback\n/fake/python\n', b''))
+        with patch.object(transcription, 'environment', return_value={'HOME': str(home), 'PATH': '/fake/bin'}), \
+                patch.object(transcription, 'check_voice_support'), \
+                patch.object(transcription.asyncio, 'create_subprocess_exec', AsyncMock(return_value=process)), \
+                patch.object(transcription.os, 'killpg'):
+            python, env = asyncio.run(transcription.setup(self.root / 'state', backend='whisper'))
+        self.assertEqual(python, '/fake/python')
+        self.assertEqual(env['HF_HOME'], str(home / '.cache/huggingface'))
+        self.assertEqual(env['HF_HUB_OFFLINE'], '1')
+
+    def assert_legacy_fallback(self, copy_failure):
+        home = self.root / 'home'
+        old = home / '.cache/huggingface'
+        name = 'models--mlx-community--whisper-large-v3-turbo'
+        (old / 'hub' / name / 'blobs').mkdir(parents=True)
+        (old / 'hub' / name / 'blobs/weights').write_bytes(b'model')
+        hub = self.root / 'state/transcription/huggingface/hub'
+        seen = []
+        def run(command, **kwargs):
+            if 'venv' in command:
+                python = Path(command[-1]) / 'bin/python'
+                python.parent.mkdir(parents=True)
+                python.write_text('fixture')
+            seen.append(kwargs['env']['HF_HOME'])
+        def copy(source, target, **kwargs):
+            Path(target).mkdir(parents=True)
+            (Path(target) / 'partial').write_text('partial')
+            raise OSError('injected copy failure')
+        with patch.object(transcription.host_os.platform, 'system', return_value='Darwin'), \
+                patch.object(transcription.host_os.platform, 'machine', return_value='arm64'), \
+                patch.object(transcription, 'uv_binary', return_value='/fake/uv'), \
+                patch.object(transcription.subprocess, 'run', side_effect=run), \
+                patch.object(transcription.shutil, 'disk_usage', return_value=(100, 99, 1) if not copy_failure else (100, 0, 100)), \
+                patch.object(transcription.shutil, 'copytree', side_effect=copy) as copying:
+            transcription.prepare_environment(self.root / 'state', {'HOME': str(home), 'PATH': '/fake/bin'}, backend='whisper')
+        self.assertEqual(seen, [str(old)] * 3)
+        self.assertFalse((hub / (name + '.migrating')).exists())
+        self.assertTrue((old / 'hub' / name / 'blobs/weights').is_file())
+        self.assertEqual(copying.called, copy_failure)
+
+    def test_model_setups_for_different_backends_do_not_overlap(self):
+        active = []
+        overlaps = []
+        guard = threading.Lock()
+        def run(command, **kwargs):
+            if 'venv' in command:
+                python = Path(command[-1]) / 'bin/python'
+                python.parent.mkdir(parents=True)
+                python.write_text('fixture')
+            if command[-1] == '--setup':
+                with guard:
+                    active.append(command)
+                    overlaps.append(len(active))
+                time.sleep(.3)
+                with guard:
+                    active.remove(command)
+        with patch.object(transcription.host_os.platform, 'system', return_value='Darwin'), \
+                patch.object(transcription.host_os.platform, 'machine', return_value='arm64'), \
+                patch.object(transcription.host_os.platform, 'mac_ver', return_value=('27.0', (), 'arm64')), \
+                patch.object(transcription.shutil, 'which', return_value='/fake/ffmpeg'), \
+                patch.object(transcription, 'uv_binary', return_value='/fake/uv'), \
+                patch.object(transcription.subprocess, 'run', side_effect=run):
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                calls = [pool.submit(transcription.prepare_environment, self.root, {'PATH': '/fake/bin'}, backend)
+                         for backend in ('whisper', 'parakeet')]
+                for call in calls:
+                    call.result()
+        self.assertEqual(overlaps, [1, 1])
+
     def test_voice_refuses_unsupported_macs_before_install(self):
         for machine, version in (('x86_64', '14.0'), ('arm64', '13.6')):
-            with patch.object(transcription.platform, 'system', return_value='Darwin'), \
-                    patch.object(transcription.platform, 'machine', return_value=machine), \
-                    patch.object(transcription.platform, 'mac_ver', return_value=(version, ('', '', ''), machine)):
+            with patch.object(transcription.host_os.platform, 'system', return_value='Darwin'), \
+                    patch.object(transcription.host_os.platform, 'machine', return_value=machine), \
+                    patch.object(transcription.host_os.platform, 'mac_ver', return_value=(version, ('', '', ''), machine)):
                 with self.assertRaisesRegex(transcription.UnsupportedVoice, 'macOS 14'):
                     transcription.prepare_environment(self.root, {'PATH': '/usr/bin:/bin'}, backend='whisper')
         self.assertFalse((self.root / 'transcription').exists())
@@ -50,8 +178,8 @@ class SetupTests(unittest.TestCase):
         archive = self.archive()
         digest = hashlib.sha256(archive).hexdigest()
         with patch.object(transcription.shutil, 'which', return_value=None), \
-                patch.object(transcription.platform, 'system', return_value='Darwin'), \
-                patch.object(transcription.platform, 'machine', return_value='arm64'), \
+                patch.object(transcription.host_os.platform, 'system', return_value='Darwin'), \
+                patch.object(transcription.host_os.platform, 'machine', return_value='arm64'), \
                 patch.dict(transcription.UV_ARCHIVES, {('Darwin', 'arm64'): ('test', digest)}), \
                 patch.object(transcription.urllib.request, 'urlopen', return_value=io.BytesIO(archive)) as fetch:
             binary = Path(transcription.uv_binary(self.root, {'PATH': '/usr/bin:/bin'}))
@@ -63,8 +191,8 @@ class SetupTests(unittest.TestCase):
 
     def test_bad_uv_hash_never_creates_an_executable(self):
         with patch.object(transcription.shutil, 'which', return_value=None), \
-                patch.object(transcription.platform, 'system', return_value='Darwin'), \
-                patch.object(transcription.platform, 'machine', return_value='arm64'), \
+                patch.object(transcription.host_os.platform, 'system', return_value='Darwin'), \
+                patch.object(transcription.host_os.platform, 'machine', return_value='arm64'), \
                 patch.object(transcription.urllib.request, 'urlopen', return_value=io.BytesIO(self.archive())):
             with self.assertRaisesRegex(RuntimeError, 'checksum'):
                 transcription.uv_binary(self.root, {'PATH': '/usr/bin:/bin'})
@@ -79,8 +207,8 @@ class SetupTests(unittest.TestCase):
                     python.parent.mkdir(parents=True)
                     python.write_text('fake-python')
             with self.subTest(system=system), \
-                    patch.object(transcription.platform, 'system', return_value=system), \
-                    patch.object(transcription.platform, 'machine', return_value=machine), \
+                    patch.object(transcription.host_os.platform, 'system', return_value=system), \
+                    patch.object(transcription.host_os.platform, 'machine', return_value=machine), \
                     patch.object(transcription, 'uv_binary', return_value='/fake/uv'), \
                     patch.object(transcription.subprocess, 'run', side_effect=run) as launch:
                 self.assertEqual(transcription.prepare_environment(state, {'PATH': '/usr/bin:/bin'}, backend='whisper'), str(python))
@@ -98,8 +226,8 @@ class SetupTests(unittest.TestCase):
                 self.assertEqual(launch.call_args.args[0], [str(python), str(Path(transcribe.__file__)), '--backend', 'whisper', '--check'])
 
     def test_failed_setup_is_retried_without_a_ready_marker(self):
-        with patch.object(transcription.platform, 'system', return_value='Darwin'), \
-                patch.object(transcription.platform, 'machine', return_value='arm64'), \
+        with patch.object(transcription.host_os.platform, 'system', return_value='Darwin'), \
+                patch.object(transcription.host_os.platform, 'machine', return_value='arm64'), \
                 patch.object(transcription, 'uv_binary', return_value='/fake/uv'), \
                 patch.object(transcription.subprocess, 'run', side_effect=RuntimeError('fake failure')):
             with self.assertRaises(RuntimeError):
@@ -288,8 +416,8 @@ print('loop closed')
         with patch.dict('sys.modules', {'huggingface_hub': hub}):
             for system, machine, model in (('Darwin', 'arm64', transcribe.MAC_MODEL),
                                            ('Linux', 'x86_64', transcribe.LINUX_MODEL)):
-                with patch.object(transcribe.platform, 'system', return_value=system), \
-                        patch.object(transcribe.platform, 'machine', return_value=machine):
+                with patch.object(transcription.host_os.platform, 'system', return_value=system), \
+                        patch.object(transcription.host_os.platform, 'machine', return_value=machine):
                     transcribe.model_path(setup=True, backend='whisper')
                     self.assertEqual(hub.snapshot_download.call_args.kwargs['revision'], model[1])
                     self.assertFalse(hub.snapshot_download.call_args.kwargs['local_files_only'])
@@ -307,11 +435,11 @@ print('loop closed')
                 patch.object(transcribe, 'decode', return_value=samples) as decode, \
                 patch.object(transcribe.sys, 'argv', ['transcribe.py', '--backend', 'whisper', '/audio.ogg']), \
                 patch('builtins.print') as output:
-            with patch.object(transcribe, 'uses_mlx', return_value=True):
+            with patch.object(transcribe.host_os, 'apple_silicon', return_value=True):
                 transcribe.main()
             mlx.transcribe.assert_called_once_with(samples, path_or_hf_repo='/cached/model')
             output.assert_called_with('Mac transcript')
-            with patch.object(transcribe, 'uses_mlx', return_value=False):
+            with patch.object(transcribe.host_os, 'apple_silicon', return_value=False):
                 transcribe.main()
             faster.WhisperModel.return_value.transcribe.assert_called_once_with(samples)
             output.assert_called_with('Linux transcript')
@@ -394,9 +522,9 @@ class SelectedBackendTests(unittest.TestCase):
                     python = Path(command[-1]) / 'bin/python'
                     python.parent.mkdir(parents=True)
                     python.write_text('fixture')
-            with patch.object(transcription.platform, 'system', return_value='Darwin'), \
-                    patch.object(transcription.platform, 'machine', return_value='arm64'), \
-                    patch.object(transcription.platform, 'mac_ver', return_value=('27.0', (), 'arm64')), \
+            with patch.object(transcription.host_os.platform, 'system', return_value='Darwin'), \
+                    patch.object(transcription.host_os.platform, 'machine', return_value='arm64'), \
+                    patch.object(transcription.host_os.platform, 'mac_ver', return_value=('27.0', (), 'arm64')), \
                     patch.object(transcription.shutil, 'which', return_value='/fake/ffmpeg'), \
                     patch.object(transcription, 'uv_binary', return_value='/fake/uv'), \
                     patch.object(transcription.subprocess, 'run', side_effect=run) as launch:
@@ -416,7 +544,7 @@ class SelectedBackendTests(unittest.TestCase):
 
     def test_parakeet_refuses_unsupported_platform_before_setup(self):
         with tempfile.TemporaryDirectory() as temporary, \
-                patch.object(transcription.platform, 'system', return_value='Linux'), \
+                patch.object(transcription.host_os.platform, 'system', return_value='Linux'), \
                 patch.object(transcription, 'uv_binary') as install:
             with self.assertRaisesRegex(transcription.UnsupportedVoice, 'Parakeet.*Apple silicon'):
                 transcription.prepare_environment(temporary, {'PATH': '/fake/bin'}, backend='parakeet')
@@ -430,9 +558,9 @@ class SelectedBackendTests(unittest.TestCase):
 
     def test_missing_ffmpeg_has_a_clear_reason_before_any_setup_process(self):
         with tempfile.TemporaryDirectory() as temporary, \
-                patch.object(transcription.platform, 'system', return_value='Darwin'), \
-                patch.object(transcription.platform, 'machine', return_value='arm64'), \
-                patch.object(transcription.platform, 'mac_ver', return_value=('27.0', (), 'arm64')), \
+                patch.object(transcription.host_os.platform, 'system', return_value='Darwin'), \
+                patch.object(transcription.host_os.platform, 'machine', return_value='arm64'), \
+                patch.object(transcription.host_os.platform, 'mac_ver', return_value=('27.0', (), 'arm64')), \
                 patch.object(transcription.shutil, 'which', return_value=None), \
                 patch.object(transcription.asyncio, 'create_subprocess_exec') as launch:
             with self.assertRaisesRegex(transcription.UnsupportedVoice, 'ffmpeg.*required.*Parakeet'):

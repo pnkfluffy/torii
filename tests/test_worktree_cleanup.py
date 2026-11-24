@@ -2,6 +2,7 @@ import asyncio
 import json
 import os
 from pathlib import Path
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -10,10 +11,10 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import AsyncMock, patch
 
-from coordinator import control_api, workspaces
+from coordinator import control_api, host_os, workspaces
 from coordinator.service import Service
 from coordinator.store import Store
-from coordinator.workspaces import cleanup_closed_worktrees, cleanup_task_workspace, prepare_task_workspace
+from coordinator.workspaces import prepare_task_workspace
 from tests.support import until_unlocked
 
 
@@ -22,7 +23,7 @@ TOPIC = '1:2'
 
 class WorktreeCleanupTests(unittest.TestCase):
     def setUp(self):
-        self.temp = tempfile.TemporaryDirectory(prefix='worktree-cleanup-', dir=Path.home())
+        self.temp = tempfile.TemporaryDirectory(prefix='w', dir=Path.home())
         self.root = Path(self.temp.name).resolve()
         self.project = self.root / 'project'
         self.project.mkdir()
@@ -69,7 +70,7 @@ class WorktreeCleanupTests(unittest.TestCase):
         task = self.call('tasks.create', title='Keep job code').data
         self.call('worktree.create', task=task['id'])
         if closed:
-            self.call('tasks.update', task=task['id'], status=status)
+            self.call('tasks.update', task=task['id'], status=status, **({'summary': 'Closed in test.'} if status in ('done', 'dropped') else {}), **({'note': 'No longer needed'} if status == 'dropped' else {}))
             with self.store.db:
                 self.store.db.execute('UPDATE tasks SET updated=? WHERE id=?', (self.now - age, task['id']))
         return self.store.task_get(task['id'])
@@ -86,27 +87,86 @@ class WorktreeCleanupTests(unittest.TestCase):
     def registrations(self):
         return self.git('worktree', 'list', '--porcelain').stdout
 
-    def assert_retained(self, task):
-        target = self.target(task)
-        before = self.registrations()
-        self.assertIsNone(asyncio.run(cleanup_task_workspace(self.store, task['id'], now=self.now)))
-        self.assertTrue(target.exists() or target.is_symlink())
-        self.assertEqual(self.registrations(), before)
-        return target
-
-    def test_pending_image_keeps_old_copy_until_delivered_then_swept(self):
+    def test_timed_out_deletion_stage_scan_preserves_copy(self):
         task = self.job()
         target = self.target(task)
-        with self.store.db:
-            row_id = self.store.enqueue_report(TOPIC, 'Queued image', image=str(target / 'README.md'))
-        asyncio.run(cleanup_closed_worktrees(self.store, now=self.now))
-        self.assertEqual((target / 'README.md').read_text(), 'base\n')
-        self.assertIn('worktree ' + str(target) + '\n', self.registrations())
-        self.store.delivered(row_id, 100)
-        asyncio.run(cleanup_closed_worktrees(self.store, now=self.now))
-        self.assertFalse(target.exists())
-        self.assertEqual((self.trash / target.name / 'README.md').read_text(), 'base\n')
-        self.assertEqual(self.git('rev-parse', 'torii/task-' + str(task['id'])).stdout.strip(), self.base)
+        original = workspaces.scan_process.run
+        def never(function, *args, **kwargs):
+            if function is workspaces._scan_deletion_stages:
+                return original(time.sleep, 60, timeout=0.2)
+            return original(function, *args, **kwargs)
+        with patch.object(workspaces.scan_process, 'run', side_effect=never):
+            asyncio.run(workspaces.cleanup_closed_copies(self.store, sweep=True))
+        self.assertTrue(target.exists())
+        self.assertIsNotNone(self.store.db.execute(
+            "SELECT 1 FROM problems WHERE code='closed-copy-scan-failed'").fetchone())
+
+    def test_scan_failures_remain_closed_when_problem_reporting_fails(self):
+        stage = self.state / 'worktree-deletions' / 'stage'
+        operations = (
+            lambda: workspaces._save_deletion_bounded(self.store, stage, {}),
+            lambda: workspaces.async_prepare_deletion_stage(self.store, stage, {}),
+            lambda: workspaces.async_detach_staged(self.store, stage, {}),
+            lambda: workspaces.async_deletion_stages(self.store),
+        )
+        with patch.object(workspaces.scan_process, 'run_async', side_effect=workspaces.scan_process.ScanError('timeout')):
+            with patch('coordinator.problems.record', side_effect=RuntimeError('report failed')):
+                with patch.object(workspaces.logger, 'error', side_effect=RuntimeError('log failed')):
+                    for operation in operations:
+                        with self.subTest(operation=operation):
+                            with self.assertRaises(workspaces.scan_process.ScanError):
+                                asyncio.run(operation())
+                    self.assertFalse(asyncio.run(workspaces._recover_finalization_stages(self.store)))
+            with patch.object(workspaces.logger, 'warning', side_effect=RuntimeError('log failed')):
+                with patch.object(workspaces.logger, 'error', side_effect=RuntimeError('log failed')):
+                    with self.assertRaises(workspaces.scan_process.ScanError):
+                        asyncio.run(workspaces._async_deletion_stages(self.state))
+        records = [(stage, {'repository': 'repository', 'restoring': True})]
+        with patch.object(workspaces, '_async_deletion_stages', new=AsyncMock(return_value=records)):
+            with patch('coordinator.problems.record', side_effect=RuntimeError('report failed')):
+                with patch.object(workspaces.logger, 'error', side_effect=RuntimeError('log failed')):
+                    with self.assertRaises(workspaces.scan_process.ScanError):
+                        asyncio.run(workspaces.async_recover_staged_registrations(self.store, 'repository'))
+
+    def test_invalid_deletion_stage_blocks_cleanup(self):
+        task = self.job()
+        stage = self.state / 'worktree-deletions' / 'invalid'
+        stage.mkdir(parents=True)
+        (stage / 'record.json').write_text('{')
+        missing = stage.parent / 'missing'
+        missing.mkdir()
+        directory = stage.parent / 'directory'
+        (directory / 'record.json').mkdir(parents=True)
+        symlink = stage.parent / 'symlink'
+        symlink.mkdir()
+        (symlink / 'record.json').symlink_to(stage / 'record.json')
+        asyncio.run(workspaces.cleanup_closed_copies(self.store, sweep=True))
+        self.assertTrue(self.target(task).exists())
+        self.assertTrue((stage / 'record.json').exists())
+        self.assertIsNotNone(self.store.db.execute(
+            "SELECT 1 FROM problems WHERE code='closed-copy-record-invalid'").fetchone())
+        self.assertEqual(self.store.db.execute(
+            "SELECT count(*) FROM problems WHERE code='closed-copy-record-invalid'").fetchone()[0], 1)
+
+    def test_finalization_preserves_unexpected_content(self):
+        stage = self.state / 'worktree-deletion-finalizing' / 'unknown'
+        stage.mkdir(parents=True)
+        (stage / 'copy').mkdir()
+        (stage / 'copy' / 'data').write_text('keep')
+        asyncio.run(workspaces.cleanup_closed_copies(self.store))
+        self.assertEqual((stage / 'copy' / 'data').read_text(), 'keep')
+        self.assertIsNotNone(self.store.db.execute(
+            "SELECT 1 FROM problems WHERE code='closed-copy-finalization-failed'").fetchone())
+
+    def test_completed_stage_accounting_is_idempotent(self):
+        task = self.job()
+        stage = self.state / 'worktree-deletions' / 'accounted'
+        record = {'task': task['id'], 'space_k': task['iteration'], 'removed': {'bytes': 42, 'files': 1}}
+        self.assertTrue(asyncio.run(workspaces._account_completed_stage(self.store, stage, record)))
+        self.assertTrue(asyncio.run(workspaces._account_completed_stage(self.store, stage, record)))
+        row = self.store.db.execute('SELECT bytes_freed FROM task_iterations WHERE task=? AND k=?',
+                                    (task['id'], task['iteration'])).fetchone()
+        self.assertEqual(row['bytes_freed'], 42)
 
     def worker(self, task, cwd, status='running', provider='codex'):
         with self.store.db:
@@ -167,19 +227,6 @@ class WorktreeCleanupTests(unittest.TestCase):
                         'Path(' + repr(str(marker)) + ').write_text("finished")\n')
         hook.chmod(0o700)
 
-    def test_initialized_submodule_is_salvaged_before_trash(self):
-        task, tip = self.submodule_job()
-        target = self.target(task)
-        (target / 'sub' / 'library.txt').write_bytes(b'changed\x00binary')
-        (target / 'sub' / 'untracked.bin').write_bytes(b'untracked\x00data')
-        moved = asyncio.run(cleanup_task_workspace(self.store, task['id'], now=self.now))
-        self.assertIsNotNone(moved)
-        self.assertFalse(target.exists())
-        saved = next((self.state / 'results' / target.name / 'worktree-salvage').glob('salvage-*'))
-        self.assertEqual((saved / '1' / 'untracked' / 'untracked.bin').read_bytes(), b'untracked\x00data')
-        self.assertIn(b'GIT binary patch', (saved / '1' / 'changes.patch').read_bytes())
-        self.assertIn(tip, self.git('bundle', 'list-heads', saved / '1' / 'commits.bundle').stdout)
-
     def test_salvage_keeps_index_edits_and_detects_later_source_edits(self):
         from coordinator.worktree_salvage import preserve_worktree, verify_preserved_worktree
         task = self.job()
@@ -200,28 +247,6 @@ class WorktreeCleanupTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'changed after preserving'):
             asyncio.run(verify_preserved_worktree(target, manifest))
 
-    def test_uninitialized_submodule_with_files_is_kept_before_trash(self):
-        task, _ = self.submodule_job(initialized=False)
-        target = self.target(task)
-        (target / 'sub' / 'notes.bin').write_bytes(b'unsaved\x00\xff')
-        self.assert_retained(task)
-        self.assertEqual((target / 'sub' / 'notes.bin').read_bytes(), b'unsaved\x00\xff')
-
-    def test_recursive_uninitialized_submodule_with_files_is_kept(self):
-        task, tip = self.submodule_job()
-        target = self.target(task)
-        sub = target / 'sub'
-        self.git('update-index', '--add', '--cacheinfo', '160000,' + tip + ',nested', cwd=sub)
-        (sub / '.gitmodules').write_text('[submodule "nested"]\n\tpath = nested\n\turl = ../source\n')
-        self.git('add', '.gitmodules', cwd=sub)
-        self.git('commit', '-qm', 'add nested submodule', cwd=sub)
-        self.git('add', 'sub', cwd=target)
-        self.git('commit', '-qm', 'record nested submodule', cwd=target)
-        (sub / 'nested').mkdir()
-        (sub / 'nested' / 'notes.txt').write_text('nested source\n')
-        self.assert_retained(task)
-        self.assertEqual((sub / 'nested' / 'notes.txt').read_text(), 'nested source\n')
-
     def test_failed_salvage_leaves_no_partial_destination(self):
         from coordinator.worktree_salvage import preserve_worktree
         task, _ = self.submodule_job()
@@ -230,48 +255,6 @@ class WorktreeCleanupTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'failed snapshot'):
                 asyncio.run(preserve_worktree(self.target(task), saved))
         self.assertEqual(list(saved.glob('salvage-*')), [])
-
-    def test_remote_backed_clean_submodule_needs_no_commit_bundle(self):
-        task, tip = self.submodule_job()
-        target = self.target(task)
-        self.git('push', '-q', 'origin', 'HEAD:refs/heads/saved', cwd=target / 'sub')
-        moved = asyncio.run(cleanup_task_workspace(self.store, task['id'], now=self.now))
-        self.assertIsNotNone(moved)
-        saved = next((self.state / 'results' / target.name / 'worktree-salvage').glob('salvage-*'))
-        self.assertFalse((saved / '1' / 'commits.bundle').exists())
-
-    def test_failed_submodule_preservation_keeps_original_copy_and_registration(self):
-        task, _ = self.submodule_job()
-        with patch('coordinator.worktree_salvage.preserve_worktree',
-                   AsyncMock(side_effect=OSError('preservation failed'))):
-            self.assert_retained(task)
-        self.assertFalse(self.trash.exists())
-
-    def test_deinitialized_submodule_with_hidden_commits_is_kept(self):
-        task, tip = self.submodule_job()
-        target = self.target(task)
-        self.git('submodule', 'deinit', '-f', 'sub', cwd=target)
-        self.assert_retained(task)
-        self.assertFalse(self.trash.exists())
-
-    def test_lossy_untracked_git_listing_is_kept(self):
-        task, _ = self.submodule_job()
-        original = workspaces._git
-
-        async def lossy_listing(repository, *args, **options):
-            if 'ls-files' in args and '--others' in args:
-                return 0, 'invalid-\ufffd\0'
-            return await original(repository, *args, **options)
-
-        with patch('coordinator.workspaces._git', side_effect=lossy_listing):
-            self.assert_retained(task)
-        self.assertFalse(self.trash.exists())
-
-    def test_uninitialized_submodule_can_be_retired(self):
-        task, _ = self.submodule_job(initialized=False)
-        moved = asyncio.run(cleanup_task_workspace(self.store, task['id'], now=self.now))
-        self.assertIsNotNone(moved)
-        self.assertFalse(self.target(task).exists())
 
     def test_f2_reopen_preserves_old_admin_and_submodule_repository_in_trash(self):
         task, sub_tip = self.submodule_job(closed=False)
@@ -302,50 +285,6 @@ class WorktreeCleanupTests(unittest.TestCase):
         self.assertIn('worktree ' + str(unrelated) + '\n', self.registrations())
         self.assertEqual((collision / 'keep').read_text(), 'existing admin Trash data')
         self.assertTrue((self.trash / (target.name + '.git-worktree-1')).is_symlink())
-
-    def test_f3_sweep_preserves_checkout_admin_logs_index_branch_and_stash(self):
-        task = self.job()
-        target = self.target(task)
-        tip = self.commit(target)
-        (target / 'README.md').write_text('stashed bytes\n')
-        self.git('stash', 'push', '-qm', 'retained stash', cwd=target)
-        stash = self.git('stash', 'list').stdout
-        git_dir = self.git_directory(target)
-        admin_before = self.files(git_dir)
-        self.assertIn('index', admin_before)
-        self.assertIn('logs/HEAD', admin_before)
-        (target / '.env').write_bytes(b'ignored bytes\x00\xff')
-        checkout_before = self.files(target)
-        moved = asyncio.run(cleanup_task_workspace(self.store, task['id'], now=self.now))
-        self.assertEqual(moved, self.trash / target.name)
-        self.assertEqual(self.files(moved), checkout_before)
-        self.assertEqual(self.files(self.trash / (target.name + '.git-worktree')), admin_before)
-        self.assertFalse(git_dir.exists())
-        self.assertNotIn('worktree ' + str(target) + '\n', self.registrations())
-        self.assertEqual(self.git('rev-parse', 'torii/task-' + str(task['id'])).stdout.strip(), tip)
-        self.assertEqual(self.git('stash', 'list').stdout, stash)
-        result = asyncio.run(prepare_task_workspace(
-            self.project, self.state, task['id'], saved_cwd=task['worktree']))
-        self.assertEqual(result['base_commit'], tip)
-        self.assertEqual(self.git('rev-parse', 'HEAD', cwd=target).stdout.strip(), tip)
-
-    def test_f3_admin_move_failure_restores_checkout_and_keeps_registration(self):
-        task = self.job()
-        target = self.target(task)
-        git_dir = self.git_directory(target)
-        before = self.files(git_dir)
-        real_move = workspaces.move_to_trash
-
-        def fail_admin(path, *args, **kwargs):
-            if Path(path) == git_dir:
-                self.assertFalse(target.exists())
-                raise OSError('admin rename fixture failure')
-            return real_move(path, *args, **kwargs)
-
-        with patch('coordinator.workspaces.move_to_trash', side_effect=fail_admin):
-            self.assert_retained(task)
-        self.assertEqual(self.files(git_dir), before)
-        self.assertEqual(list(self.trash.iterdir()), [])
 
     def test_f4_new_job_checkout_can_exceed_sweep_git_limit(self):
         task = self.call('tasks.create', title='slow new checkout').data
@@ -383,15 +322,6 @@ class WorktreeCleanupTests(unittest.TestCase):
         self.assertEqual(self.registrations(), before)
         self.assertFalse(self.target(task).exists())
 
-    def test_empty_admin_modules_without_checkout_gitmodules_can_be_retired(self):
-        task = self.job()
-        target = self.target(task)
-        (self.git_directory(target) / 'modules').mkdir()
-        self.assertFalse((target / '.gitmodules').exists())
-        moved = asyncio.run(cleanup_task_workspace(self.store, task['id'], now=self.now))
-        self.assertIsNotNone(moved)
-        self.assertFalse(target.exists())
-
     def test_reopen_refuses_missing_or_ambiguous_admin_mapping_without_moving_data(self):
         for ambiguous in (False, True):
             with self.subTest(ambiguous=ambiguous):
@@ -425,62 +355,6 @@ class WorktreeCleanupTests(unittest.TestCase):
                 self.assertEqual(self.files(git_dir.parent), snapshots[0])
                 self.assertFalse(target.exists())
                 self.assertFalse(self.trash.exists())
-
-    def test_sweep_refuses_missing_or_ambiguous_admin_mapping_before_either_move(self):
-        for ambiguous in (False, True):
-            with self.subTest(ambiguous=ambiguous):
-                task = self.job()
-                target = self.target(task)
-                git_dir = self.git_directory(target)
-                if ambiguous:
-                    duplicate = git_dir.parent / ('duplicate-' + target.name)
-                    duplicate.mkdir()
-                    for name in ('gitdir', 'HEAD', 'commondir'):
-                        (duplicate / name).write_bytes((git_dir / name).read_bytes())
-                else:
-                    (git_dir / 'gitdir').write_text(str(self.root / 'wrong-target' / '.git') + '\n')
-                before = self.files(git_dir.parent)
-                with patch('coordinator.workspaces.move_to_trash') as move:
-                    self.assert_retained(task)
-                move.assert_not_called()
-                self.assertEqual(self.files(git_dir.parent), before)
-                self.assertFalse(self.trash.exists())
-
-    def test_sweep_checks_both_filesystems_before_either_move(self):
-        for different in ('checkout', 'admin'):
-            with self.subTest(different=different):
-                task = self.job()
-                target = self.target(task)
-                git_dir = self.git_directory(target)
-                source = target if different == 'checkout' else git_dir
-                real_lstat = Path.lstat
-
-                def different_device(path, *args, **kwargs):
-                    result = real_lstat(path, *args, **kwargs)
-                    if path == source:
-                        fields = list(result)
-                        fields[2] += 1
-                        return os.stat_result(fields)
-                    return result
-
-                with patch.object(Path, 'lstat', different_device), \
-                        patch('coordinator.workspaces.move_to_trash') as move, \
-                        self.assertLogs('coordinator.workspaces', level='DEBUG') as logs:
-                    self.assert_retained(task)
-                move.assert_not_called()
-                self.assertIn('another filesystem', logs.output[0])
-                self.assertFalse(self.trash.exists())
-
-    def test_checkout_move_failure_leaves_admin_and_registration_untouched(self):
-        task = self.job()
-        target = self.target(task)
-        git_dir = self.git_directory(target)
-        before = self.files(git_dir)
-        with patch('coordinator.workspaces.move_to_trash', side_effect=OSError('checkout rename failure')) as move:
-            self.assert_retained(task)
-        move.assert_called_once_with(target, self.trash)
-        self.assertEqual(self.files(git_dir), before)
-        self.assertEqual(list(self.trash.iterdir()), [])
 
     def test_reopen_admin_move_failure_preserves_registration_and_data(self):
         task = self.job(closed=False)
@@ -523,20 +397,6 @@ class WorktreeCleanupTests(unittest.TestCase):
         self.assertEqual(self.registrations(), registrations)
         self.assertFalse(target.exists())
         self.assertEqual(list(self.trash.iterdir()), [])
-
-    def test_admin_directory_is_found_by_mapping_instead_of_folder_name(self):
-        task = self.job()
-        target = self.target(task)
-        git_dir = self.git_directory(target)
-        renamed = git_dir.with_name('renamed-admin-directory')
-        git_dir.rename(renamed)
-        (target / '.git').write_text('gitdir: ' + str(renamed) + '\n')
-        before = self.files(renamed)
-        moved = asyncio.run(cleanup_task_workspace(self.store, task['id'], now=self.now))
-        self.assertEqual(moved, self.trash / target.name)
-        self.assertEqual(self.files(self.trash / (target.name + '.git-worktree')), before)
-        self.assertFalse(renamed.exists())
-        self.assertNotIn('worktree ' + str(target) + '\n', self.registrations())
 
     def test_r1_reopen_repairs_only_its_stale_registration_and_keeps_commits(self):
         task = self.job(closed=False)
@@ -635,46 +495,6 @@ class WorktreeCleanupTests(unittest.TestCase):
         self.assertEqual(self.registrations(), before)
         self.assertFalse(self.target(task).exists())
 
-    def test_sweep_quietly_skips_externally_trashed_worktree_and_continues(self):
-        task = self.job()
-        target = self.target(task)
-        tip = self.commit(target)
-        payload = b'externally preserved ignored bytes\x00\xff'
-        (target / '.env').write_bytes(payload)
-        later = self.job()
-        self.trash.mkdir()
-        moved = self.trash / target.name
-        target.rename(moved)
-        registrations = self.registrations()
-        branches = self.git('show-ref', '--heads').stdout
-        with patch.object(workspaces, 'logger') as logger, \
-                patch('coordinator.problems.record') as problem, \
-                patch('coordinator.workspaces._git', new=AsyncMock()) as git, \
-                patch('coordinator.workspaces.cleanup_task_workspace',
-                      new=AsyncMock(wraps=cleanup_task_workspace)) as cleanup:
-            self.assertIsNone(asyncio.run(workspaces.cleanup_task_workspace(self.store, task['id'], now=self.now)))
-            cleanup.assert_awaited_once_with(self.store, task['id'], now=self.now)
-            git.assert_not_awaited()
-            problem.assert_not_called()
-            self.assertEqual(logger.mock_calls, [])
-        self.assertFalse(target.exists())
-        self.assertEqual(self.store.task_get(task['id']), task)
-        self.assertEqual(self.registrations(), registrations)
-        self.assertEqual(self.git('show-ref', '--heads').stdout, branches)
-        self.assertEqual(self.git('rev-parse', 'torii/task-' + str(task['id'])).stdout.strip(), tip)
-        self.assertEqual((moved / 'README.md').read_text(), 'job commit\n')
-        self.assertEqual((moved / '.env').read_bytes(), payload)
-        with patch('coordinator.workspaces.cleanup_task_workspace',
-                   new=AsyncMock(wraps=cleanup_task_workspace)) as cleanup:
-            cursor = asyncio.run(cleanup_closed_worktrees(self.store, limit=1, now=self.now))
-            self.assertEqual(cursor, later['id'])
-            cleanup.assert_awaited_once_with(self.store, later['id'], now=self.now)
-            self.assertEqual(asyncio.run(cleanup_closed_worktrees(
-                self.store, limit=1, now=self.now)), 0)
-            self.assertEqual(cleanup.await_count, 1)
-        self.assertFalse(self.target(later).exists())
-        self.assertIn('worktree ' + str(target) + '\n', self.registrations())
-
     def test_externally_trashed_worktree_reopens_on_saved_branch_and_nested_cwd(self):
         task = self.job(nested=True)
         target = self.target(task)
@@ -704,110 +524,6 @@ class WorktreeCleanupTests(unittest.TestCase):
         self.assertEqual({path.relative_to(moved): path.read_bytes()
                           for path in moved.rglob('*') if path.is_file()}, saved)
 
-    def test_c1_cleanup_uses_suffix_keeps_branches_and_next_spawn_rebuilds(self):
-        task = self.job()
-        target = self.target(task)
-        tip = self.commit(target)
-        unrelated = self.missing_unrelated_worktree()
-        branches = self.git('show-ref', '--heads').stdout
-        collision = self.trash / target.name
-        collision.mkdir(parents=True)
-        (collision / 'keep').write_text('existing Trash data')
-        second = self.trash / (target.name + '-1')
-        second.symlink_to(self.root / 'missing-collision')
-        with self.assertLogs('coordinator.workspaces', level='INFO') as logs:
-            moved = asyncio.run(cleanup_task_workspace(self.store, task['id'], now=self.now))
-        self.assertEqual(moved, self.trash / (target.name + '-2'))
-        self.assertTrue(moved.is_dir())
-        self.assertFalse(target.exists())
-        self.assertEqual((moved / 'README.md').read_text(), 'job commit\n')
-        self.assertEqual((collision / 'keep').read_text(), 'existing Trash data')
-        self.assertTrue(second.is_symlink())
-        self.assertNotIn('worktree ' + str(target) + '\n', self.registrations())
-        self.assertIn('worktree ' + str(unrelated) + '\n', self.registrations())
-        self.assertEqual(self.git('show-ref', '--heads').stdout, branches)
-        self.assertEqual(self.store.task_get(task['id'])['updated'], task['updated'])
-        self.assertEqual(len(logs.output), 1)
-        for value in (str(task['number']), str(moved), str(self.project / '.git')):
-            self.assertIn(value, logs.output[0])
-        self.assertIsNone(asyncio.run(cleanup_task_workspace(self.store, task['id'], now=self.now)))
-        self.call('tasks.update', task=task['id'], status='open')
-        worker = self.call('workers.spawn', task=task['id'], provider='codex', prompt='Resume this job').data
-        row = self.store.db.execute('SELECT cwd,status FROM workers WHERE id=?', (worker['worker'],)).fetchone()
-        self.assertEqual((row['cwd'], row['status']), (str(target), 'queued'))
-        self.assertEqual(self.git('rev-parse', 'HEAD', cwd=target).stdout.strip(), tip)
-        self.assertIn('worktree ' + str(unrelated) + '\n', self.registrations())
-
-    def test_c2_modified_tracked_file_is_kept(self):
-        task = self.job()
-        (self.target(task) / 'README.md').write_text('unsaved tracked bytes\n')
-        with self.assertLogs('coordinator.workspaces', level='DEBUG') as logs:
-            target = self.assert_retained(task)
-        self.assertEqual((target / 'README.md').read_text(), 'unsaved tracked bytes\n')
-        self.assertEqual(len(logs.output), 1)
-        self.assertIn('changes', logs.output[0])
-
-    def test_c3_untracked_file_is_kept_even_when_status_config_hides_it(self):
-        task = self.job()
-        target = self.target(task)
-        self.git('config', 'status.showUntrackedFiles', 'no', cwd=target)
-        (target / 'untracked.txt').write_bytes(b'unsaved untracked bytes\x00')
-        self.assert_retained(task)
-        self.assertEqual((target / 'untracked.txt').read_bytes(), b'unsaved untracked bytes\x00')
-
-    def test_c4_detached_head_is_kept(self):
-        task = self.job()
-        self.git('checkout', '--detach', '-q', cwd=self.target(task))
-        self.assert_retained(task)
-
-    def test_c5_real_rebase_in_progress_is_kept(self):
-        task = self.job()
-        target = self.target(task)
-        self.commit(target, 'job side\n')
-        self.commit(self.project, 'source side\n')
-        source_branch = self.git('symbolic-ref', '--short', 'HEAD').stdout.strip()
-        self.assertNotEqual(self.git('rebase', source_branch, cwd=target, check=False).returncode, 0)
-        self.assert_retained(task)
-
-    def test_c6_locked_worktree_is_kept(self):
-        task = self.job()
-        self.git('worktree', 'lock', '--reason', 'owner keeps this copy', self.target(task))
-        self.assert_retained(task)
-
-    def test_c7_every_unfinished_status_and_provider_keeps_the_job(self):
-        task = self.job()
-        target = self.target(task)
-        worker = self.worker(task['id'], target)
-        for provider in ('claude', 'codex', 'opencode'):
-            for status in ('queued', 'running', 'parked', 'waiting', 'waiting_for_secret',
-                           'waiting_for_quota', 'future_unfinished'):
-                with self.subTest(provider=provider, status=status), self.store.db:
-                    self.store.db.execute('UPDATE workers SET provider=?,status=? WHERE id=?',
-                                          (provider, status, worker))
-                    self.assert_retained(task)
-
-    def test_c8_recently_closed_job_is_kept(self):
-        self.assert_retained(self.job(age=86399))
-
-    def test_c9_shared_stash_survives_cleanup(self):
-        task = self.job()
-        target = self.target(task)
-        (target / 'README.md').write_text('stashed job bytes\n')
-        self.git('stash', 'push', '-qm', 'saved job work', cwd=target)
-        stash = self.git('stash', 'list').stdout
-        self.assertTrue(stash)
-        self.assertIsNotNone(asyncio.run(cleanup_task_workspace(self.store, task['id'], now=self.now)))
-        self.assertEqual(self.git('stash', 'list').stdout, stash)
-        self.assertEqual(self.git('show', 'stash:README.md').stdout, 'stashed job bytes\n')
-
-    def test_c10_ignored_env_bytes_go_to_trash(self):
-        task = self.job()
-        payload = b'fixture ignored bytes\r\n\x00\xff'
-        (self.target(task) / '.env').write_bytes(payload)
-        moved = asyncio.run(cleanup_task_workspace(self.store, task['id'], now=self.now))
-        self.assertIsNotNone(moved)
-        self.assertEqual((moved / '.env').read_bytes(), payload)
-
     def test_cli_decodes_only_boolean_parameters(self):
         cli = [sys.executable, '-m', 'coordinator', '--state-dir', str(self.state),
                '--token-file', str(self.root / 'no-token'), 'ctl', 'call']
@@ -821,105 +537,6 @@ class WorktreeCleanupTests(unittest.TestCase):
                                 capture_output=True, text=True, timeout=30)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.store.task_get(task['id'])['title'], 'true')
-
-    def test_sweep_resumes_saved_cursor_after_service_and_store_restart(self):
-        tasks = [self.job() for _ in range(12)]
-        for task in tasks[:10]:
-            (self.target(task) / 'unsaved.txt').write_text('keep early job')
-        for restarted in (False, True):
-            if restarted:
-                self.store.close()
-                self.store = Store(self.state, token_file=self.root / 'no-token')
-            service = Service.__new__(Service)
-            service.store = self.store
-            with patch('coordinator.service.asyncio.sleep', side_effect=asyncio.CancelledError), \
-                    self.assertRaises(asyncio.CancelledError):
-                asyncio.run(service.worktree_cleanup_loop())
-        self.assertTrue(all(self.target(task).is_dir() for task in tasks[:10]))
-        for task in tasks[10:]:
-            self.assertFalse(self.target(task).exists())
-            self.assertTrue((self.trash / self.target(task).name).is_dir())
-        self.assertEqual(self.store.get('closed_worktree_cleanup_cursor'), 0)
-
-    def test_sweep_skips_more_than_ten_gone_folders_for_free(self):
-        gone = [self.job() for _ in range(12)]
-        for task in gone:
-            self.target(task).rename(self.root / ('gone-' + str(task['id'])))
-        eligible = self.job()
-        asyncio.run(cleanup_closed_worktrees(self.store, now=self.now))
-        self.assertFalse(self.target(eligible).exists())
-        self.assertTrue((self.trash / self.target(eligible).name).is_dir())
-        for task in gone:
-            self.assertTrue((self.root / ('gone-' + str(task['id']))).is_dir())
-
-    def test_sweep_caps_git_checked_jobs_and_next_call_continues(self):
-        tasks = [self.job() for _ in range(12)]
-        for task in tasks:
-            (self.target(task) / 'unsaved.txt').write_text('keep dirty job')
-        with patch('coordinator.workspaces._git', new=AsyncMock(wraps=workspaces._git)) as git:
-            asyncio.run(cleanup_closed_worktrees(self.store, now=self.now))
-            checked = [call.args[0] for call in git.await_args_list if call.args[1:2] == ('status',)]
-            self.assertEqual(checked, [self.target(task) for task in tasks[:10]])
-            self.assertEqual(self.store.get('closed_worktree_cleanup_cursor'), tasks[9]['id'])
-            git.reset_mock()
-            asyncio.run(cleanup_closed_worktrees(self.store, now=self.now))
-            checked = [call.args[0] for call in git.await_args_list if call.args[1:2] == ('status',)]
-            self.assertEqual(checked, [self.target(task) for task in tasks[10:]])
-        self.assertTrue(all(self.target(task).is_dir() for task in tasks))
-        self.assertEqual(self.store.get('closed_worktree_cleanup_cursor'), 0)
-
-    def test_sweep_wraps_saved_cursor_after_last_job(self):
-        tasks = [self.job() for _ in range(2)]
-        for task in tasks:
-            (self.target(task) / 'unsaved.txt').write_text('keep for next round')
-        for expected in (tasks[0]['id'], tasks[1]['id'], 0, tasks[0]['id']):
-            self.assertEqual(asyncio.run(cleanup_closed_worktrees(self.store, limit=1, now=self.now)), expected)
-            self.assertEqual(self.store.get('closed_worktree_cleanup_cursor'), expected)
-        self.assertTrue(all(self.target(task).is_dir() for task in tasks))
-
-    def test_sweep_pre_git_rejections_do_not_spend_git_budget(self):
-        recent = self.job(age=60)
-        linked = self.job()
-        preserved = self.root / 'symlink-target'
-        self.target(linked).rename(preserved)
-        self.target(linked).symlink_to(preserved, target_is_directory=True)
-        busy = self.job()
-        self.worker(busy['id'], self.target(busy))
-        eligible = self.job()
-        asyncio.run(cleanup_closed_worktrees(self.store, limit=1, now=self.now))
-        self.assertFalse(self.target(eligible).exists())
-        self.assertTrue((self.trash / self.target(eligible).name).is_dir())
-        self.assertTrue(self.target(recent).is_dir())
-        self.assertTrue(self.target(linked).is_symlink())
-        self.assertTrue(preserved.is_dir())
-        self.assertTrue(self.target(busy).is_dir())
-
-    def test_c13_default_bound_and_cursor_advance_past_skipped_jobs(self):
-        tasks = [self.job() for _ in range(12)]
-        for task in tasks[:2]:
-            (self.target(task) / 'unsaved.txt').write_text('keep early job')
-        cursor = asyncio.run(cleanup_closed_worktrees(self.store, now=self.now))
-        self.assertEqual(cursor, tasks[9]['id'])
-        self.assertTrue(all(self.target(task).is_dir() for task in tasks[:2] + tasks[10:]))
-        self.assertTrue(all(not self.target(task).exists() for task in tasks[2:10]))
-        self.assertEqual(asyncio.run(cleanup_closed_worktrees(self.store, now=self.now)), 0)
-        self.assertTrue(all(not self.target(task).exists() for task in tasks[10:]))
-        self.assertTrue(all(self.target(task).is_dir() for task in tasks[:2]))
-
-    def test_saved_nested_cwd_reopens_through_creation_and_spawn(self):
-        task = self.job(nested=True)
-        target = self.target(task)
-        tip = self.commit(target)
-        self.assertIsNotNone(asyncio.run(cleanup_task_workspace(self.store, task['id'], now=self.now)))
-        self.call('tasks.update', task=task['id'], status='open')
-        created = self.call('worktree.create', task=task['id'], base='missing-base')
-        self.assertEqual(created.data['cwd'], str(target / 'nested'))
-        self.assertEqual(created.data['base_commit'], tip)
-        target.rename(self.root / 'removed-nested-copy')
-        worker = self.call('workers.spawn', task=task['id'], provider='codex', prompt='Nested job').data
-        row = self.store.db.execute('SELECT cwd FROM workers WHERE id=?', (worker['worker'],)).fetchone()
-        self.assertEqual(row['cwd'], str(target / 'nested'))
-        self.assertEqual(self.git('rev-parse', 'HEAD', cwd=target).stdout.strip(), tip)
 
     def test_missing_custom_cwd_is_refused_by_creation_and_spawn(self):
         task = self.job(closed=False)
@@ -946,269 +563,131 @@ class WorktreeCleanupTests(unittest.TestCase):
         self.assertIn('branch is missing', result.text)
         self.assertFalse(target.exists())
 
-    def test_open_jobs_are_kept_and_dropped_jobs_at_24_hours_are_cleaned(self):
-        task = self.job(closed=False)
-        with self.store.db:
-            self.store.db.execute('UPDATE tasks SET updated=? WHERE id=?', (self.now - 86401, task['id']))
-        self.assert_retained(task)
-        dropped = self.job(status='dropped', age=86400)
-        self.assertIsNotNone(asyncio.run(cleanup_task_workspace(self.store, dropped['id'], now=self.now)))
+class DeleteTreeTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name).resolve()
 
-    def test_other_jobs_unfinished_worker_inside_the_folder_is_kept(self):
-        task = self.job()
-        other = self.job(closed=False)
-        alias = self.root / 'worker-cwd-alias'
-        alias.symlink_to(self.target(task), target_is_directory=True)
-        self.worker(other['id'], alias / 'nested', status='parked', provider='opencode')
-        self.assert_retained(task)
+    def tearDown(self):
+        for directory, names, files in os.walk(str(self.root)):
+            for name in names:
+                path = Path(directory) / name
+                if not path.is_symlink():
+                    path.chmod(0o700)
+        self.temp.cleanup()
 
-    def test_finished_workers_and_neighboring_path_prefix_do_not_block_cleanup(self):
-        task = self.job()
-        target = self.target(task)
-        self.worker(task['id'], target, status='done')
-        self.worker(task['id'], target / 'nested', status='interrupted', provider='claude')
-        self.worker(None, str(target) + '-other', status='running')
-        self.assertIsNotNone(asyncio.run(cleanup_task_workspace(self.store, task['id'], now=self.now)))
-
-    def test_clean_git_operation_markers_keep_the_folder(self):
-        for marker in ('rebase-merge', 'rebase-apply', 'MERGE_HEAD', 'CHERRY_PICK_HEAD',
-                       'REVERT_HEAD', 'BISECT_LOG', 'BISECT_START', 'sequencer'):
-            with self.subTest(marker=marker):
-                task = self.job()
-                target = self.target(task)
-                git_dir = Path(self.git('rev-parse', '--absolute-git-dir', cwd=target).stdout.strip())
-                if marker in ('rebase-merge', 'rebase-apply', 'sequencer'):
-                    (git_dir / marker).mkdir()
-                else:
-                    (git_dir / marker).write_text(self.base + '\n')
-                self.assert_retained(task)
-
-    def test_attached_feature_branch_is_cleaned_and_every_branch_is_kept(self):
-        task = self.job()
-        target = self.target(task)
-        self.git('checkout', '-qb', 'feat/closed-job-worktree-cleanup', cwd=target)
-        tip = self.commit(target, 'feature branch commit\n')
-        branches = self.git('for-each-ref', '--format=%(refname) %(objectname)', 'refs/heads').stdout
-        moved = asyncio.run(cleanup_task_workspace(self.store, task['id'], now=self.now))
-        self.assertEqual(moved, self.trash / target.name)
+    def test_writable_app_bundle_deletion_does_not_require_chmod_permission(self):
+        target = self.root / 'copy'
+        bundle = target / '.cache' / 'TestDriver.app' / 'Contents'
+        bundle.mkdir(parents=True)
+        (bundle / 'payload').write_bytes(b'cache')
+        for path in (target, bundle.parent.parent, bundle.parent, bundle):
+            path.chmod(0o755)
+        with patch('coordinator.host_os.os.fchmod', side_effect=PermissionError('App metadata change denied')):
+            removed = asyncio.run(host_os.delete_tree(target))
+        self.assertEqual(removed, {'bytes': 5, 'files': 1})
         self.assertFalse(target.exists())
-        self.assertNotIn('worktree ' + str(target) + '\n', self.registrations())
-        self.assertEqual(self.git('for-each-ref', '--format=%(refname) %(objectname)',
-                                  'refs/heads').stdout, branches)
-        self.assertEqual(self.git('rev-parse', 'feat/closed-job-worktree-cleanup').stdout.strip(), tip)
-        self.assertEqual(self.git('rev-parse', 'torii/task-' + str(task['id'])).stdout.strip(), self.base)
 
-    def test_foreign_repository_at_the_expected_path_is_kept(self):
-        foreign = self.job()
-        foreign_target = self.target(foreign)
-        foreign_target.rename(self.root / 'preserved-original-worktree')
-        foreign_target.mkdir()
-        self.git('init', '-q', cwd=foreign_target)
-        self.git('-c', 'user.name=Test', '-c', 'user.email=test@example.com',
-                 'commit', '--allow-empty', '-qm', 'foreign repository', cwd=foreign_target)
-        self.assert_retained(foreign)
-        self.assertTrue((foreign_target / '.git').is_dir())
+    def test_delete_helper_refuses_root_link_and_never_traverses_child_link(self):
+        outside = self.root / 'outside'
+        outside.mkdir()
+        (outside / 'keep').write_text('keep')
+        link = self.root / 'link'
+        link.symlink_to(outside, target_is_directory=True)
+        self.assertTrue(callable(getattr(host_os, 'delete_tree', None)), 'Missing cancellable no-follow tree deletion')
+        with self.assertRaises(OSError):
+            asyncio.run(host_os.delete_tree(link))
+        self.assertTrue(link.is_symlink())
+        tree = self.root / 'owned'
+        tree.mkdir()
+        (tree / 'child').symlink_to(outside, target_is_directory=True)
+        counts = asyncio.run(host_os.delete_tree(tree))
+        self.assertEqual(counts['files'], 1)
+        self.assertEqual((outside / 'keep').read_text(), 'keep')
+        self.assertFalse(tree.exists())
 
-    def test_task_folder_and_parent_symlinks_are_kept(self):
-        task = self.job()
-        target = self.target(task)
-        moved = self.root / 'preserved-task-folder'
-        target.rename(moved)
-        target.symlink_to(moved, target_is_directory=True)
-        self.assert_retained(task)
-        self.assertTrue(target.is_symlink())
-        parent = target.parent
-        relocated = self.root / 'preserved-worktrees-folder'
-        parent.rename(relocated)
-        parent.symlink_to(relocated, target_is_directory=True)
-        self.assert_retained(task)
-        self.assertTrue(parent.is_symlink())
+    def test_delete_tree_removes_empty_and_full_mode_zero_without_following_links(self):
+        outside = self.root / 'outside'
+        outside.mkdir()
+        (outside / 'keep').write_text('outside')
+        outside_mode = outside.stat().st_mode
+        for name, full in (('empty', False), ('full', True), ('root', True)):
+            with self.subTest(shape=name):
+                tree = self.root / name
+                tree.mkdir()
+                (tree / 'link').symlink_to(outside, target_is_directory=True)
+                locked = tree / 'locked'
+                locked.mkdir()
+                if full:
+                    (locked / 'bytes').write_text('saved bytes')
+                locked.chmod(0)
+                if name == 'root':
+                    tree.chmod(0)
+                asyncio.run(host_os.delete_tree(tree))
+                self.assertFalse(tree.exists())
+                self.assertEqual((outside / 'keep').read_text(), 'outside')
+                self.assertEqual(outside.stat().st_mode, outside_mode)
 
-    def test_cross_filesystem_trash_keeps_folder_and_registration(self):
-        task = self.job()
-        real_stat = Path.stat
+    def test_delete_tree_rechecks_inode_after_chmod(self):
+        tree = self.root / 'tree'
+        child = tree / 'child'
+        child.mkdir(parents=True)
+        (child / 'keep').write_text('do not delete a moved directory')
+        child.chmod(0o500)
+        inode = child.stat().st_ino
+        original = os.fchmod
+        moved = self.root / 'moved'
 
-        def different_device(path, *args, **kwargs):
-            result = real_stat(path, *args, **kwargs)
-            if path == self.trash:
-                fields = list(result)
-                fields[2] += 1
-                return os.stat_result(fields)
-            return result
+        def replace(fd, mode):
+            original(fd, mode)
+            if os.fstat(fd).st_ino == inode:
+                child.rename(moved)
+                child.mkdir()
 
-        with patch.object(Path, 'stat', different_device):
-            self.assert_retained(task)
-        self.assertFalse((self.trash / self.target(task).name).exists())
+        with patch('coordinator.host_os.os.fchmod', side_effect=replace):
+            with self.assertRaisesRegex(OSError, 'changed'):
+                asyncio.run(host_os.delete_tree(tree))
+        self.assertEqual((moved / 'keep').read_text(), 'do not delete a moved directory')
 
-    def test_git_error_before_move_keeps_folder_and_registration(self):
-        task = self.job()
-        real_git = workspaces._git
+    def test_delete_tree_rechecks_device_after_chmod(self):
+        tree = self.root / 'tree'
+        child = tree / 'child'
+        child.mkdir(parents=True)
+        (child / 'keep').write_text('mounted bytes')
+        child.chmod(0o500)
+        inode = child.stat().st_ino
+        original_chmod, original_stat = os.fchmod, os.fstat
+        changed = False
 
-        async def fail_status(cwd, *args, **kwargs):
-            if args[0] == 'status':
-                raise RuntimeError('status fixture error')
-            return await real_git(cwd, *args, **kwargs)
+        def chmod(fd, mode):
+            nonlocal changed
+            original_chmod(fd, mode)
+            if original_stat(fd).st_ino == inode:
+                changed = True
 
-        with patch('coordinator.workspaces._git', side_effect=fail_status):
-            self.assert_retained(task)
-        self.assertFalse(self.trash.exists())
+        def stat(fd):
+            info = original_stat(fd)
+            if changed and info.st_ino == inode:
+                return SimpleNamespace(st_dev=info.st_dev + 1, st_ino=info.st_ino, st_mode=info.st_mode)
+            return info
 
-    def test_registration_removal_error_restores_folder_and_ignored_data(self):
-        task = self.job()
-        target = self.target(task)
-        (target / '.env').write_bytes(b'keep ignored fixture bytes')
-        git_dir = self.git_directory(target)
-        real_move = workspaces.move_to_trash
+        with patch('coordinator.host_os.os.fchmod', side_effect=chmod), patch(
+                'coordinator.host_os.os.fstat', side_effect=stat):
+            with self.assertRaises(OSError):
+                asyncio.run(host_os.delete_tree(tree))
+        self.assertEqual((child / 'keep').read_text(), 'mounted bytes')
 
-        def fail_move(path, *args, **kwargs):
-            if Path(path) == git_dir:
-                self.assertFalse(target.exists())
-                self.assertTrue((self.trash / target.name).is_dir())
-                raise RuntimeError('registration fixture error')
-            return real_move(path, *args, **kwargs)
-
-        with patch('coordinator.workspaces.move_to_trash', side_effect=fail_move):
-            self.assert_retained(task)
-        self.assertEqual((target / '.env').read_bytes(), b'keep ignored fixture bytes')
-        self.assertFalse((self.trash / target.name).exists())
-        self.assertEqual(self.git('rev-parse', 'HEAD', cwd=target).stdout.strip(), self.base)
-
-    def test_rollback_keeps_both_copies_when_another_path_prevents_restoration(self):
-        task = self.job()
-        target = self.target(task)
-        (target / '.env').write_bytes(b'original ignored fixture bytes')
-        git_dir = self.git_directory(target)
-        real_move = workspaces.move_to_trash
-
-        def replace_before_error(path, *args, **kwargs):
-            if Path(path) == git_dir:
-                target.mkdir()
-                (target / 'replacement').write_text('new data')
-                raise RuntimeError('registration fixture error')
-            return real_move(path, *args, **kwargs)
-
-        with patch('coordinator.workspaces.move_to_trash', side_effect=replace_before_error), \
-                self.assertLogs('coordinator.workspaces', level='ERROR') as logs:
-            self.assertIsNone(asyncio.run(cleanup_task_workspace(self.store, task['id'], now=self.now)))
-        self.assertEqual((target / 'replacement').read_text(), 'new data')
-        self.assertEqual((self.trash / target.name / '.env').read_bytes(), b'original ignored fixture bytes')
-        self.assertIn('rollback failed', logs.output[0])
-        self.assertIn('worktree ' + str(target) + '\n', self.registrations())
-
-    def test_cancellation_during_registration_removal_restores_folder(self):
-        task = self.job()
-        target = self.target(task)
-        before = self.registrations()
-        git_dir = self.git_directory(target)
-        real_move = workspaces.move_to_trash
-
-        def cancel_move(path, *args, **kwargs):
-            if Path(path) == git_dir:
-                raise asyncio.CancelledError()
-            return real_move(path, *args, **kwargs)
-
-        with patch('coordinator.workspaces.move_to_trash', side_effect=cancel_move), \
-                self.assertRaises(asyncio.CancelledError):
-            asyncio.run(cleanup_task_workspace(self.store, task['id'], now=self.now))
-        self.assertTrue(target.is_dir())
-        self.assertEqual(self.registrations(), before)
-        self.assertFalse((self.trash / target.name).exists())
-
-    def test_reopen_or_worker_started_during_git_checks_is_seen_before_move(self):
-        for change in ('reopen', 'worker', 'lock', 'operation', 'branch', 'gitmodules', 'modules'):
-            with self.subTest(change=change):
-                task = self.job()
-                target = self.target(task)
-                real_git = workspaces._git
-
-                async def change_after_status(cwd, *args, **kwargs):
-                    result = await real_git(cwd, *args, **kwargs)
-                    if args[0] == 'status':
-                        if change == 'reopen':
-                            self.store.task_update(task['id'], status='open')
-                        elif change == 'worker':
-                            self.worker(None, target / 'nested', provider='opencode')
-                        elif change == 'lock':
-                            self.git('worktree', 'lock', target)
-                        elif change == 'branch':
-                            self.git('checkout', '-qb', 'changed-during-cleanup', cwd=target)
-                        elif change == 'gitmodules':
-                            (target / '.gitmodules').write_text('late submodule metadata\n')
-                        elif change == 'modules':
-                            (self.git_directory(target) / 'modules').mkdir()
-                        else:
-                            git_dir = Path(self.git('rev-parse', '--absolute-git-dir', cwd=target).stdout.strip())
-                            (git_dir / 'rebase-apply').mkdir()
-                    return result
-
-                with patch('coordinator.workspaces._git', side_effect=change_after_status):
-                    self.assertIsNone(asyncio.run(cleanup_task_workspace(self.store, task['id'], now=self.now)))
-                self.assertTrue(target.is_dir())
-                self.assertIn('worktree ' + str(target) + '\n', self.registrations())
-
-    def test_git_timeout_stops_slow_status_and_preserves_the_folder(self):
-        task = self.job()
-        target = self.target(task)
-        ready, lock = self.root / 'fsmonitor.ready', self.root / 'fsmonitor.lock'
-        helper = self.root / 'slow-fsmonitor'
-        helper.write_text('#!' + sys.executable + '\n'
-                          'import fcntl,time\n'
-                          'from pathlib import Path\n'
-                          'handle = open(' + repr(str(lock)) + ', "a")\n'
-                          'fcntl.flock(handle, fcntl.LOCK_EX)\n'
-                          'Path(' + repr(str(ready)) + ').touch()\n'
-                          'time.sleep(60)\n')
-        helper.chmod(0o700)
-        self.git('config', 'core.fsmonitor', str(helper), cwd=target)
-
-        async def attempt():
-            result = await cleanup_task_workspace(self.store, task['id'], now=self.now)
-            self.assertIsNone(result)
-            await until_unlocked(lock, 'the timed-out Git status process group to die')
-
-        with patch('coordinator.workspaces.GIT_TIMEOUT', 1), self.assertLogs('coordinator.workspaces', 'DEBUG') as logs:
-            asyncio.run(attempt())
-        self.assertTrue(any('TimeoutError' in line for line in logs.output))
-        self.assertTrue(ready.exists())
-        self.assertTrue(target.is_dir())
-        self.assertIn('worktree ' + str(target) + '\n', self.registrations())
-
-    def test_service_startup_and_hourly_sweeps_cleanup_closed_worktrees(self):
-        startup = self.job()
-        hourly = self.job(age=0)
-        tips = {task['id']: self.git('rev-parse', 'HEAD', cwd=self.target(task)).stdout.strip()
-                for task in (startup, hourly)}
-        service = Service.__new__(Service)
-        service.store = self.store
-        service.pair_only = False
-        service.workers = SimpleNamespace(runner=SimpleNamespace(binaries={}))
-        service.updater = SimpleNamespace(run=None, freeze=None)
-        service.signins = SimpleNamespace(run=None)
-        self.assertIn(('worktree_cleanup', service.worktree_cleanup_loop), service.supervised())
-        delays = []
-
-        async def next_hour(delay):
-            delays.append(delay)
-            task = startup if len(delays) == 1 else hourly
-            target = self.target(task)
-            self.assertFalse(target.exists())
-            self.assertTrue((self.trash / target.name).is_dir())
-            self.assertTrue((self.trash / (target.name + '.git-worktree')).is_dir())
-            self.assertEqual(self.git('rev-parse', 'torii/task-' + str(task['id'])).stdout.strip(),
-                             tips[task['id']])
-            self.assertEqual(self.store.get('closed_worktree_cleanup_cursor'), 0)
-            if len(delays) == 1:
-                self.assertTrue(self.target(hourly).is_dir())
-                with self.store.db:
-                    self.store.db.execute('UPDATE tasks SET updated=? WHERE id=?',
-                                          (self.now - 86401, hourly['id']))
-            else:
-                raise asyncio.CancelledError()
-
-        with patch('coordinator.service.asyncio.sleep', side_effect=next_hour), \
-                self.assertRaises(asyncio.CancelledError):
-            asyncio.run(service.worktree_cleanup_loop())
-        self.assertEqual(delays, [3600, 3600])
+    def test_chmod_denial_names_the_operation_and_full_path(self):
+        tree = self.root / 'tree'
+        child = tree / 'child'
+        child.mkdir(parents=True)
+        child.chmod(0o500)
+        with patch('coordinator.host_os.os.fchmod', side_effect=PermissionError(1, 'metadata denied')):
+            with self.assertRaises(PermissionError) as failure:
+                asyncio.run(host_os.delete_tree(tree))
+        self.assertEqual(failure.exception.operation, 'fchmod')
+        self.assertEqual(failure.exception.filename, str(child))
+        self.assertIn('metadata denied', str(failure.exception))
 
 
 class ServiceCleanupLoopTests(unittest.TestCase):

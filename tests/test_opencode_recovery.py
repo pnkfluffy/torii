@@ -59,7 +59,7 @@ class OpenCodeRecoveryTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_real_overflow_uses_one_bounded_catchup_then_original_rows(self):
         session, owner = await self.failed_turn(context_overflow=True)
-        result = self.chat.row('worker result ' + 'x' * 20000, 'worker_result')
+        result = self.chat.row(json.dumps({'worker': 1, 'text': 'worker result ' + 'x' * 20000}), 'worker_result')
         native = session.session_id
         self.assertEqual(self.recovery().get('code'), 'context_overflow')
         self.assertIsNone(await self.start())
@@ -86,7 +86,9 @@ class OpenCodeRecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.recovery()['phase'], 'resuming')
         await self.service.feed_once()
         await until(lambda: not self.recovery())
-        self.assertEqual(self.chat.persisted(owner)['delivered'], 'received')
+        await self.service.feed_once()
+        await asyncio.gather(*self.service.feed_tasks.values())
+        await until(lambda: self.chat.persisted(owner)['delivered'] == 'received')
         self.assertEqual(self.chat.persisted(result)['delivered'], 'received')
 
     async def test_failed_catchup_pauses_until_owner_writes(self):

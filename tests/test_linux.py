@@ -9,7 +9,7 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import AsyncMock, patch
 
-from coordinator import health, host_os, policy, service
+from coordinator import health, host_os, service
 from coordinator.providers import ProviderRunner
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -53,7 +53,7 @@ class LinuxTests(LinuxTestsSupport, unittest.TestCase):
             files.pop('pressure/memory')
             self.assertNotIn('stall', health.system_pressure(self.home)[1])
 
-    def test_linux_trash_is_private_and_policies_use_it(self):
+    def test_linux_trash_is_private(self):
         with patch('pwd.getpwuid', return_value=SimpleNamespace(pw_dir=str(self.home))):
             directory = host_os.trash_directory()
             host_os.prepare_trash()
@@ -61,11 +61,6 @@ class LinuxTests(LinuxTestsSupport, unittest.TestCase):
             host_os.prepare_trash()
             self.assertEqual(directory.stat().st_mode & 0o777, 0o700)
             self.assertEqual(directory, self.home / '.local/share/Trash/files')
-            captured = runpy.run_path(str(ROOT / 'coordinator/policy.py'), run_name='coordinator._capture')
-            self.assertIn('Linux Trash at ' + str(directory), captured['COORDINATOR_POLICY'])
-            with patch.object(policy, 'DELETION_POLICY', captured['DELETION_POLICY']):
-                worker = runpy.run_path(str(ROOT / 'coordinator/workers.py'), run_name='coordinator._capture')
-            self.assertIn(captured['DELETION_POLICY'], worker['WORKER_POLICY'])
 
     def test_linux_installer_unit_and_linger_commands(self):
         installer = runpy.run_path(str(ROOT / 'scripts/install-service.py'))
@@ -103,9 +98,9 @@ class LinuxTests(LinuxTestsSupport, unittest.TestCase):
 
     def test_unit_escaping_and_write_only(self):
         installer = runpy.run_path(str(ROOT / 'scripts/install-service.py'))
-        self.assertEqual(installer['systemd_quote']('a"b%c\\d'), '"a\\"b%%c\\\\d"')
+        self.assertEqual(host_os.systemd_quote('a"b%c\\d'), '"a\\"b%%c\\\\d"')
         with self.assertRaises(ValueError):
-            installer['systemd_quote']('bad\npath')
+            host_os.systemd_quote('bad\npath')
         old_umask = os.umask(0o077)
         try:
             with patch('pathlib.Path.home', return_value=self.home), patch('os.getuid', return_value=1000), \

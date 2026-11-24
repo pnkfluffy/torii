@@ -207,12 +207,11 @@ class ReconnectTests(unittest.IsolatedAsyncioTestCase):
         runner = type('Runner', (), {'run': run})()
         service = Service(store, object(), runner, self.root)
         self.addCleanup(service.workers.storage.close)
-        with patch.object(service.jobs, 'resume_due', AsyncMock()):
+        await service.workers_once()
+        await asyncio.gather(*service.worker_tasks.values())
+        if service.workers.get(wid)['status'] == 'queued':
             await service.workers_once()
             await asyncio.gather(*service.worker_tasks.values())
-            if service.workers.get(wid)['status'] == 'queued':
-                await service.workers_once()
-                await asyncio.gather(*service.worker_tasks.values())
         self.assertEqual(service.workers.get(wid)['status'], 'done')
         self.assertTrue(json.loads(service.workers.get(wid)['result'])['success'])
         self.assertEqual(run.await_count, 1)
@@ -229,8 +228,7 @@ class ReconnectTests(unittest.IsolatedAsyncioTestCase):
         runner = type('Runner', (), {'run': AsyncMock()})()
         service = Service(store, object(), runner, self.root)
         self.addCleanup(service.workers.storage.close)
-        with patch.object(service.jobs, 'resume_due', AsyncMock()), \
-                patch.object(HostClient, 'connect', AsyncMock(side_effect=RuntimeError('unavailable'))), \
+        with patch.object(HostClient, 'connect', AsyncMock(side_effect=RuntimeError('unavailable'))), \
                 patch.object(HostClient, 'stop', AsyncMock()) as stop:
             await service.workers_once()
         self.assertEqual(service.workers.get(wid)['status'], 'running')
@@ -249,8 +247,7 @@ class ReconnectTests(unittest.IsolatedAsyncioTestCase):
         async def stopped():
             (directory / 'exit.json').write_text(json.dumps({'returncode': -9}))
 
-        with patch.object(service.jobs, 'resume_due', AsyncMock()), \
-                patch.object(HostClient, 'connect', AsyncMock(side_effect=RuntimeError('unavailable'))) as connect, \
+        with patch.object(HostClient, 'connect', AsyncMock(side_effect=RuntimeError('unavailable'))) as connect, \
                 patch.object(HostClient, 'stop', AsyncMock(side_effect=stopped)) as stop, \
                 patch('coordinator.service.time', wraps=time) as clock:
             clock.monotonic.return_value = 100
@@ -296,8 +293,7 @@ class ReconnectTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 cancelled.set()
 
-        with patch.object(service.jobs, 'resume_due', AsyncMock()), \
-                patch.object(HostClient, 'connect', AsyncMock(side_effect=connect)), \
+        with patch.object(HostClient, 'connect', AsyncMock(side_effect=connect)), \
                 patch.object(HostClient, 'stop', AsyncMock()) as stop, \
                 patch('coordinator.service.WORKER_REATTACH_TIMEOUT', .01), \
                 patch('coordinator.service.time', wraps=time) as clock:
@@ -324,8 +320,7 @@ class ReconnectTests(unittest.IsolatedAsyncioTestCase):
         runner = type('Runner', (), {'run': AsyncMock()})()
         service = Service(store, object(), runner, self.root)
         self.addCleanup(service.workers.storage.close)
-        with patch.object(service.jobs, 'resume_due', AsyncMock()), \
-                patch.object(HostClient, 'connect', AsyncMock(side_effect=RuntimeError('unavailable'))) as connect, \
+        with patch.object(HostClient, 'connect', AsyncMock(side_effect=RuntimeError('unavailable'))) as connect, \
                 patch.object(HostClient, 'stop', AsyncMock(side_effect=RuntimeError('cannot stop'))) as stop, \
                 patch('coordinator.service.time', wraps=time) as clock:
             for now in (100, 106, 112, 118):

@@ -5,6 +5,8 @@ import logging
 import re
 import time
 
+from .extension import optional
+
 
 CANCEL_DATA = re.compile(r'envelope:(\d{1,18}):cancel\Z')
 AGAIN_DATA = re.compile(r'envelope:(\d{1,18}):again\Z')
@@ -12,6 +14,7 @@ FILL_DATA = re.compile(r'envelope:(\d{1,18}):fill\Z')
 NO_ARGUMENTS = 'Commands take no arguments now. Use the buttons below.'
 CARD_LIMIT = 4000
 PAGE = 8
+ACCOUNT_PAGE = 12
 BUTTON = 40
 
 
@@ -39,10 +42,8 @@ def _back_row(name):
     """The one way back, to the parent page. Top cards have none."""
     if name.startswith('model:') or name == 'policy':
         return [_view('Back', 'settings')]
-    if name == 'settings' or name.startswith(('account:', 'reset:')):
+    if name == 'settings' or name.startswith(('account:', 'remove:')):
         return [_view('Back', 'accounts:0')]
-    if name.startswith('remove:'):
-        return [_view('Back', 'account:' + name.split(':', 1)[1])]
     if name == 'project':
         return [_command('Back', '/projects')]
     if name == 'jobs':
@@ -181,8 +182,8 @@ def control_report(store, topic, text, command, args, reply_to=None, in_place=Fa
     if command == '/projects':
         return _projects(store, topic, reply_to, prefix, in_place, None if args else text)
     if command == '/help' and args:
-        from .controls import _HELP
-        text = _HELP
+        from .controls import _help
+        text = _help(store)
     if command == '/health' and args:
         from .control_api import call
         text = call(store, 'health.show', {}, topic=topic, source='telegram', message=reply_to).text
@@ -194,6 +195,7 @@ def control_report(store, topic, text, command, args, reply_to=None, in_place=Fa
 
 _MODEL_TITLES = {'worker': 'Worker model', 'codex': 'Codex model', 'coordinator': 'Coordinator model'}
 _MODEL_UNSET = {'worker': 'native default', 'codex': 'Codex CLI default', 'coordinator': 'service default'}
+_ACCOUNT_BUTTONS = {'⚪': ('Sign in %s', 'account:'), '⚫': ('Turn on %s', 'account:'), None: ('Remove %s', 'remove:')}
 _SIGNIN_STATES = {'starting': 'starting', 'link': 'waiting for you to open the link',
                   'code': 'waiting for the code', 'checking': 'checking the sign-in',
                   'approve': 'waiting for the device code', 'cancelled': 'closing'}
@@ -203,33 +205,12 @@ def _model_value(store, role):
     return store.get(role + '_model', 'opus' if role == 'worker' else None) or _MODEL_UNSET[role]
 
 
-def _mark(authenticated, enabled, state):
-    """The /health mark and state words of one account."""
-    from .controls import _number, _timestamp, _until
-    if not authenticated:
-        return '⚪', 'signed out'
-    if not enabled:
-        return '⚫', 'off'
-    if state['state'] == 'limited':
-        until = state.get('until')
-        return '🔴', ('back in ' + _until(until) if _number(until) and until > time.time() else 'back later')
-    if state['state'] == 'stale':
-        return '🟡', 'stale since ' + _timestamp(state.get('since'))
-    return '🟢', ''
-
-
-def _left(usage, keys):
-    from .controls import _mapping, _window_left
-    values = [_window_left(_mapping(usage.get(key)))[0] for key in keys]
-    return [f'{value:g}%' if value is not None else '?' for value in values]
-
-
 def _claude_accounts(store):
     """Every registered Claude alias: the next account, then signed in, then signed out, each by label."""
     from .accounts import account_label, listed_accounts
     from .controls import _ALIAS
     registry = store.get('accounts', {}) or {}
-    listed, active = listed_accounts(store)
+    listed, active = listed_accounts(store, model='opus')
     rest = sorted((alias for alias, profile in registry.items()
                    if isinstance(profile, dict) and alias not in listed),
                   key=lambda alias: (account_label(store, alias).casefold(), alias))
@@ -244,55 +225,48 @@ def _codex_accounts(broker):
     return [alias for alias in listed + rest if _ALIAS.fullmatch(alias)], current
 
 
-def _expiry(value):
-    from .controls import _until
-    return _until(value).replace('d 0h', 'd')
-
-
-def _resets(snapshot):
-    from .controls import _number
-    banked = snapshot.get('resets_available')
-    if type(banked) is not int or banked <= 0:
-        return ''
-    expires = snapshot.get('reset_expires')
-    return (' · %d reset%s' % (banked, '' if banked == 1 else 's')
-            + (', first expires in ' + _expiry(expires) if _number(expires) else ''))
+def _short_names(labels):
+    """Button names that fit a phone and still tell accounts apart: the email's name, plus its domain when shared."""
+    from collections import Counter
+    local = {alias: label.partition('@')[0] or label for alias, label in labels.items()}
+    shared = Counter(local.values())
+    names = {}
+    for alias, label in labels.items():
+        domain = label.partition('@')[2]
+        if shared[local[alias]] > 1 and domain:
+            first = domain.split('.')[0]
+            twins = [other.partition('@')[2].split('.')[0] for key, other in labels.items() if local[key] == local[alias]]
+            names[alias] = local[alias] + ' · ' + (first if twins.count(first) == 1 else domain)
+        else:
+            names[alias] = local[alias]
+    repeated = Counter(names.values())
+    return {alias: name + ' (' + alias + ')' if repeated[name] > 1 else name for alias, name in names.items()}
 
 
 def _accounts_view(store, page):
     from . import opencode_subscription
-    from .accounts import AccountBroker, account_label, authenticated, identity_email, signed_in, switch_threshold
-    from .codex_accounts import CODEX_SWITCH_THRESHOLD, WINDOWS, CodexBroker
+    from .accounts import AccountBroker, account_label, account_picks, identity_email, switch_threshold
+    from .codex_accounts import CODEX_SWITCH_THRESHOLD, CodexBroker
     from .controls import _mapping
+    from .health import claude_line, codex_line
     from .signin import pending, provider_name, signin_label
     claude, next_alias = _claude_accounts(store)
     broker = CodexBroker(store)
     codex, current = _codex_accounts(broker)
     threshold = switch_threshold(store)
     record = pending(store)
-    repair = []
+    picks = account_picks(store)
+    buttons = []
     lines = []
     if claude:
         router = AccountBroker(store)
-        registry = store.get('accounts', {}) or {}
         snapshots = _mapping(store.get('account_status', {}))
         identities = {}
         for alias in claude:
-            profile = registry[alias]
-            signed = authenticated(store, alias, profile)
-            mark, state = _mark(signed, profile.get('enabled') is True, router.account_state(alias))
-            label = account_label(store, alias)
-            if mark in ('⚪', '⚫'):
-                line = f'{mark} {_plain(label)}: {state}'
-                repair.append((('Sign in %s' if mark == '⚪' else 'Turn on %s'), label, alias))
-            else:
-                usage = _mapping(_mapping(snapshots.get(alias)).get('usage'))
-                line = (f'{mark} {_plain(label)}: ' + ' · '.join(_left(usage, ('five_hour', 'seven_day', 'seven_day_fable')))
-                        + (', ' + state if state else ''))
-            if alias == next_alias:
+            mark, _, line = claude_line(store, router, alias)
+            buttons.append((_ACCOUNT_BUTTONS.get(mark, _ACCOUNT_BUTTONS[None]), 'Claude', account_label(store, alias), alias))
+            if alias == next_alias and len(claude) > 1:
                 line += ' · next'
-            if alias == store.get('claude_account_pick'):
-                line += ' · picked'
             if switch_threshold(store, alias) != threshold:
                 line += ' · reserve %d%%' % round((1 - switch_threshold(store, alias)) * 100)
             email = identity_email(_mapping(_mapping(snapshots.get(alias)).get('identity')))
@@ -301,27 +275,30 @@ def _accounts_view(store, page):
                 if first != alias:
                     line += ' · same login as ' + _plain(account_label(store, first))
             lines.append(line)
-        lines[0] = '\n**Claude** (left: 5h · week · Fable)\n' + lines[0]
+        named = {group: _plain(account_label(store, pick)) if pick else 'automatic' for group, pick in picks.items()}
+        lines[0] = ('\n**Claude** (left: week · Fable)\n'
+                    + ('Fable: %s · Other models: %s\n' % (named['fable'], named['other']) if any(picks.values())
+                       else 'Automatic\n') + lines[0])
     if codex:
         start = len(lines)
-        profiles = broker.accounts()
         for alias in codex:
-            snapshot = broker.snapshot(alias)
-            mark, state = _mark(broker.authenticated(alias), profiles[alias].get('enabled') is True,
-                                broker.account_state(alias))
-            label = broker.label(alias)
-            if mark in ('⚪', '⚫'):
-                line = f'{mark} {_plain(label)}: {state}'
-                repair.append((('Sign in %s' if mark == '⚪' else 'Turn on %s'), label, alias))
-            else:
-                line = (f'{mark} {_plain(label)}: ' + ' · '.join(_left(_mapping(snapshot.get('usage')), WINDOWS))
-                        + (', ' + state if state else ''))
-            lines.append(line + (' · active' if alias == current else '') + _resets(snapshot))
+            mark, _, line = codex_line(broker, alias, current, len(codex))
+            buttons.append((_ACCOUNT_BUTTONS.get(mark, _ACCOUNT_BUTTONS[None]), 'ChatGPT', broker.label(alias), alias))
+            lines.append(line)
         lines[start] = ('\n**ChatGPT** · auto-switch ' + ('on' if broker.automatic() else 'off')
-                        + ' (left: 5h · week)\n' + lines[start])
-    for alias in opencode_subscription.accounts(store):
-        lines.append('\n' + opencode_subscription.card(store, alias))
-    tail = []
+                        + ' (left: week)\n' + lines[start])
+    antigravity = optional('antigravity_accounts')
+    start = len(lines)
+    for alias, mark, line in antigravity.lines(store) if antigravity else []:
+        buttons.append((_ACCOUNT_BUTTONS.get(mark, _ACCOUNT_BUTTONS[None]), 'Antigravity', alias, alias))
+        lines.append(line)
+    if len(lines) > start:
+        lines[start] = '\n**Antigravity** (left: week)\n' + lines[start]
+    opencode = opencode_subscription.card(store)
+    if opencode:
+        lines.append('\n' + opencode)
+    routing = optional('routing')
+    tail = [routing.order_line(routing.Brokers(store))] if routing is not None else []
     if claude and not next_alias:
         tail.append('No Claude account can take work now.')
     if record:
@@ -337,35 +314,25 @@ def _accounts_view(store, page):
     else:
         text = '\n'.join(['**Accounts**', 'No accounts yet. Add one to start work. Project setup works before sign-in.']
                          + ([''] + tail if tail else []))
-    selectable = [alias for alias in claude if alias != next_alias and signed_in(store, alias, registry[alias])]
-    page = min(page, max(0, (len(repair) + len(selectable) - 1) // PAGE))
+    names = {provider: _short_names({alias: label for _, kind, label, alias in buttons if kind == provider})
+             for provider in ('Claude', 'ChatGPT', 'Antigravity')}
+    page = min(page, max(0, (len(buttons) - 1) // ACCOUNT_PAGE))
     name = 'accounts:%d' % page
-    choices = [[_view(_button(template, label), 'account:' + alias)]
-               for template, label, alias in repair]
-    choices += [[_operation(_button('Use %s for Claude', account_label(store, alias)),
-                            'account.use', name, alias=alias)] for alias in selectable]
-    rows = choices[page * PAGE:(page + 1) * PAGE]
+    choices = [[_view(_button(template.replace('%s', '%s (' + provider + ')'), names[provider][alias]), view + alias)]
+               for (template, view), provider, _, alias in buttons]
+    rows = choices[page * ACCOUNT_PAGE:(page + 1) * ACCOUNT_PAGE]
     rows += [[_view('OpenCode subscription', 'account:' + alias)] for alias in opencode_subscription.accounts(store)]
-    if store.get('claude_account_pick'):
-        rows.append([_operation('Automatic', 'accounts.claude_auto', name)])
-    if codex and not broker.automatic():
-        active = broker.active()
-        rows += [[_operation(_button('Use %s for ChatGPT', broker.label(alias)), 'account.use', name, alias=alias)]
-                 for alias in codex if broker.signed_in(alias) and alias != active]
-    for alias in codex:
-        banked = broker.snapshot(alias).get('resets_available')
-        if broker.authenticated(alias) and type(banked) is int and banked > 0:
-            rows.append([_view(_button('Reset %s (' + str(banked) + ')', broker.label(alias)), 'reset:' + alias)])
-    rows.append([_operation('Cancel sign-in', 'account.signin_cancel', name)] if record else
-                [_operation('Add Claude', 'account.add', name), _operation('Add ChatGPT', 'account.add', name, provider='codex')])
-    if codex:
-        rows.append([_operation('Turn %s ChatGPT auto-switch' % ('off' if broker.automatic() else 'on'),
-                                'accounts.codex_auto', name, enabled=not broker.automatic())])
-    rows.append([_view('Models & Codex ›', 'settings')])
+    if record:
+        rows.append([_operation('Cancel sign-in', 'account.signin_cancel', name)])
+    else:
+        rows.append([_operation('Add Claude', 'account.add', name), _operation('Add ChatGPT', 'account.add', name, provider='codex')]
+                    + ([_operation('Add Antigravity', 'account.add', name, provider='antigravity')]
+                       if store.get('antigravity_enabled', False) is True else []))
+    rows.append([_view('Models ›', 'settings')])
     navigation = []
     if page:
         navigation.append(_view('‹ Previous', 'accounts:%d' % (page - 1)))
-    if (page + 1) * PAGE < len(choices):
+    if (page + 1) * ACCOUNT_PAGE < len(choices):
         navigation.append(_view('Next ›', 'accounts:%d' % (page + 1)))
     if navigation:
         rows.append(navigation)
@@ -377,7 +344,7 @@ def _registered(store, alias):
     from .controls import _ALIAS
     if not isinstance(alias, str) or not _ALIAS.fullmatch(alias):
         return None, None
-    for provider, key in (('claude', 'accounts'), ('codex', 'codex_accounts')):
+    for provider, key in (('claude', 'accounts'), ('codex', 'codex_accounts'), ('antigravity', 'antigravity_accounts')):
         profile = (store.get(key, {}) or {}).get(alias)
         if isinstance(profile, dict):
             return provider, profile
@@ -393,14 +360,15 @@ def _account_view(store, alias):
     if not provider:
         return None
     label = _plain(signin_label(store, alias, provider))
-    name = {'claude': 'Claude', 'codex': 'ChatGPT'}[provider]
+    name = {'claude': 'Claude', 'codex': 'ChatGPT', 'antigravity': 'Antigravity'}[provider]
     if not account_authenticated(store, alias, provider):
         text = (f'{label} ({name}) is signed out.\n'
                 f'Sign in with the same {name} account to bring it back. Its alias, history and settings stay.\n'
-                'Remove takes it off this list. Its folder stays on this Mac.')
+                'Remove takes it off this list. ' + ('Its profile folder goes to the Trash.' if provider == 'antigravity'
+                                                     else 'Its folder stays on this Mac.'))
         return text, [[_operation('Sign in', 'account.add', 'accounts:0', alias=alias),
                        _view('Remove', 'remove:' + alias)]]
-    if profile.get('enabled') is not True:
+    if provider != 'antigravity' and profile.get('enabled') is not True:
         return (f"{label} ({name}) is signed in but turned off, so Torii doesn't use it.",
                 [[_operation('Turn on', 'account.enable', 'accounts:0', alias=alias)]])
     return None
@@ -409,44 +377,17 @@ def _account_view(store, alias):
 def _remove_view(store, alias):
     from .signin import account_authenticated, signin_label
     provider, _ = _registered(store, alias)
-    if not provider or account_authenticated(store, alias, provider):
+    if not provider:
         return None
-    text = ('Remove %s from Torii? It\'s signed out, so no work uses it. Its folder stays on this Mac '
-            'and Torii won\'t re-add it on its own.' % _plain(signin_label(store, alias, provider)))
+    signed = account_authenticated(store, alias, provider)
+    detail = ''
+    if provider == 'antigravity' and signed:
+        detail = optional('antigravity_accounts').card(store, alias) + '\n\n'
+    text = (detail + 'Remove %s from Torii? ' % _plain(signin_label(store, alias, provider))
+            + ('New work moves to your other accounts. ' if signed else "It's signed out, so no work uses it. ")
+            + ('Its profile folder goes to the Trash.' if provider == 'antigravity' else
+               "Its folder stays on this Mac and Torii won't re-add it on its own."))
     return text, [[_operation('Remove', 'account.remove', 'accounts:0', alias=alias)]]
-
-
-def _reset_view(store, alias):
-    from .codex_accounts import CODEX_SWITCH_THRESHOLD, CodexBroker, full_windows
-    from .controls import _mapping, _number, _until
-    if _registered(store, alias)[0] != 'codex':
-        return None
-    broker = CodexBroker(store)
-    snapshot = broker.snapshot(alias)
-    banked = snapshot.get('resets_available')
-    if not broker.authenticated(alias) or type(banked) is not int or banked <= 0:
-        return None
-    usage = _mapping(snapshot.get('usage'))
-    meters = ' · '.join(name + ' ' + left + ' left' for name, left in zip(('5h', 'week'), _left(usage, ('five_hour', 'seven_day'))))
-    label = _plain(broker.label(alias))
-    if not (broker.blocks().get(alias) or snapshot.get('usage_allowed') is False or full_windows(usage)):
-        return ("%s doesn't need a reset yet: %s.\n"
-                'Torii spends a banked reset only when the account is limited or a meter is at %d%% or more. '
-                'Your %d reset%s banked.' % (label, meters, round(CODEX_SWITCH_THRESHOLD * 100), banked,
-                                             ' stays' if banked == 1 else 's stay')), []
-    state = broker.account_state(alias)
-    limited = ''
-    if state['state'] == 'limited':
-        until = state.get('until')
-        limited = (' Limited, back in ' + _until(until) + '.' if _number(until) and until > time.time()
-                   else ' Limited.')
-    expires = snapshot.get('reset_expires')
-    text = ('Spend 1 of %d banked reset%s on %s?\nNow: %s.%s\n'
-            "It refills the 5-hour and weekly limits right away. It can't be undone.\n"
-            % (banked, '' if banked == 1 else 's', label, meters, limited)
-            + ('Torii spends the one that expires first (in %s).' % _expiry(expires) if _number(expires)
-               else 'Codex picks which one.'))
-    return text, [[_operation('Spend reset', 'account.codex_reset', 'accounts:0', alias=alias)]]
 
 
 def _opencode_line(store):
@@ -479,20 +420,16 @@ def _settings_view(store):
         until = broker.earliest_reset()
         quota = (' · the active Codex account %s is ' % (_plain(broker.label(active)) if active else 'none') +
                  ('limited, back in ' + _until(until) if until else 'unavailable'))
-    text = '\n'.join(['**Models & Codex**']
+    routing = optional('routing')
+    text = '\n'.join(['**Models**']
                      + [_MODEL_TITLES[role] + ': ' + _plain(_model_value(store, role)) for role in _MODEL_TITLES]
                      + ['Codex: ' + ('on' if enabled else 'off') + quota]
                      + _opencode_line(store)
-                     + ['Updates from Telegram: ' + ('on' if store.get('telegram_updates_enabled', False) is True else 'off'),
-                        'Worker and Codex changes apply to future dispatches. '
+                     + (routing.table_lines(store) if routing is not None else [])
+                     + ['Worker and Codex changes apply to future dispatches. '
                         'The coordinator change applies at its next launch.'])
     return text, ([[_view(title, 'model:' + role)] for role, title in _MODEL_TITLES.items()]
-                  + [[_operation('Turn Codex off' if enabled else 'Turn Codex on', 'delegation.codex', 'settings',
-                                 enabled=not enabled)],
-                     [_operation('Turn Telegram updates off' if store.get('telegram_updates_enabled', False) is True
-                                 else 'Turn Telegram updates on', 'service.updates', 'settings',
-                                 enabled=store.get('telegram_updates_enabled', False) is not True)],
-                     [_view('Usage policy', 'policy')]])
+                  + [[_view('Usage policy', 'policy')]])
 
 
 def _secret_rows(store):
@@ -607,12 +544,18 @@ def _model_view(store, role):
     if role not in _MODEL_TITLES:
         return None
     text = f'{_MODEL_TITLES[role]}: {_plain(_model_value(store, role))}\nChoose a model or enter its ID. Your provider checks model access.'
-    presets = ([_operation('GPT-6.1 Sol (default)', 'model.codex', 'settings', model='gpt-6.1-sol'),
-                _operation('GPT-6 Luna', 'model.codex', 'settings', model='gpt-6-luna'),
-                _operation('GPT-6 Astra', 'model.codex', 'settings', model='gpt-6-astra')] if role == 'codex' else
-               [_operation('Opus 5.5', 'model.' + role, 'settings', model='claude-opus-5-5')])
-    return text, [presets, [_input('Custom model', 'model:' + role)],
-                  [_operation(_MODEL_UNSET[role].capitalize(), 'model.' + role, 'settings', model=None)]]
+    presets = ([[_operation('GPT-6.2 Sol (default)', 'model.codex', 'settings', model='gpt-6.2-sol'),
+                 _operation('GPT-6 Luna', 'model.codex', 'settings', model='gpt-6-luna')],
+                [_operation('GPT-6 Astra', 'model.codex', 'settings', model='gpt-6-astra'),
+                 _operation('GPT-6.2 Astra', 'model.codex', 'settings', model='gpt-6.2-astra')]] if role == 'codex' else
+               [[_operation('Opus 5.5', 'model.' + role, 'settings', model='claude-opus-5-5')]])
+    return text, presets + [[_input('Custom model', 'model:' + role)],
+                  [_operation(_MODEL_UNSET[role][0].upper() + _MODEL_UNSET[role][1:], 'model.' + role, 'settings', model=None)]]
+
+
+def _readable(policy):
+    """The policy as the owner reads it: no source comments, no blank-line runs they leave."""
+    return re.sub(r'\n{3,}', '\n\n', re.sub(r'[ \t]*<!--.*?-->', '', policy, flags=re.S)).strip()
 
 
 def _page(name):
@@ -633,8 +576,6 @@ def view(store, topic, name, reply_to=None, prefix='', in_place=False):
         shown = _account_view(store, rest)
     elif head == 'remove' and rest:
         shown = _remove_view(store, rest)
-    elif head == 'reset' and rest:
-        shown = _reset_view(store, rest)
     elif head == 'secret' and rest:
         shown = _secret_view(store, topic, rest)
     elif head == 'revoke' and rest:
@@ -648,8 +589,13 @@ def view(store, topic, name, reply_to=None, prefix='', in_place=False):
     elif name == 'project':
         shown = _project_view(store, topic)
     elif name == 'policy':
-        from .policy import usage_policy
-        shown = 'Usage policy\n' + usage_policy(store.directory), [[_input('Edit', 'policy')]]
+        from .policy import personal_path, read_rule
+        try:
+            rules = read_rule(personal_path(store))
+        except (OSError, UnicodeError):
+            shown = 'Personal rules\npersonal.md is unavailable.', []
+        else:
+            shown = 'Personal rules\n' + _readable(rules), []
     else:
         return False
     if shown is None:
@@ -658,8 +604,9 @@ def view(store, topic, name, reply_to=None, prefix='', in_place=False):
     back = _back_row(name)
     if back:
         rows = rows + [back]
-    text = (prefix + '\n\n' if prefix else '') + clip(text, CARD_LIMIT)
-    emit(store, topic, clip(text, 4096), rows, reply_to, where=name, in_place=in_place)
+    whole = name == 'policy'
+    text = (prefix + '\n\n' if prefix else '') + (text if whole else clip(text, CARD_LIMIT))
+    emit(store, topic, text if whole else clip(text, 4096), rows, reply_to, where=name, in_place=in_place)
     return True
 
 
@@ -690,9 +637,6 @@ def prompt(store, topic, kind, reply_to=None, error='', in_place=False):
         text = ('Reply to this message with the full path of an existing folder for new projects. '
                 'Existing projects will stay where they are.')
         back = _command('Cancel', '/projects')
-    elif kind == 'policy':
-        text = 'Reply to this message with the usage policy to replace USAGE.md (up to 4000 characters).'
-        back = _view('Cancel', 'policy')
     else:
         return False
     emit(store, topic, (error + '\n\n' if error else '') + text, [[back]], reply_to, pending=kind, in_place=in_place)
@@ -749,10 +693,6 @@ def accept_text(store, topic, text, message_id, reply_to=None):
         valid = _existing_path(value) is not None
         op, params, page = 'projects.root', {'path': value}, '/projects'
         error = 'That folder is unavailable. Send an existing absolute folder path.'
-    elif kind == 'policy':
-        valid = 0 < len(value) <= 4000
-        op, params, page = 'policy.set', {'text': value}, 'policy'
-        error = 'Send guidance of 1–4000 characters.'
     else:
         return False
     if not valid:

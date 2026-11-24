@@ -1,21 +1,24 @@
 import asyncio
 import json
+import re
 from io import StringIO
 import os
 from pathlib import Path
 import select
 import shutil
 import signal
+import sqlite3
 import subprocess
 import sys
 import tempfile
 import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
-from coordinator import control_api, log, mcp
+from coordinator import control_api, extension, log, mcp
 from coordinator.store import Store
 from coordinator.mcp import tools_list
+from tests.support import SETTLE
 
 
 class CopiedMcpServer:
@@ -27,13 +30,16 @@ class CopiedMcpServer:
         shutil.copy2(Path(__file__).resolve().parents[1] / 'scripts' / 'update-watchdog.py',
                      self.root / 'scripts' / 'update-watchdog.py')
         self.store = Store(directory / 'state')
+        self.process = None
+        self.sequence = 0
+        self.pending = b''
+
+    def start(self):
         self.process = subprocess.Popen(
             [sys.executable, '-m', 'coordinator', '--state-dir', str(self.store.directory), 'mcp'],
             cwd=self.root, env=dict(os.environ, PYTHONPATH=str(self.root)),
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
             start_new_session=True)
-        self.sequence = 0
-        self.pending = b''
 
     def request(self, method, params=None):
         self.sequence += 1
@@ -69,6 +75,9 @@ class CopiedMcpServer:
             self.store.put('service_run', {'state': 'running', 'started': 1.0, 'code': stamp})
 
     def close(self):
+        self.store.close()
+        if self.process is None:
+            return
         self.process.stdin.close()
         try:
             self.process.wait(timeout=30)
@@ -82,14 +91,20 @@ class CopiedMcpServer:
             self.process.wait(timeout=30)
             self.process.stdout.close()
             self.process.stderr.close()
-            self.store.close()
 
 
 def retained_tool_arguments(folder):
-    return {
+    arguments = {
+        'followup_propose': {'parent': 999999, 'title': 'Later', 'why': 'Needed'},
+        'followup_ready': {},
+        'keep_save': {'path': str(folder / 'missing'), 'reason': 'Proof', 'task': 1},
+        'keep_drop': {'id': 'missing'},
         'telegram_send': {'topic': '1:2', 'text': 'Report', 'task': 1, 'image': str(folder / 'image.png')},
+        'events_post': {'topic': '1:2', 'text': 'Report'},
         'tasks_create': {'title': 'Build', 'secrets': 'SAMPLE_KEY'},
         'tasks_update': {'task': 999999, 'notes': 'Updated'},
+        'tasks_link': {'task': 1, 'kind': 'related', 'to': 2},
+        'tasks_note': {'task': 1, 'text': 'Fixture note'},
         'tasks_get': {'task': 1},
         'tasks_list': {'topic': '1:2'},
         'tasks_wait': {'topic': '1:2', 'kind': 'owner', 'ask': 'Choose the next step', 'key': 'owner:retained'},
@@ -98,7 +113,7 @@ def retained_tool_arguments(folder):
         'pending_cancel': {'wait': 2, 'reason': 'No longer needed'},
         'tasks_stale': {'hours': 1000000},
         'worktree_create': {'task': 2},
-        'workers_spawn': {'task': 1, 'provider': 'codex', 'prompt': 'Build'},
+        'workers_spawn': {'task': 1, 'kind': 'general', 'prompt': 'Build'},
         'workers_steer': {'worker': 1, 'prompt': 'Continue'},
         'workers_stop': {'worker': 2},
         'workers_goal': {'worker': 2, 'condition': 'Finish'},
@@ -124,18 +139,22 @@ def retained_tool_arguments(folder):
         'account_show': {'alias': 'test'},
         'policy_show': {},
         'projects_list': {},
+        'loadout_show': {},
+        'loadout_swap': {'key': 'workers.codex.effort', 'value': 'low', 'until': '1d', 'reason': 'Test', 'message': 1},
+        'loadout_unswap': {'id': 1},
         'problems_list': {},
         'problems_summary': {'since': '2026-01-01T00:00:00Z'},
     }
+    if extension.available('trash_move'):
+        arguments['trash_move'] = {'path': str(folder / 'missing')}
+    return arguments
 
 
 def seed_retained_tools(server, folder):
     folder.mkdir(exist_ok=True)
     (folder / 'image.png').write_bytes(b'image')
     store = server.store
-    (store.directory / 'USAGE.md').write_text('Test usage policy.\n')
     with store.db:
-        store.put('waits_enabled', True)
         store.put('owner', 1)
         store.put('group', 1)
         store.put('bot_username', 'fixture_bot')
@@ -149,6 +168,7 @@ def seed_retained_tools(server, folder):
         for task, worktree in ((1, folder), (2, folder / 'missing')):
             store.db.execute('INSERT INTO tasks(id,topic,number,title,worktree,origin,created,updated) '
                              "VALUES (?,'1:2',?,'Build',?,1,1,1)", (task, task, str(worktree)))
+            store.db.execute('UPDATE tasks SET uid=? WHERE id=?', ('%08x' % task, task))
         store.db.execute("INSERT INTO task_stamps(task,stage,created) VALUES (1,'ready',1)")
         for worker, status, fresh in ((1, 'done', 0), (2, 'running', 1)):
             store.db.execute('INSERT INTO workers(id,task,topic,provider,prompt,session,status,fresh,'
@@ -182,6 +202,7 @@ class McpRetainedCodeTests(unittest.TestCase):
                             server = CopiedMcpServer(root / name / side)
                             servers.append(server)
                             seed_retained_tools(server, root / 'data')
+                            server.start()
                             self.assertIn('result', server.request('initialize'))
                             listed = server.request('tools/list')['result']['tools']
                             self.assertEqual(set(arguments), {tool['name'] for tool in listed})
@@ -203,8 +224,7 @@ class McpRetainedCodeTests(unittest.TestCase):
                             if name == 'pending_list':
                                 self.assertEqual(([item['id'] for item in data['waits']], data['held']), ([1], []))
                             else:
-                                self.assertEqual((data['id'], data['state']),
-                                                 (1, 'armed') if name == 'tasks_wait' else (2, 'fired'))
+                                self.assertEqual(data['id'], 1 if name == 'tasks_wait' else 2)
                         if name in ('tasks_get', 'workers_spawn'):
                             for response, server in ((expected, before), (actual, swapped)):
                                 content = response['result']['content'][0]
@@ -212,7 +232,25 @@ class McpRetainedCodeTests(unittest.TestCase):
                                 data = json.loads(payload)
                                 self.assertEqual(data['results'], str(server.store.directory / 'results/task-1'))
                                 data['results'] = '<results>'
+                                if 'scratch' in data:
+                                    self.assertEqual(data['scratch'], str(server.store.directory / 'scratch/task-1'))
+                                    data['scratch'] = '<scratch>'
+                                data['journal'] = '<journal>'
                                 content['text'] = text + '\n' + json.dumps(data, separators=(',', ':'))
+                        if name == 'tasks_note':
+                            for response in (expected, actual):
+                                content = response['result']['content'][0]
+                                text, payload = content['text'].rsplit('\n', 1)
+                                data = json.loads(payload)
+                                data['at'] = '<time>'
+                                data['journal'] = '<journal>'
+                                content['text'] = text + '\n' + json.dumps(data, separators=(',', ':'))
+                        if name == 'policy_show':
+                            for response, server in ((expected, before), (actual, swapped)):
+                                content = response['result']['content'][0]
+                                content['text'] = re.sub(r'^Torii\.md: \d+ bytes', 'Torii.md: <bytes>', content['text'].replace(
+                                    str(server.root), '<root>').replace(str(server.store.directory), '<state>').replace(
+                                    '/swapped/', '/<side>/').replace('/original/', '/<side>/'))
                         self.assertEqual(actual, expected)
                         self.assertIsNone(swapped.process.poll())
                         self.assertIn('result', swapped.request('initialize'))
@@ -227,6 +265,7 @@ class McpFreshCodeTests(unittest.TestCase):
         self.addCleanup(directory.cleanup)
         self.server = CopiedMcpServer(Path(directory.name))
         self.addCleanup(self.server.close)
+        self.server.start()
         self.assertIn('result', self.server.request('initialize'))
 
     def assert_probe(self, text):
@@ -275,6 +314,22 @@ class McpFreshCodeTests(unittest.TestCase):
 
 
 class McpTests(unittest.TestCase):
+    def test_async_failed_tool_rolls_back_and_releases_write_lock(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = Store(Path(directory) / 'state')
+            self.addCleanup(store.close)
+            async def failed(*args, **kwargs):
+                store.put('mcp_uncommitted_test', True)
+                return control_api.Result(False, 'failed', state='failed')
+            request = {'method': 'tools/call', 'params': {'name': 'tasks_update', 'arguments': {'task': 1}}}
+            with patch.object(control_api, 'call_async', side_effect=failed):
+                reply = asyncio.run(mcp.dispatch_async(store, request))
+            self.assertTrue(reply['isError'])
+            self.assertFalse(store.db.in_transaction)
+            self.assertIsNone(store.get('mcp_uncommitted_test'))
+            with sqlite3.connect(str(store.directory / 'state.sqlite'), timeout=0) as other:
+                other.execute('BEGIN IMMEDIATE')
+
     def test_ready_file_written_only_when_asked(self):
         with tempfile.TemporaryDirectory() as directory:
             store = Store(Path(directory) / 'state')
@@ -324,7 +379,7 @@ class McpTests(unittest.TestCase):
                                  (directory,))
             task = store.task_create('1:2', 'Finish this', finish='merged', worktree=directory)
             request = {'jsonrpc': '2.0', 'id': 1, 'method': 'tools/call', 'params': {
-                'name': 'tasks_update', 'arguments': {'task': task['id'], 'status': 'done',
+                'name': 'tasks_update', 'arguments': {'task': task['id'], 'status': 'done', 'summary': 'Closed in test.',
                     'pr': 'https://github.com/example/project/pull/12'}}}
             target = StringIO()
             with patch.object(control_api, 'call', side_effect=AssertionError('sync control call')), \
@@ -348,22 +403,23 @@ class McpTests(unittest.TestCase):
             request = {'jsonrpc': '2.0', 'id': 1, 'method': 'tools/call', 'params': {
                 'name': 'worktree_create', 'arguments': {'task': task['id']}}}
             target = StringIO()
-            mcp.serve(store, None, StringIO(json.dumps(request) + '\n'), target)
+            workspace = {'cwd': directory, 'branch': 'torii/task-1', 'isolated': True,
+                         'base_ref': 'HEAD', 'base_commit': 'abc', 'fetched': False}
+            with patch('coordinator.workspaces.prepare_task_workspace', new=AsyncMock(return_value=workspace)) as create:
+                mcp.serve(store, None, StringIO(json.dumps(request) + '\n'), target)
             response = json.loads(target.getvalue())
             self.assertFalse(response['result']['isError'], response)
-            data = json.loads(response['result']['content'][0]['text'].rsplit('\n', 1)[1])
-            self.assertEqual(data['worktree'], directory)
-            self.assertEqual(data['base_ref'], 'HEAD')
+            text, data = response['result']['content'][0]['text'].rsplit('\n', 1)
+            data = json.loads(data)
+            self.assertEqual(text, directory)
+            self.assertEqual(data['base_commit'], 'abc')
+            self.assertEqual(create.await_args.kwargs['saved_cwd'], directory)
 
     def test_d7_chat_policy_tool_schema_description_and_loading(self):
         listed = {tool['name']: tool for tool in tools_list()}
         tool = listed['policy_chat']
         self.assertEqual(tool['description'],
-            "Set or clear one chat's own delegation instructions: how its agent delegates work. They add to the usage "
-            'policy and win where the two conflict, in that chat only. Coordinator rules and owner-only controls stay in force. '
-            'Over MCP, topic and message=N for the owner message in the asking channel are required. '
-            'Send text (at most 2000 characters) to set it; omit text to clear it. '
-            "The chat's agent loads them with its next message. Workers keep their settings.")
+            'Append a chat rule with append and owner message=N. The next message loads it.')
         self.assertEqual(tool['inputSchema']['required'], ['message', 'topic'])
         self.assertNotIn('_meta', tool)
         self.assertIn('topic', listed['policy_show']['inputSchema']['properties'])
@@ -450,6 +506,20 @@ class McpTests(unittest.TestCase):
             self.assertEqual(json.loads(target.getvalue()), {'jsonrpc': '2.0', 'id': 7, 'result': {
                 'content': [{'type': 'text', 'text': 'Unknown job.\nnull'}], 'isError': True}})
 
+    def test_forwarded_trash_call_has_a_timeout(self):
+        request = {'jsonrpc': '2.0', 'id': 7, 'method': 'tools/call',
+                   'params': {'name': 'trash_move', 'arguments': {'path': '/fixture'}}}
+        with tempfile.TemporaryDirectory() as root:
+            store = Store(Path(root))
+            self.addCleanup(store.close)
+            store.put('service_run', {'code': 'new'})
+            target = StringIO()
+            with patch('coordinator.mcp.code_stamp', return_value='new'), \
+                    patch('coordinator.mcp.subprocess.run', side_effect=subprocess.TimeoutExpired('mcp', 120)) as run:
+                mcp.serve(store, 'start', StringIO(json.dumps(request) + '\n'), target)
+            self.assertEqual(run.call_args.kwargs['timeout'], 120)
+            self.assertEqual(json.loads(target.getvalue())['error']['code'], -32603)
+
     def test_l_child_reply_requires_the_request_id_and_keeps_serving(self):
         following = '{"jsonrpc":"2.0","id":8,"method":"tools/list"}\n'
         with tempfile.TemporaryDirectory() as root:
@@ -494,7 +564,7 @@ class McpTests(unittest.TestCase):
                                      '--state-dir', str(store.directory), 'mcp'])
                     self.assertEqual(run.call_args.kwargs, {
                         'cwd': Path(root), 'env': dict(os.environ, PYTHONPATH=root),
-                        'input': request, 'capture_output': True, 'text': True})
+                        'input': request, 'capture_output': True, 'text': True, 'timeout': None})
                     self.assertFalse(store.db.in_transaction)
             with patch('coordinator.mcp.subprocess.run', side_effect=OSError('cannot start child')):
                 response = mcp.current_code_response(store, Path(root), request, 7)
@@ -530,9 +600,10 @@ class McpTests(unittest.TestCase):
         from unittest.mock import patch
         tools = tools_list()
         for tool in tools:
-            op = mcp.TOOLS[tool['name']]
+            op = mcp.TOOLS.get(tool['name']) or control_api.BY_ID['events.post']
             self.assertEqual(tool['annotations'], {'readOnlyHint': op.kind == control_api.READ,
-                                                   'destructiveHint': op.id == 'topic.close', 'openWorldHint': False})
+                                                   'destructiveHint': op.id in ('topic.close', 'trash.move'),
+                                                   'openWorldHint': False})
         original = mcp.tools_hash()
         tools[0]['annotations']['readOnlyHint'] = not tools[0]['annotations']['readOnlyHint']
         with patch('coordinator.mcp.tools_list', return_value=tools):
@@ -574,19 +645,17 @@ class McpTests(unittest.TestCase):
                 {'jsonrpc': '2.0', 'id': 4, 'method': 'tools/call',
                  'params': {'name': 'tasks_list', 'arguments': {'topic': '1:2'}}},
             ]
-            process = subprocess.Popen([sys.executable, '-m', 'coordinator', '--state-dir', root, 'mcp'],
-                                       stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                       stderr=subprocess.PIPE, text=True)
-            output, errors = process.communicate(''.join(json.dumps(row) + '\n' for row in requests), timeout=10)
-            self.assertEqual(process.returncode, 0, errors)
-            replies = [json.loads(line) for line in output.splitlines()]
+            process = subprocess.run([sys.executable, '-m', 'coordinator', '--state-dir', root, 'mcp'],
+                                     input=''.join(json.dumps(row) + '\n' for row in requests),
+                                     capture_output=True, text=True, timeout=3 * SETTLE)
+            self.assertEqual(process.returncode, 0, process.stderr)
+            replies = [json.loads(line) for line in process.stdout.splitlines()]
             self.assertEqual([row['id'] for row in replies], [1, 2, 3, 4])
             self.assertEqual(replies[0]['result']['protocolVersion'], '2025-06-18')
             names = {tool['name'] for tool in replies[1]['result']['tools']}
             self.assertIn('tasks_create', names)
             self.assertIn('tasks_list', names)
             self.assertIn('"number":1', replies[2]['result']['content'][0]['text'])
-            self.assertIn('"topic":"1:2"', replies[2]['result']['content'][0]['text'])
             self.assertIn('Build', replies[3]['result']['content'][0]['text'])
 
 
@@ -661,11 +730,11 @@ class OpenCodePickTests(unittest.TestCase):
         self.assertEqual(mcp.input_schema(control_api.BY_ID['topic.bind'])['properties']['provider']['enum'], ['claude', 'codex'])
         self.assertEqual(mcp.input_schema(control_api.BY_ID['effort.parent'])['properties']['provider']['enum'], ['claude', 'codex'])
         self.assertEqual(tools['workers_spawn']['inputSchema']['properties']['provider']['enum'],
-                         ['claude', 'codex', 'opencode', 'muse'])
-        self.assertIn('Muse workers are off by default.', tools['workers_spawn']['description'])
+                         ['claude', 'codex', 'opencode']
+                         + (['antigravity'] if extension.available('antigravity_runtime') else []))
         self.assertNotIn('topic_bind', tools)
 
-    def test_topic_create_opencode_writes_pick_and_delegation(self):
+    def test_topic_create_opencode_writes_pick_and_rules(self):
         from coordinator import topics
         from tests.test_group_setup import GroupTelegram
         from types import SimpleNamespace
@@ -675,7 +744,7 @@ class OpenCodePickTests(unittest.TestCase):
         model = 'example-host/example-model'
         self.store.put('opencode_accounts', {'example-host': {'model': model}})
         params = {'name': 'OpenCode', 'provider': 'opencode', 'message': self.owner,
-                  'delegation': '  Start only OpenCode (example-model) workers.  '}
+                  'rules': '- Start only OpenCode (example-model) workers.'}
         for setting, value, extra, expected in (
                 ('opencode_enabled', False, {}, 'OpenCode is off. Turn on delegation.opencode first.'),
                 ('opencode_active_account', None, {}, 'Select an OpenCode account with opencode.use first.'),
@@ -687,7 +756,7 @@ class OpenCodePickTests(unittest.TestCase):
                 self.store.put(setting, value)
                 reply = self.call('topic_create', dict(params, **extra))
                 self.assertTrue(reply['isError'], reply)
-                self.assertEqual(reply['content'][0]['text'], expected + '\nnull')
+                self.assertEqual(reply['content'][0]['text'], expected + '\n{}')
                 self.assertEqual(self.store.db.execute('SELECT count(*) FROM service_requests').fetchone()[0], 0)
                 self.assertEqual(list(projects.iterdir()), [])
                 self.store.put(setting, previous)
@@ -708,11 +777,10 @@ class OpenCodePickTests(unittest.TestCase):
         key = 'coordinator:' + topic
         self.assertEqual(self.store.get(key + '_selection'),
                          {'provider': 'opencode', 'model': None, 'effort': None, 'revision': 1})
-        self.assertEqual(self.store.get(key + '_delegation'),
-                         {'text': 'Start only OpenCode (example-model) workers.', 'revision': 1})
+        from coordinator.policy import chat_path
+        self.assertEqual(chat_path(self.store, topic).read_text(), '- Start only OpenCode (example-model) workers.\n')
         ready = self.store.db.execute('SELECT text FROM outbox WHERE topic=? ORDER BY id DESC LIMIT 1', (topic,)).fetchone()[0]
         self.assertIn('Chat agent: OpenCode example-host ' + model + ' · picked for this chat.', ready)
-        self.assertIn('Delegation updated.', ready)
         self.assertNotIn('Start only OpenCode (example-model) workers.', ready)
         self.assertIsNone(self.store.get('coordinator_selection'))
 
@@ -720,7 +788,13 @@ class OpenCodePickTests(unittest.TestCase):
 class ToolSetTests(unittest.TestCase):
     def test_coordinator_can_clear_owner_claude_pick(self):
         self.store.put('claude_account_pick', 'work')
-        reply = self.call('accounts_claude_auto')
+        self.store.put('group', 1)
+        refused = mcp.dispatch(self.store, {'method': 'tools/call', 'params': {'name': 'accounts_claude_auto',
+                                                                               'arguments': {}}}, topic='1:2')
+        self.assertIn('message=N', refused['content'][0]['text'])
+        message = self.store.message_save('1:2', 'owner', 'Pick Claude automatically.')['id']
+        reply = mcp.dispatch(self.store, {'method': 'tools/call', 'params': {'name': 'accounts_claude_auto',
+                                                                             'arguments': {'message': message}}}, topic='1:2')
         self.assertIn('Claude account choice is automatic.', reply['content'][0]['text'])
         self.assertIsNone(self.store.get('claude_account_pick'))
 
@@ -743,14 +817,16 @@ class ToolSetTests(unittest.TestCase):
     def test_tools_list_is_the_coordinator_ops_plus_read_only_views(self):
         names = {tool['name'] for tool in mcp.dispatch(self.store, {'method': 'tools/list'})['tools']}
         self.assertEqual(names, {
-            'telegram_send', 'tasks_create', 'tasks_update', 'tasks_get', 'tasks_list', 'worktree_create',
+            'keep_save', 'keep_drop', 'telegram_send', 'tasks_create', 'tasks_update', 'tasks_link', 'tasks_note', 'tasks_get', 'tasks_list', 'worktree_create',
             'workers_spawn', 'workers_steer', 'workers_stop', 'workers_goal', 'workers_list',
             'service_restart', 'settings_show', 'topics_list', 'topic_show', 'workers_get',
             'accounts_list', 'account_current', 'account_show', 'policy_show', 'projects_list',
             'secret_ask', 'secret_list', 'secret_rotate', 'secret_revoke', 'problems_list', 'problems_summary',
             'tasks_stale', 'account_use', 'accounts_claude_auto', 'account_redeem', 'topic_create', 'topic_close', 'model_parent', 'policy_chat',
-            'tasks_wait', 'pending_list', 'pending_fire', 'pending_cancel'})
-        self.assertEqual(len(names), 39)
+            'tasks_wait', 'pending_list', 'pending_fire', 'pending_cancel', 'followup_propose', 'followup_ready', 'events_post',
+            'loadout_show', 'loadout_swap', 'loadout_unswap'}
+            | ({'trash_move'} if extension.available('trash_move') else set()))
+        self.assertEqual(len(names), 49 + extension.available('trash_move'))
         for op_id in mcp.READ_OPS:
             self.assertEqual(control_api.BY_ID[op_id].kind, control_api.READ)
 
@@ -768,14 +844,15 @@ class ToolSetTests(unittest.TestCase):
                 else:
                     self.assertNotIn('_meta', tool)
 
-    def test_policy_show_returns_current_usage_file(self):
-        policy = 'Use one worker.'
-        (self.store.directory / 'USAGE.md').write_text(policy)
+    def test_policy_show_returns_current_personal_rules(self):
+        from coordinator.policy import personal_path
+        personal_path(self.store).write_text('- Use one worker.\n')
         reply = self.call('policy_show', {})
-        self.assertEqual(reply['content'][0]['text'], policy + '\nnull')
+        self.assertIn('- Use one worker.', reply['content'][0]['text'])
 
     def test_owner_only_ops_are_not_callable_through_mcp(self):
-        before = (self.store.directory / 'USAGE.md').read_bytes()
+        from coordinator.policy import personal_path
+        before = personal_path(self.store).read_bytes()
         for name, arguments in (('account_select', {'alias': 'other'}), ('account_disable', {'alias': 'work'}),
                                 ('policy_set', {'text': 'Always use codex'}), ('delegation_codex', {'enabled': 'false'}),
                                 ('topic_bind', {'topic': '1:2', 'cwd': self.temp.name, 'name': 'x'}),
@@ -784,12 +861,12 @@ class ToolSetTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'Unknown tool'):
                 self.call(name, arguments)
         self.assertTrue(self.store.get('accounts')['work']['enabled'])
-        self.assertEqual((self.store.directory / 'USAGE.md').read_bytes(), before)
+        self.assertEqual(personal_path(self.store).read_bytes(), before)
         self.assertEqual(self.store.topic('1:2')['name'], 'test')
 
     def test_read_views_and_workers_get_answer_through_mcp(self):
         task = self.store.task_create('1:2', 'Build', worktree=self.temp.name)
-        spawned = self.call('workers_spawn', {'task': task['id'], 'provider': 'claude', 'prompt': 'Go'})
+        spawned = self.call('workers_spawn', {'task': task['id'], 'kind': 'design', 'prompt': 'Go'})
         self.assertFalse(spawned['isError'])
         worker = json.loads(spawned['content'][0]['text'].split('\n', 1)[1])['worker']
         got = self.call('workers_get', {'worker': worker})

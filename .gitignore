@@ -30,3 +30,5 @@ shared-mcp.lock
 service.lock
 USAGE.md
 !coordinator/defaults/USAGE.md
+
+.verify-proof/

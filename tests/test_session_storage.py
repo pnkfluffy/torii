@@ -5,15 +5,14 @@ from contextlib import nullcontext
 import json
 import os
 from pathlib import Path
-import sqlite3
-import sys
+import subprocess
 import tempfile
 import time
 from types import SimpleNamespace
 import unittest
 from unittest.mock import AsyncMock, patch
 
-from coordinator import control_api
+from coordinator import control_api, session_storage
 from coordinator.store import Store
 from tests.test_worker_storage import StorageSupport
 
@@ -22,6 +21,10 @@ SID = '00000000-0000-4000-8000-000000000001'
 OTHER = '00000000-0000-4000-8000-000000000002'
 THIRD = '00000000-0000-4000-8000-000000000003'
 OPENCODE = 'ses_' + 'a' * 26
+
+
+class SimulatedCrash(BaseException):
+    """A process crash: not an error the sweep runner catches."""
 
 
 class SessionStorageTests(unittest.IsolatedAsyncioTestCase):
@@ -36,6 +39,11 @@ class SessionStorageTests(unittest.IsolatedAsyncioTestCase):
         self.job = self.store.task_create('1:2', 'Research')
         self.store.put('session_delete', True)
         self.home = self.root / 'profile'
+        self.trash = self.root / 'trash'
+        for fixture in (patch('coordinator.host_os.trash_directory', return_value=self.trash),
+                        patch('coordinator.stray_report.process_paths', return_value=[])):
+            fixture.start()
+            self.addCleanup(fixture.stop)
 
     def worker(self, provider='claude', status='done', result=True, sid=SID, job=None):
         job = job or self.job
@@ -63,6 +71,8 @@ class SessionStorageTests(unittest.IsolatedAsyncioTestCase):
         path = home / relative
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(b'fixture session data')
+        old = time.time() - 15 * 86400
+        os.utime(path, (old, old))
         return path
 
     def remember(self, worker=None, provider='claude', sid=SID, home=None, parent=None, created=True, host=None):
@@ -86,7 +96,7 @@ class SessionStorageTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result.ok, result)
         self.assertIs(self.store.get('session_delete'), True)
 
-    async def test_closed_worker_files_deleted_for_claude_and_codex(self):
+    async def test_closed_worker_files_trashed_for_claude_and_codex(self):
         for provider in ('claude', 'codex'):
             with self.subTest(provider=provider):
                 path = self.file(provider)
@@ -95,7 +105,60 @@ class SessionStorageTests(unittest.IsolatedAsyncioTestCase):
                 self.close_round()
                 await self.sweep()
                 self.assertFalse(path.exists())
+                self.assertEqual(next(self.trash.glob('*' + path.name)).read_bytes(), b'fixture session data')
                 self.assertTrue(self.store.db.execute('SELECT result FROM workers WHERE id=?', (worker,)).fetchone()[0])
+
+    def second_closed_job(self):
+        job = self.store.task_create('1:2', 'Other')
+        worker = self.worker(sid=OTHER, job=job)
+        self.remember(worker, sid=OTHER)
+        with self.store.db:
+            self.store.db.execute("UPDATE tasks SET status='done' WHERE id=?", (job['id'],))
+            self.store.db.execute("UPDATE task_iterations SET closed=2,outcome='done' WHERE task=?", (job['id'],))
+        return job, worker, self.file(sid=OTHER)
+
+    async def test_session_file_is_not_trashed_after_its_job_reopens(self):
+        path = self.file()
+        worker = self.worker()
+        self.remember(worker)
+        self.close_round()
+        _, _, other_path = self.second_closed_job()
+        real_settled = session_storage.SessionStorage.settled
+
+        async def settled(storage, record):
+            result = await real_settled(storage, record)
+            if record['worker'] == worker:
+                with self.store.db:
+                    self.store.db.execute("UPDATE tasks SET status='open' WHERE id=?", (self.job['id'],))
+            return result
+        with patch.object(session_storage.SessionStorage, 'settled', settled):
+            await self.sweep()
+        self.assertTrue(path.exists(), 'a session was trashed after its job reopened')
+        self.assertFalse(other_path.exists())
+
+    async def test_one_failed_trash_backs_off_and_the_next_session_moves(self):
+        path = self.file()
+        self.remember(self.worker())
+        self.close_round()
+        _, _, other_path = self.second_closed_job()
+        real_trash = session_storage.trash_file
+
+        def trash(root, plan, folder):
+            if Path(plan['path']).name == path.name:
+                raise PermissionError('fixture trash refusal')
+            return real_trash(root, plan, folder)
+        with patch.object(session_storage, 'trash_file', trash):
+            await self.sweep()
+        self.assertTrue(path.exists())
+        self.assertFalse(other_path.exists())
+        [detail] = [row[0] for row in self.store.db.execute(
+            "SELECT detail FROM problems WHERE area='cleanup' AND code='session-trash-failed'")]
+        self.assertRegex(detail, r'^item=claude:%s failures=1 PermissionError: fixture trash refusal at '
+                                 r'test_session_storage\.py:\d+ trash' % SID)
+        with patch('coordinator.sweeps.time.time', return_value=time.time() + 61):
+            await self.sweep()
+        self.assertFalse(path.exists())
+        self.assertIsNone(self.store.db.execute("SELECT 1 FROM sweep_failures WHERE sweep='session-trash'").fetchone())
 
     async def test_open_waiting_and_active_rounds_keep_all_sessions(self):
         path = self.file()
@@ -143,7 +206,7 @@ class SessionStorageTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(json.loads(row['result'])['failure_code'], 'owner_stopped')
             self.assertIsNotNone(self.store.db.execute('SELECT 1 FROM messages WHERE source_worker=?', (identifier,)).fetchone())
         await self.sweep()
-        self.assertFalse(path.exists())
+        self.assertTrue(path.exists())
 
     async def test_closing_job_with_switch_off_keeps_existing_result_behavior(self):
         worker = self.worker(status='waiting_for_quota', result=False)
@@ -170,41 +233,30 @@ class SessionStorageTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.store.db.execute("SELECT count(*) FROM messages WHERE source_worker=? AND kind='worker_result'",
                                                (worker,)).fetchone()[0], 1)
 
-    async def test_unreadable_home_backs_off_once_per_home_and_recovers(self):
+    async def test_unreadable_home_does_not_stop_cleanup_of_other_homes(self):
         from coordinator import session_storage
         first = self.file()
-        second = self.file(sid=OTHER)
-        self.remember(self.worker())
-        self.remember(self.worker(sid=OTHER), sid=OTHER)
         other_home = self.root / 'other-profile'
-        other = self.file(sid=THIRD, home=other_home)
-        self.remember(self.worker(sid=THIRD), sid=THIRD, home=other_home)
+        second = self.file(sid=OTHER, home=other_home)
+        self.remember(self.worker())
+        self.remember(self.worker(sid=OTHER), sid=OTHER, home=other_home)
         self.close_round()
-        now = time.time()
-        with patch.object(session_storage.time, 'time', return_value=now):
-            with patch.object(session_storage, 'session_files', side_effect=PermissionError('fixture')) as scan:
-                await self.sweep()
-                self.assertEqual(scan.call_count, 2)
-                retries = [row[0] for row in self.store.db.execute('SELECT retry_at FROM native_sessions')]
-                self.assertEqual(len(set(retries)), 1)
-                first_delay = retries[0] - now
-                self.assertGreaterEqual(first_delay, 300)
-                await self.sweep()
-                self.assertEqual(scan.call_count, 2)
-        self.assertEqual(self.store.db.execute("SELECT count(*) FROM problems WHERE area='cleanup'").fetchone()[0], 2)
-        with patch.object(session_storage.time, 'time', return_value=now + first_delay + 1):
-            with patch.object(session_storage, 'session_files', side_effect=ValueError('fixture ambiguity')) as scan:
-                await self.sweep()
-                self.assertEqual(scan.call_count, 2)
-            second_retry = self.store.db.execute('SELECT MIN(retry_at) FROM native_sessions').fetchone()[0]
-            self.assertGreater(second_retry - (now + first_delay + 1), first_delay)
-        self.assertEqual(self.store.db.execute("SELECT count(*) FROM problems WHERE area='cleanup'").fetchone()[0], 2)
-        self.store.close()
-        self.store = Store(self.root / 'state')
-        with patch.object(session_storage.time, 'time', return_value=second_retry + 1):
+        scan = session_storage.file_catalog
+
+        def list_sessions(provider, root, archived):
+            if root == str(self.home / 'projects'):
+                raise PermissionError('fixture')
+            return scan(provider, root, archived)
+
+        with patch.object(session_storage, 'file_catalog', side_effect=list_sessions):
             await self.sweep()
-        for path in (first, second, other):
-            self.assertFalse(path.exists())
+        self.assertTrue(first.exists())
+        self.assertFalse(second.exists())
+        await self.sweep()
+        self.assertTrue(first.exists(), 'a failed session waits for its backoff')
+        with patch('coordinator.sweeps.time.time', return_value=time.time() + 61):
+            await self.sweep()
+        self.assertFalse(first.exists())
 
     async def test_unknown_interactive_memory_and_config_untouched(self):
         path = self.file()
@@ -231,7 +283,7 @@ class SessionStorageTests(unittest.IsolatedAsyncioTestCase):
         await self.sweep()
         self.assertTrue(path.exists())
         self.assertEqual(self.store.db.execute('SELECT count(*) FROM session_deletions').fetchone()[0], 0)
-        self.assertIsNone(self.store.get('session_cleanup_cursor'))
+        self.assertFalse(self.trash.exists())
 
     async def test_parent_current_and_previous_retained_after_confirmation(self):
         old, previous, current = (self.file(sid=sid) for sid in (SID, OTHER, THIRD))
@@ -266,21 +318,21 @@ class SessionStorageTests(unittest.IsolatedAsyncioTestCase):
         await self.sweep()
         self.assertTrue(target.exists())
         with self.assertRaises((ValueError, OSError)):
-            session_storage.remove_file(self.home / 'projects', {'path': '../outside', 'device': 0, 'inode': 0})
+            session_storage.trash_file(self.home / 'projects', {'path': '../outside'}, self.trash)
 
     async def test_crash_after_record_before_delete_resumes_and_does_not_delete_replacement(self):
         from coordinator import session_storage
         path = self.file()
         self.remember(self.worker())
         self.close_round()
-        with patch.object(session_storage, 'remove_file', side_effect=RuntimeError('simulated crash')):
-            await self.sweep()
+        with patch.object(session_storage, 'trash_file', side_effect=SimulatedCrash('simulated crash')):
+            with self.assertRaisesRegex(SimulatedCrash, 'simulated crash'):
+                await self.sweep()
         planned = self.store.db.execute('SELECT * FROM session_deletions').fetchone()
         self.assertIsNotNone(planned)
         self.assertTrue(path.exists())
         self.store.close()
         self.store = Store(self.root / 'state')
-        self.store.db.execute('UPDATE session_deletions SET retry_at=0')
         await self.sweep()
         self.assertFalse(path.exists())
         path.write_text('new occupant')
@@ -292,12 +344,12 @@ class SessionStorageTests(unittest.IsolatedAsyncioTestCase):
         path = self.file()
         self.remember(self.worker())
         self.close_round()
-        with patch.object(session_storage, 'remove_file', side_effect=RuntimeError('simulated crash')):
-            await self.sweep()
+        with patch.object(session_storage, 'trash_file', side_effect=SimulatedCrash('simulated crash')):
+            with self.assertRaisesRegex(SimulatedCrash, 'simulated crash'):
+                await self.sweep()
         saved = path.with_suffix('.saved')
         path.rename(saved)
         path.write_text('replacement')
-        self.store.db.execute('UPDATE session_deletions SET retry_at=0')
         await self.sweep()
         self.assertEqual(path.read_text(), 'replacement')
         self.assertTrue(saved.exists())
@@ -307,8 +359,9 @@ class SessionStorageTests(unittest.IsolatedAsyncioTestCase):
         path = self.file()
         self.remember(self.worker())
         self.close_round()
-        with patch.object(session_storage, 'remove_file', side_effect=RuntimeError('simulated crash')):
-            await self.sweep()
+        with patch.object(session_storage, 'trash_file', side_effect=SimulatedCrash('simulated crash')):
+            with self.assertRaisesRegex(SimulatedCrash, 'simulated crash'):
+                await self.sweep()
         outside = self.root / 'outside'
         outside.mkdir()
         target = outside / path.name
@@ -316,7 +369,6 @@ class SessionStorageTests(unittest.IsolatedAsyncioTestCase):
         saved = path.parent.with_name('saved-project')
         path.parent.rename(saved)
         path.parent.symlink_to(outside, target_is_directory=True)
-        self.store.db.execute('UPDATE session_deletions SET retry_at=0')
         await self.sweep()
         self.assertEqual(target.read_text(), 'unknown session')
         self.assertTrue((saved / path.name).exists())
@@ -329,46 +381,8 @@ class SessionStorageTests(unittest.IsolatedAsyncioTestCase):
         with session_storage.session_lease(self.store, {'provider': 'claude', 'session': SID}):
             await self.sweep()
         self.assertTrue(path.exists())
-        self.store.db.execute('UPDATE session_deletions SET retry_at=0')
         await self.sweep()
         self.assertFalse(path.exists())
-
-    async def test_open_code_uses_native_delete_with_isolated_data_home(self):
-        from coordinator import session_storage
-        home = self.store.directory / 'opencode/workers/1'
-        data = home / 'data/opencode'
-        data.mkdir(parents=True)
-        (data / 'opencode.db').write_bytes(b'fake database')
-        worker = self.worker('opencode', sid=OPENCODE)
-        self.remember(worker, 'opencode', OPENCODE, home=home)
-        self.close_round()
-        delete = AsyncMock(return_value=None)
-        with patch.object(session_storage, 'delete_opencode', delete):
-            await self.sweep()
-        delete.assert_awaited_once()
-        plan = delete.call_args.args[1]
-        self.assertEqual(plan['session'], OPENCODE)
-        self.assertEqual(plan['home'], str(home))
-        self.assertTrue((data / 'opencode.db').exists())
-
-    async def test_backlog_uses_launch_evidence_and_is_bounded(self):
-        from coordinator import session_storage
-        path = self.file()
-        worker = self.worker()
-        directory = self.store.directory / 'hosts' / ('worker-' + str(worker))
-        directory.mkdir(parents=True)
-        (directory / 'spec.json').write_text(json.dumps({'fresh': True, 'provider': 'claude',
-            'cwd': str(self.root), 'env': {'CLAUDE_CONFIG_DIR': str(self.home)}}))
-        (directory / 'exit.json').write_text('{"returncode":0}')
-        imported = self.file(sid=OTHER)
-        self.worker(sid=OTHER)
-        self.close_round()
-        with patch.object(session_storage, 'BATCH', 1):
-            await self.sweep()
-            self.assertLessEqual(self.store.get('session_cleanup_cursor', 0), 1)
-            await self.sweep()
-        self.assertFalse(path.exists())
-        self.assertTrue(imported.exists())
 
     async def test_backlog_recovers_closed_worker_after_host_log_removal(self):
         path = self.file()
@@ -453,65 +467,6 @@ class SessionStorageTests(unittest.IsolatedAsyncioTestCase):
         row = dict(self.store.db.execute('SELECT * FROM workers WHERE id=?', (worker,)).fetchone())
         self.assertFalse(can_resume_finished(self.store, row))
 
-    async def test_native_opencode_command_deletes_only_requested_session_and_verifies_it(self):
-        from coordinator import session_storage
-        home = self.store.directory / 'opencode/workers/1'
-        data = home / 'data/opencode'
-        data.mkdir(parents=True)
-        with sqlite3.connect(str(data / 'opencode.db')) as db:
-            db.execute('CREATE TABLE session(id TEXT PRIMARY KEY,parent_id TEXT)')
-            db.executemany('INSERT INTO session VALUES (?,NULL)', ((OPENCODE,), ('ses_' + 'b' * 26,)))
-        binary = self.root / 'fake-opencode-delete'
-        binary.write_text('#!' + sys.executable + '\n' + '''import json, os, sqlite3, sys
-from pathlib import Path
-assert sys.argv[1:3] == ['session', 'delete']
-assert os.environ['OPENCODE_AUTH_CONTENT'] == '{}'
-database = Path(os.environ['XDG_DATA_HOME']) / 'opencode/opencode.db'
-with sqlite3.connect(str(database)) as db:
-    db.execute('DELETE FROM session WHERE id=?', (sys.argv[3],))
-''')
-        binary.chmod(0o700)
-        self.store.put('opencode_binary', str(binary))
-        worker = self.worker('opencode', sid=OPENCODE)
-        self.remember(worker, 'opencode', OPENCODE, home=home)
-        self.close_round()
-        await self.sweep()
-        with sqlite3.connect(str(data / 'opencode.db')) as db:
-            self.assertEqual(db.execute('SELECT id FROM session').fetchall(), [('ses_' + 'b' * 26,)])
-        row = self.store.db.execute('SELECT state FROM session_deletions').fetchone()
-        self.assertEqual(row['state'], 'deleted')
-        self.assertEqual(list((self.store.directory / 'session-cleanup').iterdir()), [])
-
-    async def test_opencode_parent_database_waits_for_current_and_unconfirmed_hosts(self):
-        from coordinator import session_storage
-        home = self.root / 'parent-profile'
-        for index, sid in enumerate((OPENCODE, 'ses_' + 'b' * 26, 'ses_' + 'c' * 26)):
-            self.remember(provider='opencode', sid=sid, home=home, parent='coordinator', host='parent-' + str(index))
-        pending = SimpleNamespace(store=self.store, key='other', host_id='unconfirmed', provider='opencode')
-        session_storage.launch_parent(pending, {'provider': 'opencode', 'env': {'XDG_DATA_HOME': str(home / 'data')},
-                                               'cwd': str(self.root), 'fresh': True})
-        running = {'parent-2', 'unconfirmed'}
-        delete = AsyncMock(return_value=None)
-        with patch('coordinator.worker_storage.processes_gone', side_effect=lambda path: path.name not in running):
-            with patch.object(session_storage, 'delete_opencode', delete):
-                await self.sweep()
-                delete.assert_not_awaited()
-                running.remove('parent-2')
-                self.store.db.execute('UPDATE native_sessions SET retry_at=0')
-                await self.sweep()
-                delete.assert_not_awaited()
-                running.clear()
-                self.store.put('other_host', {'id': 'unconfirmed', 'provider': 'opencode'})
-                self.store.db.execute('UPDATE native_sessions SET retry_at=0')
-                await self.sweep()
-                delete.assert_not_awaited()
-                self.store.put('other_host', None)
-                self.store.db.execute('UPDATE native_sessions SET retry_at=0')
-                self.store.db.execute('UPDATE session_deletions SET retry_at=0')
-                await self.sweep()
-        delete.assert_awaited_once()
-        self.assertEqual(delete.call_args.args[1]['session'], OPENCODE)
-
     async def test_parent_home_is_recorded_before_the_host_can_start(self):
         from coordinator import parent_state
         home = self.root / 'parent-profile'
@@ -529,58 +484,101 @@ with sqlite3.connect(str(database)) as db:
         with patch.object(parent_state.HostClient, 'launch', side_effect=start_host):
             self.assertTrue(await parent_state.launch(session, spec, 'fixture'))
 
-    async def test_failed_opencode_delete_removes_isolated_scratch_and_retries(self):
-        home = self.root / 'opencode-profile'
-        data = home / 'data/opencode'
-        data.mkdir(parents=True)
-        with sqlite3.connect(str(data / 'opencode.db')) as db:
-            db.execute('CREATE TABLE session(id TEXT PRIMARY KEY,parent_id TEXT)')
-            db.execute('INSERT INTO session VALUES (?,NULL)', (OPENCODE,))
-        binary = self.root / 'fake-opencode-delete'
-        binary.write_text('#!' + sys.executable + '\nraise SystemExit(1)\n')
-        binary.chmod(0o700)
-        self.store.put('opencode_binary', str(binary))
-        self.remember(self.worker('opencode', sid=OPENCODE), 'opencode', OPENCODE, home=home)
+    async def test_recent_file_and_recent_finish_stay(self):
+        recent_file = self.file()
+        old_file = self.file(sid=OTHER)
+        self.remember(self.worker())
+        self.remember(self.worker(sid=OTHER), sid=OTHER)
+        self.close_round()
+        recent = time.time()
+        os.utime(recent_file, (recent, recent))
+        self.store.db.execute('UPDATE workers SET updated=? WHERE session=?', (recent, OTHER))
+        await self.sweep()
+        self.assertTrue(recent_file.exists())
+        self.assertTrue(old_file.exists())
+        self.assertFalse(self.trash.exists())
+
+    async def test_open_jobs_handoff_protects_a_session(self):
+        path = self.file()
+        self.remember(self.worker())
+        self.close_round()
+        active = self.store.task_create('1:2', 'Continue work')
+        handoff = self.store.directory / 'results' / ('task-' + str(active['id'])) / 'HANDOFF.md'
+        handoff.parent.mkdir(parents=True, exist_ok=True)
+        handoff.write_text('Resume session ' + SID)
+        await self.sweep()
+        self.assertTrue(path.exists())
+
+    async def test_unreadable_handoff_keeps_the_pass_safe(self):
+        path = self.file()
+        self.remember(self.worker())
+        self.close_round()
+        active = self.store.task_create('1:2', 'Continue work')
+        handoff = self.store.directory / 'results' / ('task-' + str(active['id'])) / 'HANDOFF.md'
+        handoff.parent.mkdir(parents=True, exist_ok=True)
+        handoff.symlink_to(path)
+        await self.sweep()
+        self.assertTrue(path.exists())
+        handoff.unlink()
+        handoff.write_bytes(b'x' * (1024 * 1024 + 1))
+        await self.sweep()
+        self.assertTrue(path.exists())
+        handoff.write_text('No native session referenced')
+        await self.sweep()
+        self.assertFalse(path.exists())
+
+    async def test_failed_process_listing_keeps_the_pass_safe(self):
+        path = self.file()
+        self.remember(self.worker())
+        self.close_round()
+        for error in (OSError('Listing failed'), subprocess.TimeoutExpired('lsof', 30)):
+            with patch('coordinator.stray_report.process_paths', side_effect=error):
+                await self.sweep()
+            self.assertTrue(path.exists())
+        await self.sweep()
+        self.assertFalse(path.exists())
+
+    async def test_archived_codex_rollout_is_moved(self):
+        path = self.file('codex')
+        archived = self.home / 'archived_sessions' / path.name
+        archived.parent.mkdir()
+        path.rename(archived)
+        self.remember(self.worker('codex'), 'codex')
         self.close_round()
         await self.sweep()
-        self.assertEqual(list((self.store.directory / 'session-cleanup').iterdir()), [])
-        plan = self.store.db.execute('SELECT state,attempts,retry_at FROM session_deletions').fetchone()
-        self.assertEqual((plan['state'], plan['attempts']), ('pending', 1))
-        self.assertGreater(plan['retry_at'], time.time())
-        with sqlite3.connect(str(data / 'opencode.db')) as db:
-            self.assertEqual(db.execute('SELECT id FROM session').fetchall(), [(OPENCODE,)])
+        self.assertFalse(archived.exists())
+        self.assertEqual(next(self.trash.iterdir()).read_bytes(), b'fixture session data')
 
-    async def test_opencode_already_deleted_session_cleans_crash_leftover_scratch(self):
-        home = self.root / 'opencode-profile'
-        native = self.remember(self.worker('opencode', sid=OPENCODE), 'opencode', OPENCODE, home=home)
-        self.store.db.execute('''INSERT INTO session_deletions(native,provider,session,home,root,path)
-            SELECT id,provider,session,home,root,session FROM native_sessions WHERE id=?''', (native,))
-        plan = self.store.db.execute('SELECT id FROM session_deletions').fetchone()[0]
-        scratch = self.store.directory / 'session-cleanup' / str(plan)
-        scratch.mkdir(parents=True)
-        (scratch / 'leftover').write_text('fixture')
+    async def test_antigravity_trashes_conversation_and_keeps_the_profile(self):
+        root = self.home / 'provider-data'
+        path = root / 'conversations' / (SID + '.db')
+        path.parent.mkdir(parents=True)
+        path.write_bytes(b'fixture conversation')
+        old = time.time() - 15 * 86400
+        os.utime(path, (old, old))
+        setting = self.home / 'settings.json'
+        setting.write_text('{}')
+        self.remember(self.worker('antigravity'), 'antigravity', home=root)
         self.close_round()
         await self.sweep()
-        self.assertFalse(scratch.exists())
-        self.assertEqual(self.store.db.execute('SELECT state FROM session_deletions').fetchone()[0], 'deleted')
+        self.assertFalse(path.exists())
+        self.assertTrue(setting.exists())
+        self.assertEqual(next(self.trash.iterdir()).read_bytes(), b'fixture conversation')
 
-    async def test_opencode_unknown_child_prevents_cascading_delete(self):
+    async def test_daily_loop_saves_clock_and_sleeps_until_due(self):
         from coordinator import session_storage
-        home = self.store.directory / 'opencode/workers/1'
-        data = home / 'data/opencode'
-        data.mkdir(parents=True)
-        child = 'ses_' + 'b' * 26
-        with sqlite3.connect(str(data / 'opencode.db')) as db:
-            db.execute('CREATE TABLE session(id TEXT PRIMARY KEY,parent_id TEXT)')
-            db.executemany('INSERT INTO session VALUES (?,?)', ((OPENCODE, None), (child, OPENCODE)))
-        self.store.put('opencode_binary', str(self.root / 'must-not-run'))
-        self.remember(self.worker('opencode', sid=OPENCODE), 'opencode', OPENCODE, home=home)
-        self.close_round()
-        with patch.object(asyncio, 'create_subprocess_exec', new=AsyncMock()) as process:
-            await self.sweep()
-        process.assert_not_awaited()
-        with sqlite3.connect(str(data / 'opencode.db')) as db:
-            self.assertEqual(db.execute('SELECT count(*) FROM session').fetchone()[0], 2)
+        storage = session_storage.storage_for(self.store)
+        with patch.object(storage, 'sweep', new=AsyncMock()) as sweep, \
+                patch.object(asyncio, 'wait_for', side_effect=self.stop_timer) as timer:
+            with self.assertRaises(asyncio.CancelledError):
+                await storage.run()
+        sweep.assert_awaited_once()
+        self.assertGreater(self.store.get('session_cleanup_last_sweep'), time.time() - 60)
+        self.assertGreater(timer.call_args.args[1], session_storage.DAY - 60)
+
+    async def stop_timer(self, waiter, delay):
+        waiter.close()
+        raise asyncio.CancelledError()
 
 
 class SessionLaunchTests(StorageSupport, unittest.IsolatedAsyncioTestCase):
@@ -603,7 +601,7 @@ class SessionLaunchTests(StorageSupport, unittest.IsolatedAsyncioTestCase):
                 else:
                     self.store.db.execute('DROP TRIGGER reject_commit')
                     context = patch('coordinator.session_storage.home_for', return_value='relative-home')
-                with context:
+                with context, self.temp_scope():
                     done = await self.pool().run(worker, self.store.topic('1:2'))
                 self.assertEqual(done['status'], 'done')
                 self.assertTrue(json.loads(done['result'])['success'])
@@ -621,7 +619,8 @@ class SessionLaunchTests(StorageSupport, unittest.IsolatedAsyncioTestCase):
     async def test_worker_observation_records_the_actual_launch_home(self):
         worker, _ = self.spawn()
         pool = self.pool()
-        done = await pool.run(worker, self.store.topic('1:2'))
+        with self.temp_scope():
+            done = await pool.run(worker, self.store.topic('1:2'))
         self.assertEqual(done['status'], 'done')
         row = self.store.db.execute('SELECT * FROM native_sessions WHERE worker=?', (worker['id'],)).fetchone()
         self.assertIsNotNone(row)

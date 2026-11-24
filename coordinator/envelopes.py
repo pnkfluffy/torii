@@ -22,11 +22,16 @@ from .control_api import Refused, Result
 
 logger = logging.getLogger(__name__)
 
-LIFETIME = 600
+LIFETIME = 86400
+CODE_LIFETIME = 600
+TOLD_WINDOW = 600
 HANDOFF = 'CLAUDE_SIGNIN_CODE'
 FILL_START = 'fill'
 LIVE = ('open', 'armed')
 NAME = re.compile(r'[A-Z][A-Z0-9_]{1,63}\Z')
+GENERIC_SECRET_WORDS = frozenset(
+    'ACCESS API AUTH BEARER CLIENT CREDENTIAL CREDENTIALS DEV DEVELOPMENT ID KEY PASSWORD PRIVATE PROD '
+    'PRODUCTION PUBLIC REFRESH SANDBOX SECRET STAGING TEST TOKEN'.split())
 RESERVED = frozenset((
     'PATH', 'HOME', 'USER', 'SHELL', 'TMPDIR', 'PWD', 'LANG', 'BOT_TOKEN', 'NODE_OPTIONS',
     'NODE_EXTRA_CA_CERTS', 'BASH_ENV', 'ENV', 'PROMPT_COMMAND', 'IFS', 'SHELLOPTS', 'HTTP_PROXY',
@@ -78,37 +83,28 @@ def _task_line(store, envelope):
     return 'Job: ' + ('%d %s' % (task['number'], task['title'][:200]) if task else 'any job')
 
 
-def _prompt_exit(store):
-    return store.get('envelope_prompt_exit')
+def _details(store, envelope, history=None):
+    return ('Envelope: ' + envelope['name'] + '\nWhy: ' + envelope['reason'][:200] +
+            ('\n' + history if history else '') +
+            '\nUsed by: ' + envelope['consumer'][:200] + '\n' + _task_line(store, envelope))
 
 
-def _paused(store):
-    record = _prompt_exit(store)
-    return record is not None and not record['acknowledged']
-
-
-def _ack_prompt_exit(store):
-    record = _prompt_exit(store)
-    if record and not record['acknowledged']:
-        store.put('envelope_prompt_exit', dict(record, acknowledged=True))
-
-
-def ask_text(store, envelope, now=None):
+def ask_text(store, envelope):
     if envelope['name'] == HANDOFF:
         return envelope['reason'] + '\n3. Paste it here as one message within 10 minutes. I delete it at once.'
-    instruction = ('\nTap Fill privately within 10 minutes and send the value there in one message. '
-                   'Never paste it in this channel.')
-    if envelope['state'] == 'armed' or store.db.execute(
-            "SELECT 1 FROM envelopes WHERE state='armed' AND name!=? AND chat=? AND expires>?",
-            (HANDOFF, store.get('owner'), time.time() if now is None else now)).fetchone():
-        if envelope['state'] == 'armed':
-            instruction = '\nWaiting for the value in the private chat. Tap Fill privately to open it.'
-        else:
-            instruction = '\nWaiting behind another credential ask in the private chat.'
-        instruction += '\nNever paste it in this channel.'
-    return ('Envelope: ' + envelope['name'] + '\nWhy: ' + envelope['reason'][:200] +
-            '\nUsed by: ' + envelope['consumer'][:200] + '\n' + _task_line(store, envelope) +
-            instruction)
+    if envelope['state'] == 'armed':
+        instruction = ('\nThe prompt is in your private chat with me. Reply to it there with the value within '
+                       '24 hours, or tap Fill privately to open the chat.')
+    else:
+        instruction = '\nTap Fill privately within 24 hours and send the value there in one message.'
+    filled, expired = store.db.execute("""SELECT MAX(filled_at IS NOT NULL OR state='filled'), MAX(state='expired')
+        FROM envelopes WHERE name=? AND id<?""", (envelope['name'], envelope['id'])).fetchone()
+    history = 'Torii has never stored a value under this name.'
+    if filled:
+        history = 'Torii stored a value under this name earlier.'
+    elif expired:
+        history = 'An earlier request for this name expired without a value.'
+    return _details(store, envelope, history) + instruction + '\nNever paste it in this channel.'
 
 
 def _private_chat_button(store):
@@ -138,17 +134,6 @@ def update_card(store, envelope, text, reply_markup=None):
     return outbox
 
 
-def _refresh_waiting_cards(store, now):
-    rows = store.db.execute("""SELECT * FROM envelopes
-        WHERE state='open' AND name!=? AND expires>? AND card_outbox IS NOT NULL""", (HANDOFF, now)).fetchall()
-    for row in rows:
-        envelope = dict(row)
-        text = ask_text(store, envelope, now)
-        current = store.db.execute('SELECT text,reply_markup FROM outbox WHERE id=?', (envelope['card_outbox'],)).fetchone()
-        if current['text'] != text:
-            update_card(store, envelope, text, json.loads(current['reply_markup']))
-
-
 CLOSED_TEXT = {'cancelled': 'Cancelled.', 'expired': 'Expired. Tap Ask again to request it again.',
                'revoked': 'Revoked. The stored value was removed.'}
 SIGNIN_CLOSED = {'cancelled': 'Claude sign-in cancelled. No account was added.',
@@ -156,7 +141,7 @@ SIGNIN_CLOSED = {'cancelled': 'Claude sign-in cancelled. No account was added.',
                  'revoked': 'Claude sign-in stopped. No account was added.'}
 
 
-def close(store, envelope, state, event, source=None, reason=None, now=None):
+def close(store, envelope, state, event, source=None, reason=None):
     """The single path that closes an envelope: live to cancelled or expired, live or filled to revoked."""
     armed = envelope['state'] == 'armed'
     updated = time.time()
@@ -171,18 +156,8 @@ def close(store, envelope, state, event, source=None, reason=None, now=None):
     retry = {'inline_keyboard': [[{'text': 'Ask again', 'callback_data': 'envelope:%d:again' % envelope['id']}]]}
     update_card(store, envelope, 'Envelope: ' + envelope['name'] + '\n' + CLOSED_TEXT[state],
                 retry if state == 'expired' else None)
-    if armed:
-        if state == 'cancelled' and source in ('intake', 'button'):
-            _prompt_next(store, now)
-        else:
-            now = time.time() if now is None else now
-            store.put('envelope_prompt_exit', {'envelope': envelope['id'], 'acknowledged': False})
-            _refresh_waiting_cards(store, now)
-            text = "%s %s, so I won't take a value for it." % (envelope['name'], state)
-            if store.db.execute("SELECT 1 FROM envelopes WHERE state='open' AND expires>? AND name!=?",
-                                (now, HANDOFF)).fetchone():
-                text += ' To give the next one, tap Fill privately on its card.'
-            _reply(store, envelope['id'], store.get('owner'), text)
+    if armed and not (state == 'cancelled' and source in ('intake', 'button')):
+        _reply(store, envelope['id'], envelope['chat'], "%s %s, so I won't take a value for it." % (envelope['name'], state))
 
 
 def sweep(store, now=None):
@@ -190,40 +165,30 @@ def sweep(store, now=None):
     rows = [dict(row) for row in store.db.execute(
         "SELECT * FROM envelopes WHERE state IN ('open','armed') AND expires<=? ORDER BY id", (now,))]
     for envelope in rows:
-        close(store, envelope, 'expired', 'expire', source='sweep', now=now)
+        close(store, envelope, 'expired', 'expire', source='sweep')
+    _prompt_open(store, now)
     return len(rows)
 
 
 def cancel(store, envelope_id, source):
     envelope = _row(store, envelope_id)
     if not envelope or envelope['state'] not in LIVE:
-        record = _prompt_exit(store)
-        if source == 'button' and record and record['envelope'] == envelope_id:
-            _ack_prompt_exit(store)
         return 'envelope_closed'
     close(store, envelope, 'cancelled', 'cancel', source=source)
     return 'envelope_cancel'
 
 
 def fill_private(store, envelope_id):
-    now = time.time()
-    sweep(store, now)
+    sweep(store)
     envelope = _row(store, envelope_id)
-    if not envelope or envelope['name'] == HANDOFF or envelope['state'] not in (*LIVE, 'expired'):
-        return 'envelope_closed'
-    if envelope['state'] == 'expired':
+    if envelope and envelope['name'] != HANDOFF and envelope['state'] == 'expired':
         return 'envelope_expired'
-    owner = store.get('owner')
-    if envelope['state'] == 'armed' and envelope['chat'] == owner:
-        return 'envelope_fill'
-    outcome = _arm(store, envelope, owner, None, now, 'button')
-    if outcome is None:
-        _reply(store, envelope['id'], owner, _value_prompt(envelope))
-        return 'envelope_fill'
-    return {'busy': 'envelope_busy', 'expired': 'envelope_expired'}.get(outcome, 'envelope_closed')
+    if not envelope or envelope['name'] == HANDOFF or envelope['state'] != 'armed':
+        return 'envelope_closed'
+    return 'envelope_fill'
 
 
-def ask(store, topic, name, reason, consumer, task=None, source='cli'):
+def ask(store, topic, name, reason, consumer, task=None, source='cli', edit=None):
     if rename_reserved(store, name):
         raise Refused('A saved key rename is unfinished for this name. Run the same rename again first.')
     if name in os.environ:
@@ -241,23 +206,22 @@ def ask(store, topic, name, reason, consumer, task=None, source='cli'):
         cursor = store.db.execute('''INSERT INTO envelopes
             (name,reason,consumer,task,topic,state,created,expires,updated)
             VALUES (?,?,?,?,?,'open',?,?,?)''',
-                                  (name, reason, consumer, task, topic, now, now + LIFETIME, now))
+                                  (name, reason, consumer, task, topic, now,
+                                   now + (CODE_LIFETIME if name == HANDOFF else LIFETIME), now))
     except sqlite3.IntegrityError as error:
         raise Refused('An envelope for ' + name + ' is already open.') from error
     envelope = _row(store, cursor.lastrowid)
     store.envelope_event(envelope['id'], name, 'ask', source=source)
     if name != HANDOFF:
-        if not store.db.execute("SELECT 1 FROM envelopes WHERE state='open' AND name!=? AND id<?",
-                                (HANDOFF, envelope['id'])).fetchone():
-            _prompt_next(store, now)
+        _prompt_open(store, now)
         envelope = _row(store, envelope['id'])
     keyboard = [_cancel_button(envelope)]
     if name != HANDOFF:
         fill = (_private_chat_button(store) if envelope['state'] == 'armed' else
                 [{'text': 'Fill privately', 'callback_data': 'envelope:%d:fill' % envelope['id']}])
         keyboard.insert(0, fill)
-    outbox = store.enqueue_report(topic, ask_text(store, envelope, now), kind='envelope',
-                                  reply_markup={'inline_keyboard': keyboard})
+    outbox = store.enqueue_report(topic, ask_text(store, envelope), kind='envelope',
+                                  reply_markup={'inline_keyboard': keyboard}, edit=edit)
     store.db.execute('UPDATE envelopes SET card_outbox=? WHERE id=?', (outbox, envelope['id']))
     return envelope['id']
 
@@ -276,8 +240,6 @@ def again(store, envelope_id):
         return 'envelope_closed'
     store.db.execute('SAVEPOINT envelope_again')
     try:
-        _ack_prompt_exit(store)
-        _prompt_next(store)
         ask(store, envelope['topic'], envelope['name'], envelope['reason'], envelope['consumer'],
             envelope['task'], source='button')
     except Refused as refusal:
@@ -289,8 +251,57 @@ def again(store, envelope_id):
     return 'envelope_again'
 
 
-def op_secret_ask(store, ctx, topic, name, reason, consumer, task=None):
+def _stored_refusal(store, ctx, name):
+    """Refuse an ask for a stored name. Tell a worker's coordinator how to declare it. Never touch the value."""
+    text = (name + ' is stored. Do not ask the owner again. The coordinator declares it on the job with '
+            'tasks.update task=N secrets=' + name + ' (or ENV_NAME=' + name + '), and the next worker run gets it '
+            'in the environment. Use secret.rotate only if the stored value is wrong. secret.list shows stored names.')
+    worker = ctx.source_worker and store.db.execute(
+        'SELECT w.id,t.id AS task,t.number,t.topic,t.secrets FROM workers w JOIN tasks t ON t.id=w.task WHERE w.id=?',
+        (ctx.source_worker,)).fetchone()
+    if not worker:
+        return Result(False, text, {'name': name, 'stored': True}, state='refused')
+    head = 'Job %d: worker ' % worker['number']
+    tail = ' asked the owner for %s, which is already stored. ' % name
+    if store.db.execute("SELECT 1 FROM messages WHERE kind='event' AND topic=? AND created>? AND text GLOB ?",
+                        (worker['topic'], time.time() - TOLD_WINDOW, head + '*' + tail + '*')).fetchone():
+        return Result(False, text + " This job's coordinator was already told.", {'name': name, 'stored': True},
+                      state='refused')
+    entries = parse_declarations(json.loads(worker['secrets'])) if worker['secrets'] else []
+    if any(declared(entry)[1] == name for entry in entries):
+        step = ('%s is already declared on the job. Worker %d started before that; steer or respawn it to load it.'
+                % (name, worker['id']))
+    else:
+        try:
+            step = 'Declare it: tasks.update task=%d secrets=%s' % (
+                worker['task'], ','.join(parse_declarations(entries + [name])))
+        except ValueError:
+            step = ('The job maps environment name %s to another vault name (secrets=%s). Choose which value the '
+                    'worker needs, then declare it with a free environment name, for example %s_STORED=%s.'
+                    % (name, ','.join(entries), name, name))
+    store.message_event(worker['topic'], head + str(worker['id']) + tail + 'I refused the ask and posted no card. '
+                        + step, source_worker=worker['id'])
+    return Result(False, text + " I told this job's coordinator.", {'name': name, 'stored': True}, state='refused')
+
+
+def _secret_words(name):
+    return set(re.findall(r'CLIENT_ID(?=_|$)|[^_]+', name)) - GENERIC_SECRET_WORDS
+
+
+def op_secret_ask(store, ctx, topic, name, reason, consumer, task=None, confirm=False):
     with store.transaction():
+        if store.db.execute("SELECT 1 FROM envelopes WHERE name=? AND state='filled'", (name,)).fetchone():
+            return _stored_refusal(store, ctx, name)
+        words = _secret_words(name)
+        if words and not confirm:
+            matches = [row['name'] for row in store.db.execute(
+                "SELECT DISTINCT name FROM envelopes WHERE state='filled' AND name!=? ORDER BY name", (HANDOFF,))
+                if words & _secret_words(row['name'])]
+            if matches:
+                return Result(False, 'Stored names that may match: ' + ', '.join(matches) +
+                              '. Map one on the job with tasks.update secrets=ENV_NAME=VAULT_NAME. '
+                              'If you need a different value, ask again with confirm=true.',
+                              {'name': name, 'matches': matches}, state='refused')
         envelope = ask(store, topic, name, reason, consumer, task, ctx.source)
     return Result(True, 'Envelope for %s posted. The owner fills it privately.' % name,
                   {'envelope': envelope, 'name': name})
@@ -298,18 +309,17 @@ def op_secret_ask(store, ctx, topic, name, reason, consumer, task=None):
 
 
 REPLIES = {
-    'bare_start': 'Open an Envelope card in your Torii channel and tap Fill privately.',
-    'nothing_to_cancel': 'No envelope is waiting for a value.',
-    'no_armed': 'No envelope is waiting for a value, so I deleted your message. Tap Fill privately on an Envelope card first.',
+    'bare_start': 'No credential asks are waiting. When a job asks for one, I post its prompt here.',
+    'nothing_to_cancel': 'No credential ask is waiting for a value.',
+    'no_armed': 'No credential ask is waiting for a value, so I deleted your message.',
+    'closed_prompt': 'That ask is no longer waiting for a value, so I deleted your message and stored nothing.',
     'not_text': 'Send the value as one text message. I deleted your message.',
     'too_long': 'The value must have at most 4096 characters. I deleted your message. Send the value again.',
     'multi_line': 'Send the value as one line. I deleted your message. Send the value again.',
     'not_printable': 'The value has characters that cannot be printed. I deleted your message. Send the value again.',
     'command': 'The value cannot start with /. I deleted your message. Send the value again.',
-    'numeric': 'A value made only of digits is refused. I deleted your message. Send the value again.',
     'vault_failed': 'The vault write failed. Your message was deleted. Send the value again.',
     'internal': 'Something failed while I handled your message. I deleted it. Send the value again.',
-    'handoff_closed': 'That sign-in is no longer waiting for a code, so I deleted your message.',
 }
 SIGNIN_REPLIES = {
     'bare_start': ('To finish the Claude sign-in, paste the code in your Torii group, in the topic with the '
@@ -322,22 +332,12 @@ SIGNIN_REPLIES = {
 MAX_ATTEMPTS = 5
 
 
-def _replies(store, now):
+def _replies(store):
     """The replies for a private chat with nothing armed. They point to the card while a Claude sign-in runs."""
     from .signin import pending
     record = pending(store)
     signin = record and record.get('provider') != 'codex' and record.get('state') != 'cancelled'
-    if signin:
-        return SIGNIN_REPLIES
-    replies = dict(REPLIES)
-    if store.db.execute("SELECT 1 FROM envelopes WHERE state='open' AND name!=? AND expires>?",
-                        (HANDOFF, now)).fetchone():
-        replies['nothing_to_cancel'] = ('No credential ask is taking a value. Another ask is waiting. '
-                                       'Tap Fill privately on its card.')
-    elif _prompt_exit(store):
-        replies['bare_start'] = 'No credential asks are waiting.'
-        replies['nothing_to_cancel'] = 'No credential asks are waiting.'
-    return replies
+    return SIGNIN_REPLIES if signin else REPLIES
 
 
 def _clock(value):
@@ -356,8 +356,6 @@ def value_problem(message):
         return 'command'
     if len(text) > 4096:
         return 'too_long'
-    if text.isdigit():
-        return 'numeric'
     return None
 
 
@@ -383,8 +381,71 @@ def _command(message):
     return parts[0].split('@', 1)[0] if parts else ''
 
 
+def _waiting(store, chat, now):
+    """The asks that take a value in this private chat, oldest first."""
+    return [dict(row) for row in store.db.execute("""SELECT * FROM envelopes
+        WHERE state='armed' AND chat=? AND expires>? AND name!=? ORDER BY id""", (chat, now, HANDOFF))]
+
+
+PROMPT_NAME = re.compile(r'(?:Envelope: |Send the value for )([A-Z][A-Z0-9_]{1,63})(?:\n| now in one message)')
+
+
+def _replied(store, message, now):
+    """The ask that a reply to a bot message names, or None for a plain message.
+
+    A reply to any message that is not the owner's own is never plain. A recorded prompt names its ask. A copy
+    that was never recorded (a retried send, or a prompt from before the upgrade) names it by its first line.
+    """
+    reply = message.get('reply_to_message')
+    if not isinstance(reply, dict):
+        return None
+    sender = reply.get('from')
+    if isinstance(sender, dict) and sender.get('id') == message['from']['id']:
+        return None
+    chat = message['chat']['id']
+    row = store.db.execute('SELECT * FROM envelopes WHERE chat=? AND prompt_message=? ORDER BY id DESC LIMIT 1',
+                           (chat, reply.get('message_id'))).fetchone() if type(reply.get('message_id')) is int else None
+    if row is None:
+        text = reply.get('text')
+        match = PROMPT_NAME.match(text) if isinstance(text, str) else None
+        row = match and store.db.execute("""SELECT * FROM envelopes WHERE chat=? AND name=? AND name!=?
+            AND state='armed' AND expires>? ORDER BY id DESC LIMIT 1""", (chat, match.group(1), HANDOFF, now)).fetchone()
+        if not row:
+            return {'live': False, 'problem': 'unknown_reply'}
+    return dict(row, live=row['state'] == 'armed' and row['expires'] > now and row['name'] != HANDOFF,
+                problem='closed_prompt')
+
+
+def _target(store, message, now):
+    """The ask a value message fills: the prompt it replies to, else the oldest prompt sent before it.
+
+    A plain message never fills a newer ask when an older prompted ask was still open when it was sent.
+    """
+    replied = _replied(store, message, now)
+    if replied is not None:
+        if replied['live']:
+            return replied, None
+        return (replied if 'id' in replied else None), replied['problem']
+    chat = message['chat']['id']
+    waiting = _waiting(store, chat, now)
+    if not waiting:
+        return None, 'no_armed'
+    date = message.get('date')
+    if type(date) is not int:
+        return waiting[0], 'before_prompt'
+    target = next((row for row in waiting if type(row['prompt_date']) is int
+                   and 0 < row['prompt_date'] < date), None)
+    if target is None:
+        return waiting[0], 'before_prompt'
+    older = store.db.execute("""SELECT * FROM envelopes WHERE chat=? AND name!=? AND id<? AND prompt_date<?
+        AND CASE WHEN state='armed' THEN expires WHEN state IN ('expired','cancelled','revoked') THEN MIN(updated,expires)
+            WHEN state IN ('filled','superseded') THEN filled_at END>=? ORDER BY id LIMIT 1""",
+                             (chat, HANDOFF, target['id'], date, date)).fetchone()
+    return (dict(older), 'sent_while_open') if older else (target, None)
+
+
 def prepare_private(store, message):
-    """Check a private message, consume a stale sign-in arm, and write the vault."""
+    """Check a private message, pick the ask it fills, and write the vault."""
     now = time.time()
     authorized = False
     try:
@@ -394,37 +455,21 @@ def prepare_private(store, message):
         authorized = True
         if _command(message) in ('/start', '/cancel'):
             return {'now': now, 'command': _command(message)}
-        armed = store.db.execute("SELECT id,name FROM envelopes WHERE state='armed' AND chat=? AND expires>?",
-                                 (message['chat']['id'], now)).fetchone()
-        if not armed or (armed['name'] != HANDOFF and _paused(store)):
-            return {'now': now, 'problem': 'no_armed'}
-        intake = {'now': now, 'envelope': armed['id'], 'name': armed['name']}
-        if armed['name'] != HANDOFF:
-            prompt = store.get('envelope_prompt_date')
-            date = message.get('date')
-            if (not isinstance(prompt, dict) or prompt.get('envelope') != armed['id']
-                    or type(prompt.get('date')) is not int or prompt['date'] <= 0
-                    or type(date) is not int or date <= prompt['date']):
-                return dict(intake, problem='before_prompt')
-        problem = value_problem(message)
+        target, problem = _target(store, message, now)
+        intake = {'now': now} if target is None else {'now': now, 'envelope': target['id'], 'name': target['name']}
+        problem = problem or value_problem(message)
         if problem:
             return dict(intake, problem=problem)
-        if armed['name'] == HANDOFF:
-            signin = getattr(store, 'signin', None)
-            if signin is None or not signin.hand(armed['id'], message['text']):
-                return dict(intake, problem='handoff_closed')
-            return dict(intake, handed=len(message['text']))
         if store.vault is None:
             return dict(intake, problem='vault_failed:unavailable')
         from .vault import VaultError
         try:
-            return dict(intake, stored=store.vault.put(armed['name'], message['text']))
+            return dict(intake, stored=store.vault.put(target['name'], message['text']))
         except VaultError as error:
-            problems.record(store, 'secrets', 'vault-write-failed', 'name=%s code=%s' % (armed['name'], error.code))
+            problems.record(store, 'secrets', 'vault-write-failed', 'name=%s code=%s' % (target['name'], error.code))
             return dict(intake, problem='vault_failed:' + error.code)
     except Exception as error:
-        logger.error('envelope intake check failed type=%s', type(error).__name__)
-        problems.record(store, 'secrets', 'intake-failed', type(error).__name__, level=logging.ERROR)
+        problems.record(store, 'secrets', 'intake-failed', type(error).__name__, level=logging.ERROR, every=3600)
         return {'now': now, 'problem': 'internal'} if authorized else {'ignored': 'internal'}
 
 
@@ -437,103 +482,88 @@ def _reply(store, envelope, chat, text, thread=None):
     _effect(store, envelope, 'reply', chat, text=text, thread=thread)
 
 
-def _value_prompt(envelope):
-    return ('Send the Claude sign-in code now in one message. I will delete it '
-            'after I pass it to Claude. Send /cancel to stop.' if envelope['name'] == HANDOFF else
-            'Send the value for ' + envelope['name'] +
-            ' now in one message. I will delete it after I store it. Send /cancel to stop.')
+def _value_prompt(store, envelope):
+    return (_details(store, envelope) + '\nReply to this message with the value in one message within 24 hours. '
+            'I delete it after I store it. Reply /cancel to stop.')
 
 
-def _prompt_next(store, now=None):
-    if _paused(store):
-        return None
+def _prompt(store, envelope, chat):
+    """Send this ask's own prompt to the private chat. Its delivery date gates plain value messages."""
+    _reply(store, envelope['id'], chat, _value_prompt(store, envelope))
+    effect = store.db.execute('SELECT last_insert_rowid()').fetchone()[0]
+    store.db.execute('UPDATE envelopes SET prompt_effect=?,prompt_message=NULL,prompt_date=NULL WHERE id=?',
+                     (effect, envelope['id']))
+
+
+def _prompt_pending(store, envelope):
+    return envelope['prompt_effect'] is not None and store.db.execute(
+        "SELECT 1 FROM envelope_effects WHERE id=? AND state='pending'", (envelope['prompt_effect'],)).fetchone()
+
+
+def _prompt_open(store, now):
+    """Give every live ask its own prompt in the owner's private chat."""
     chat = store.get('owner')
     if type(chat) is not int:
-        return None
-    if store.db.execute("SELECT 1 FROM envelopes WHERE state='armed' AND chat=?", (chat,)).fetchone():
-        return None
-    now = time.time() if now is None else now
-    row = store.db.execute("""SELECT * FROM envelopes WHERE state='open' AND expires>? AND name!=?
-        ORDER BY id LIMIT 1""", (now, HANDOFF)).fetchone()
-    if row is None:
-        return None
-    envelope = dict(row)
-    if _arm(store, envelope, chat, None, now, 'direct_prompt') is None:
-        _reply(store, envelope['id'], chat, _value_prompt(envelope))
-        return envelope
-    return None
+        return
+    for row in store.db.execute("""SELECT * FROM envelopes WHERE name!=? AND expires>?
+            AND (state='open' OR (state='armed' AND chat=? AND prompt_effect IS NULL)) ORDER BY id""",
+                                (HANDOFF, now, chat)).fetchall():
+        envelope = dict(row)
+        if envelope['state'] == 'open':
+            _arm(store, envelope, chat, now)
+        else:
+            _prompt(store, envelope, chat)
 
 
-def _arm(store, envelope, chat, thread, now, source):
-    if envelope['expires'] <= now or envelope['state'] == 'expired':
-        return 'expired'
-    if envelope['state'] != 'open':
-        return 'closed'
-    if store.db.execute("SELECT 1 FROM envelopes WHERE state='armed' AND expires>? AND chat=? AND id!=?",
-                        (now, chat, envelope['id'])).fetchone():
-        return 'busy'
-    store.db.execute("UPDATE envelopes SET state='armed',chat=?,armed_at=?,arm_thread=?,updated=? WHERE id=?",
-                     (chat, now, thread, now, envelope['id']))
-    store.envelope_event(envelope['id'], envelope['name'], 'arm', source=source)
-    envelope['state'] = 'armed'
-    text = ask_text(store, envelope, now)
-    keyboard = [_cancel_button(envelope)]
-    if envelope['name'] != HANDOFF:
-        store.db.execute("DELETE FROM settings WHERE key='envelope_prompt_exit'")
-        envelope['expires'] = now + LIFETIME
-        store.db.execute('UPDATE envelopes SET expires=? WHERE id=?', (envelope['expires'], envelope['id']))
-        text = ask_text(store, envelope, now)
-        keyboard.insert(0, _private_chat_button(store))
-    else:
-        text += '\nWaiting for the value in the private chat.'
+def _arm(store, envelope, chat, now):
+    expires = now + LIFETIME
+    store.db.execute("UPDATE envelopes SET state='armed',chat=?,armed_at=?,expires=?,updated=? WHERE id=?",
+                     (chat, now, expires, now, envelope['id']))
+    store.envelope_event(envelope['id'], envelope['name'], 'arm', source='direct_prompt')
+    envelope.update(state='armed', chat=chat, expires=expires)
+    _prompt(store, envelope, chat)
     if envelope['card_outbox']:
-        update_card(store, envelope, text, {'inline_keyboard': keyboard})
-    _refresh_waiting_cards(store, now)
-    return None
+        update_card(store, envelope, ask_text(store, envelope),
+                    {'inline_keyboard': [_private_chat_button(store), _cancel_button(envelope)]})
 
 
 def _start(store, message, chat, now):
-    parts = message['text'].split()
-    thread = None
+    """Send again each prompt that never arrived. Otherwise list the asks that wait."""
     if message['text'] == '/start ' + FILL_START:
         _effect(store, None, 'delete', chat, message['message_id'])
-        row = store.db.execute("""SELECT * FROM envelopes
-            WHERE state='armed' AND chat=? AND expires>? AND name!=?""", (chat, now, HANDOFF)).fetchone()
-        if row:
-            prompt = store.get('envelope_prompt_date')
-            if ((not isinstance(prompt, dict) or prompt.get('envelope') != row['id'])
-                    and not store.db.execute("""SELECT 1 FROM envelope_effects
-                        WHERE envelope=? AND kind='reply' AND chat=? AND text=? AND state='pending'""",
-                                             (row['id'], chat, _value_prompt(row))).fetchone()):
-                _reply(store, row['id'], chat, _value_prompt(row), thread)
-            return 'envelope_start'
-        parts = ['/start']
-    if len(parts) == 1:
-        _ack_prompt_exit(store)
-        row = store.db.execute("""SELECT * FROM envelopes
-            WHERE state='armed' AND chat=? AND expires>? AND name!=?""", (chat, now, HANDOFF)).fetchone()
-        if row:
-            _reply(store, row['id'], chat, _value_prompt(row), thread)
-            return 'envelope_arm'
-        if _prompt_next(store, now):
-            return 'envelope_arm'
-    _reply(store, None, chat, _replies(store, now)['bare_start'], thread)
-    return 'envelope_start'
+    elif len(message['text'].split()) > 1:
+        _reply(store, None, chat, _replies(store)['bare_start'])
+        return 'envelope_start'
+    waiting = _waiting(store, chat, now)
+    if not waiting:
+        _reply(store, None, chat, _replies(store)['bare_start'])
+        return 'envelope_start'
+    missing = [row for row in waiting if row['prompt_message'] is None and not _prompt_pending(store, row)]
+    for row in missing:
+        _prompt(store, row, chat)
+    if not missing:
+        _reply(store, None, chat, 'Waiting for ' + ', '.join(row['name'] for row in waiting) +
+               '. Reply to its prompt above with the value.')
+    return 'envelope_arm'
 
 
-def _cancel_private(store, chat, now, thread=None):
-    states = "('armed')"
-    row = store.db.execute('SELECT * FROM envelopes WHERE state IN ' + states + ' AND chat=?', (chat,)).fetchone()
+def _cancel_private(store, message, chat, now):
+    replied = _replied(store, message, now)
+    if replied is not None:
+        row = replied if replied['live'] else None
+    else:
+        waiting = _waiting(store, chat, now)
+        row = waiting[0] if waiting else None
     if not row:
-        _ack_prompt_exit(store)
-        _reply(store, None, chat, _replies(store, now)['nothing_to_cancel'], thread)
+        _reply(store, None, chat, _replies(store)['nothing_to_cancel'])
         return 'envelope_reject'
-    _reply(store, row['id'], chat, 'Cancelled ' + row['name'] + '.', thread)
-    close(store, dict(row), 'cancelled', 'cancel', source='intake', now=now)
+    _reply(store, row['id'], chat, 'Cancelled ' + row['name'] + '.')
+    row.pop('live', None)
+    close(store, row, 'cancelled', 'cancel', source='intake')
     return 'envelope_cancel'
 
 
-def _fill(store, intake, chat, thread=None):
+def _fill(store, intake, chat):
     envelope = _row(store, intake['envelope'])
     if envelope['state'] != 'armed':
         raise RuntimeError('envelope left the armed state')
@@ -550,18 +580,10 @@ def _fill(store, intake, chat, thread=None):
     store.message_secret_filled(envelope['topic'], envelope['id'],
                                 'Secret %s, declared on %s, is filled.' % (envelope['name'], job))
     facts = 'Length %d, fingerprint %s' % (length, fingerprint)
-    _reply(store, envelope['id'], chat, '%s stored. %s.' % (envelope['name'], facts), thread)
+    waiting = _waiting(store, chat, now)
+    rest = ' Still waiting: %s.' % ', '.join(row['name'] for row in waiting) if waiting else ''
+    _reply(store, envelope['id'], chat, '%s stored. %s.%s' % (envelope['name'], facts, rest))
     update_card(store, envelope, 'Envelope: %s\nFilled. %s, at %s.' % (envelope['name'], facts, _clock(now)))
-    _prompt_next(store, now)
-    return 'envelope_fill'
-
-
-def _hand(store, intake, chat, thread=None):
-    envelope = _row(store, intake['envelope'])
-    if envelope['state'] != 'armed':
-        raise RuntimeError('envelope left the armed state')
-    handed(store, envelope, intake['handed'], intake['now'], 'intake:handoff')
-    _reply(store, envelope['id'], chat, 'Code received. I passed it to Claude and deleted your message.', thread)
     return 'envelope_fill'
 
 
@@ -576,27 +598,32 @@ def handed(store, envelope, length, now, source):
 
 
 def _apply(store, message, intake, chat):
-    thread = None
     sweep(store, intake['now'])
     command = intake.get('command')
     if command == '/start':
         return _start(store, message, chat, intake['now'])
     if command == '/cancel':
-        return _cancel_private(store, chat, intake['now'], thread)
+        return _cancel_private(store, message, chat, intake['now'])
     _effect(store, intake.get('envelope'), 'delete', chat, message['message_id'])
     if 'stored' in intake:
-        return _fill(store, intake, chat, thread)
-    if 'handed' in intake:
-        return _hand(store, intake, chat, thread)
+        return _fill(store, intake, chat)
     problem = intake['problem']
     store.envelope_event(intake.get('envelope'), intake.get('name'), 'reject', reason=problem, source='intake')
     reason = problem.split(':', 1)[0]
     if reason == 'before_prompt':
         reply = ('That message was sent before I asked for %s, so I deleted it and stored nothing. '
-                 'Send the value for %s now in one message.') % (intake['name'], intake['name'])
+                 'Reply to its prompt with the value.') % intake['name']
+    elif reason == 'sent_while_open':
+        reply = ('That message was sent while I was still waiting for %s. I deleted it and stored nothing. '
+                 'Reply to the prompt you mean.') % intake['name']
+    elif reason == 'unknown_reply':
+        waiting = _waiting(store, chat, intake['now'])
+        reply = ('That reply does not match a waiting credential ask, so I deleted it and stored nothing. ' +
+                 ('Waiting for %s. Reply to its prompt.' % ', '.join(row['name'] for row in waiting)
+                  if waiting else 'No credential ask is waiting.'))
     else:
-        reply = (_replies(store, intake['now']) if reason == 'no_armed' else REPLIES)[reason]
-    _reply(store, intake.get('envelope'), chat, reply, thread)
+        reply = (_replies(store) if reason == 'no_armed' else REPLIES)[reason]
+    _reply(store, intake.get('envelope'), chat, reply)
     return 'envelope_reject'
 
 
@@ -614,7 +641,7 @@ def accept_private(store, message, intake):
     except Exception as error:
         store.db.execute('ROLLBACK TO envelope_intake')
         store.db.execute('RELEASE envelope_intake')
-        logger.error('envelope intake failed type=%s', type(error).__name__)
+        problems.record(store, 'secrets', 'intake-apply-failed', type(error).__name__, level=logging.ERROR, every=3600)
         if not intake.get('command'):
             _effect(store, intake.get('envelope'), 'delete', chat, message['message_id'], thread=message.get('message_thread_id'))
         store.envelope_event(intake.get('envelope'), intake.get('name'), 'reject', reason='internal', source='intake')
@@ -668,6 +695,12 @@ async def run_effects(store, telegram):
     rows = [dict(row) for row in store.db.execute(
         "SELECT * FROM envelope_effects WHERE state='pending' AND next_attempt<=? ORDER BY id", (time.time(),))]
     for effect in rows:
+        envelope = _row(store, effect['envelope']) if effect['kind'] == 'reply' and effect['envelope'] else None
+        prompt = envelope is not None and envelope['prompt_effect'] == effect['id']
+        if prompt and envelope['state'] != 'armed':
+            with store.db:
+                store.db.execute("UPDATE envelope_effects SET state='done' WHERE id=?", (effect['id'],))
+            continue
         try:
             if effect['kind'] == 'delete':
                 await telegram.call('deleteMessage', chat_id=effect['chat'], message_id=effect['message'])
@@ -682,16 +715,11 @@ async def run_effects(store, telegram):
             continue
         with store.db:
             store.db.execute("UPDATE envelope_effects SET state='done',attempts=attempts+1 WHERE id=?", (effect['id'],))
-            if effect['kind'] == 'reply':
-                envelope = _row(store, effect['envelope']) if effect['envelope'] else None
-                date = sent.get('date') if isinstance(sent, dict) else None
-                if (envelope and envelope['name'] != HANDOFF and envelope['state'] == 'armed'
-                        and envelope['chat'] == effect['chat'] and effect['text'] == _value_prompt(envelope)
-                        and type(date) is int and date > 0):
-                    prompt = store.get('envelope_prompt_date')
-                    if (not isinstance(prompt, dict) or prompt.get('envelope') != envelope['id']
-                            or type(prompt.get('date')) is not int or prompt['date'] <= 0):
-                        store.put('envelope_prompt_date', {'envelope': envelope['id'], 'date': date})
+            sent = sent if prompt and isinstance(sent, dict) else {}
+            if type(sent.get('message_id')) is int and type(sent.get('date')) is int and sent['date'] > 0:
+                store.db.execute("""UPDATE envelopes SET prompt_message=?,prompt_date=?
+                    WHERE id=? AND state='armed' AND prompt_effect=?""",
+                                 (sent['message_id'], sent['date'], envelope['id'], effect['id']))
     return bool(rows)
 
 
@@ -710,7 +738,8 @@ def intercept_topic_reply(store, topic, message):
         if card_message(store, row['card_outbox']) == reply:
             _effect(store, row['id'], 'delete', message['chat']['id'], message['message_id'])
             store.enqueue_report(topic, 'I removed your reply. ' + (
-                'Paste the code as one text message.' if row['name'] == HANDOFF else 'Use Fill privately to send values.'))
+                'Paste the code as one text message.' if row['name'] == HANDOFF else
+                'Reply to its prompt in your private chat with me, or tap Fill privately.'))
             store.envelope_event(row['id'], row['name'], 'reject', reason='topic_reply', source='intake')
             return True
     return False

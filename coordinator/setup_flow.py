@@ -51,10 +51,11 @@ def agents_ready(store):
 def setup_state(store):
     import shutil
     from .accounts import AccountBroker, signed_in
+    from .policy import COORDINATOR_MODEL
     from .codex_accounts import CodexBroker
     claude = any(signed_in(store, alias, profile) for alias, profile in (store.get('accounts', {}) or {}).items())
     broker = CodexBroker(store)
-    main = 'claude' if AccountBroker(store).select() else (
+    main = 'claude' if AccountBroker(store).select(model=COORDINATOR_MODEL) else (
         'chatgpt' if chatgpt_ready(store) and broker.parent_account() else None)
     return {'claude': claude, 'codex': any(broker.signed_in(alias) for alias in broker.accounts()),
             'codex_installed': bool(shutil.which('codex')),
@@ -244,6 +245,7 @@ def migrate(store, old, new):
         target = str(new) + ':' + str(topic['thread'])
         for table in tables:
             store.db.execute('UPDATE ' + table + ' SET topic=? WHERE topic=?', (target, topic['id']))
+        store.db.execute('UPDATE outbox SET sender=? WHERE sender=?', (target, topic['id']))
         store.db.execute('UPDATE topics SET id=?,chat=? WHERE id=?', (target, new, topic['id']))
     def replace(value):
         if isinstance(value, str) and value.startswith(prefix):
@@ -335,7 +337,10 @@ def topic_unreachable(store, row, reason):
     if not row['thread'] or not topic:
         return False
     store.db.execute('UPDATE topics SET enabled=0 WHERE id=?', (topic['id'],))
+    images = [row['image'] for row in store.db.execute('SELECT image FROM outbox WHERE topic=? AND delivered=0 AND image IS NOT NULL', (topic['id'],))]
     store.db.execute('UPDATE outbox SET retired=1 WHERE topic=? AND delivered=0', (topic['id'],))
+    for image in images:
+        store.db.cleanup_outbox_file(image, store.directory / 'outbox-attachments')
     problems.record(store, 'telegram', 'topic-gone', 'Group topic deleted.', topic=topic['id'])
     if topic['id'] == store.get('control_topic'):
         store.put('control_topic', None)

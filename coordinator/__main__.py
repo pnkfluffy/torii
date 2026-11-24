@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import re
 import signal
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -18,7 +19,7 @@ STARTUP_CODE = code_stamp(Path(__file__).resolve().parents[1])
 
 from .policy import COORDINATOR_MODEL
 from .store import Store
-from .telegram import Telegram
+from .telegram import Telegram, follow_server
 
 
 RESTART_DEADLINE_SECONDS = 30
@@ -84,37 +85,29 @@ def parser():
     result.add_argument("--token-file", type=Path, default=Path.home() / ".config/telegram-agent-coordinator/bot-token")
     commands = result.add_subparsers(dest="command", required=True)
     pair = commands.add_parser("pair", help="Print an expiring owner-pairing link or group command")
-    pair.add_argument('--group', action='store_true', help=argparse.SUPPRESS)
     pair.add_argument('--replace', action='store_true')
     pair.add_argument('--yes', action='store_true', help='Confirm replacement without a terminal prompt')
     commands.add_parser("status", help="Show linked channels and jobs without credentials")
-    commands.add_parser("bot", help="Check the Telegram bot identity")
-    accounts = commands.add_parser('accounts', help='Register existing local Claude account profiles')
-    accounts.add_argument('action', choices=['discover', 'check'])
+    records = commands.add_parser('records', help='Manage job records')
+    records.add_argument('action', choices=['backfill', 'check', 'restore'])
+    records.add_argument('--source', type=Path, help='Records clone to restore into a fresh state directory')
     serve = commands.add_parser("serve", help="Run foreground polling, feed and delivery")
     serve.add_argument("--pair-only", action="store_true", help="Poll and deliver without starting agents")
     serve.add_argument("--coordinator-model",
                        help=f"Operator override for the coordinator model (new install default: {COORDINATOR_MODEL})")
     control = commands.add_parser("ctl", help="Run one owner control operation")
     operations = control.add_subparsers(dest="operation", required=True)
-    listing = operations.add_parser("list", help="List every operation")
-    listing.add_argument("--kind", choices=["read", "write"])
+    operations.add_parser("list", help="List every operation")
     description = operations.add_parser("describe", help="Show one operation")
     description.add_argument("op")
     invocation = operations.add_parser("call", help="Run one operation")
     invocation.add_argument("op")
     invocation.add_argument('--from', dest='from_name', type=bot_name, metavar='NAME',
-                            help='Identify the local program that made this call')
+                            help="For events.post, coordinators use --from '<your chat name> coordinator' "
+                                 "to show a 🤖 note. Torii workers, lanes, and scripts omit --from; "
+                                 "outside programs use their own name. Put --from right after call.")
     invocation.add_argument("--topic", help="Channel ID; defaults to none")
     invocation.add_argument("pairs", nargs="*", metavar="key=value")
-    bind = commands.add_parser("bind", help="Link an observed channel to a local project")
-    bind.add_argument("--topic", required=True, help="Use --topic=-100123:4 for a group channel")
-    bind.add_argument("--cwd", type=Path, required=True)
-    bind.add_argument("--name", required=True)
-    bind.add_argument("--provider", choices=["claude", "codex"])
-    bind.add_argument("--session")
-    bind.add_argument("--source-pid", type=int)
-    bind.add_argument("--enable", action="store_true")
     mcp = commands.add_parser('mcp', help='Serve coordinator tools over stdio')
     mcp.add_argument('--topic', help='The parent channel for owner-message authorization')
     host = commands.add_parser('host', help=argparse.SUPPRESS)
@@ -123,6 +116,17 @@ def parser():
 
 
 async def serve(args, store):
+    from . import log
+    from .loop_watchdog import LoopWatchdog
+    watchdog = LoopWatchdog(asyncio.get_running_loop(), store, log.configure(args.state_dir))
+    watchdog.start()
+    try:
+        return await serve_watched(args, store)
+    finally:
+        watchdog.stop()
+
+
+async def serve_watched(args, store):
     from . import log
     from .providers import ProviderRunner
     from .service import Service
@@ -149,6 +153,7 @@ async def serve(args, store):
     discover_accounts(store)
     discover_codex_accounts(store)
     api = Telegram(args.token_file, store=store)
+    follow_server(store)
     webhook = await api.call("getWebhookInfo")
     if webhook.get("url"):
         raise RuntimeError("This bot has a webhook. Remove it deliberately before using long polling.")
@@ -199,8 +204,7 @@ def ctl(args, store):
     """Operations run against the store the service shares. Two need the running process."""
     from . import control_api
     if args.operation == "list":
-        print(json.dumps([describe(op) for op in control_api.OPS
-                          if not args.kind or op.kind == args.kind], indent=2))
+        print(json.dumps([describe(op) for op in control_api.OPS], indent=2))
         return 0
     found = control_api.find(args.op)
     if args.operation == "describe":
@@ -248,11 +252,26 @@ def ctl(args, store):
         print(json.dumps({"ok": False, "op": args.op, "state": "refused",
                           "text": found.id + " needs the running service. Start it, then try again."}))
         return 3
+    source_worker = None
+    if found and found.kind == control_api.WRITE:
+        worker_id = os.environ.get('TORII_WORKER_ID', '')
+        task_id = os.environ.get('TORII_TASK_ID', '')
+        if all(value.isascii() and value.isdigit() and len(value) <= 18 for value in (worker_id, task_id)):
+            row = store.db.execute('SELECT id FROM workers WHERE id=? AND task=?', (int(worker_id), int(task_id))).fetchone()
+            source_worker = row['id'] if row else None
+        if found.id == 'trash.move' and (worker_id or task_id) and source_worker is None:
+            record('refused')
+            print(json.dumps({"ok": False, "op": found.id, "state": "refused",
+                              "text": "Trash needs a valid worker job."}))
+            return 3
     with store.db:
-        result = control_api.call(store, args.op, params, topic=args.topic, source="cli", from_name=from_name)
+        result = control_api.call(store, args.op, params, topic=args.topic, source="cli", from_name=from_name,
+                                  source_worker=source_worker)
     record(result.state, result)
+    compact = result.ok and result.op == 'tasks.get' and params.get('full') is not True
     print(json.dumps({"ok": result.ok, "op": result.op, "kind": found.kind if found else None,
-                      "state": result.state, "text": result.text, "data": result.data}, indent=2, default=str))
+                      "state": result.state, "text": result.text, "data": result.data}, default=str,
+                     indent=None if compact else 2, separators=(',', ':') if compact else None))
     return {"done": 0, "queued": 0, "refused": 3, "failed": 1}[result.state]
 
 
@@ -289,6 +308,20 @@ def pair(args, store):
     return 0
 
 
+def open_store(args):
+    if (args.command in ('ctl', 'mcp') and STARTUP_CODE is not None
+            and (args.state_dir / 'state.sqlite').is_file()):
+        store = Store(args.state_dir, token_file=args.token_file, existing=True)
+        try:
+            running = store.get('service_run') or {}
+            if isinstance(running, dict) and running.get('state') == 'running' and running.get('code') == STARTUP_CODE:
+                return store
+        except (sqlite3.Error, TypeError, ValueError):
+            pass
+        store.close()
+    return Store(args.state_dir, token_file=args.token_file)
+
+
 def main():
     args = parser().parse_args()
     os.umask(0o077)
@@ -296,7 +329,7 @@ def main():
         from .host import main as host_main
         host_main(args.directory)
         return 0
-    store = Store(args.state_dir, token_file=args.token_file)
+    store = open_store(args)
     lock = None
     try:
         if args.command == "pair":
@@ -311,25 +344,18 @@ def main():
                               **({'setup_problem': store.get('setup_problem')} if store.get('setup_problem') else {}),
                               **({'group_owner_changed': store.get('group_owner_changed')} if store.get('group_owner_changed') else {}),
                               "topics": store.topics(), "tasks": tasks, "workers": workers}, indent=2))
-        elif args.command == "bot":
-            me = asyncio.run(Telegram(args.token_file).call("getMe"))
-            print(json.dumps({k: me.get(k) for k in ("id", "username", "can_read_all_group_messages")}, indent=2))
-        elif args.command == 'accounts':
-            if args.action == 'check':
-                from .account_status import check_accounts
-                checks = asyncio.run(check_accounts(store))
-                print(json.dumps({'accounts': checks}, indent=2))
-                return int(any(value != 'ready' for value in checks.values()))
-            from .accounts import discover_accounts
-            print(json.dumps({'registered': list(discover_accounts(store))}))
+        elif args.command == 'records':
+            from . import records
+            if args.action == 'restore':
+                if args.source is None:
+                    raise ValueError('records restore requires --source')
+                result = records.restore(store, args.source)
+            else:
+                result = records.backfill(store) if args.action == 'backfill' else records.check(store)
+            print(json.dumps(result, indent=2))
+            return int(result.get('count', 0) != 0 or result.get('bytes', 0) >= 50_000_000)
         elif args.command == "ctl":
             return ctl(args, store)
-        elif args.command == "bind":
-            from .workers import process_alive
-            if args.enable and process_alive(args.source_pid):
-                raise ValueError("Source process is still alive; bind disabled until ownership transfers")
-            store.bind(args.topic, args.cwd, args.name, args.provider, args.session, args.enable, args.source_pid)
-            print("Channel link saved. Accepting work:", args.enable)
         elif args.command == "serve":
             lock = os.open(str(args.state_dir / "service.lock"), os.O_CREAT | os.O_RDWR, 0o600)
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)

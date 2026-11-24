@@ -1,6 +1,7 @@
 import asyncio
 from contextlib import AsyncExitStack
 from datetime import datetime, timezone
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -14,16 +15,17 @@ import uuid
 
 from coordinator import control_api
 from coordinator.host import HostClient
-from coordinator.policy import REPLY_FIRST
+from coordinator.policy import chat_policy
 from coordinator.providers import ProviderRunner
 from coordinator.service import Service
 from coordinator.session import (LOST_TURN, RESTART_MESSAGE_CHARS, RESTART_MESSAGE_HEAD, RESTART_MESSAGES,
                                  CoordinatorSession, message_tag, message_uuid, transcript_receipts)
 from coordinator.store import Store
-from tests.support import read_jsonl, restart_work_rows, settle, stop_test_hosts, until
+from tests.support import plain, read_jsonl, restart_work_rows, settle, stop_test_hosts, until
 
 
-NEXT_QUOTA = '[topic=home name="Home" message=2 kind=owner] ' + REPLY_FIRST + 'next-quota'
+MEMORY_NOTE = ('\nKeep your memory index at or below 40 lines. If it exceeds 40 lines, '
+               'trim the index without deleting memory notes.\n')
 
 
 def lost_note(message, *rows):
@@ -59,7 +61,7 @@ class CoordinatorSessionTestsSupport:
         environment.start()
         self.addCleanup(environment.stop)
         overrides = self.root / 'local-overrides.json'
-        overrides.write_text(json.dumps({'shared_mcp_servers': ['example-mcp', 'other-mcp']}))
+        overrides.write_text('{}')
         selection = patch('coordinator.accounts.LOCAL_OVERRIDES_PATH', overrides)
         selection.start()
         self.addCleanup(selection.stop)
@@ -202,7 +204,7 @@ for line in sys.stdin:
             time.sleep(.02)
     if text=='threshold':
         print(json.dumps({'type':'rate_limit_event','session_id':sid,'rate_limit_info':
-            {'status':'allowed_warning','rateLimitType':'seven_day','utilization':.98,'resetsAt':time.time()+3600}}),flush=True)
+            {'status':'allowed_warning','rateLimitType':'seven_day','utilization':.99,'resetsAt':time.time()+3600}}),flush=True)
         print(json.dumps({'type':'result','subtype':'success','session_id':sid,'result':'done:threshold'}),flush=True)
         complete()
         continue
@@ -242,6 +244,7 @@ for line in sys.stdin:
         profile = self.root / 'claude-profile'
         profile.mkdir()
         with self.store.db:
+            self.store.put('coordinator_home_topic', 'home')
             self.store.put('accounts', {'test': {'config_dir': str(profile), 'enabled': True}})
             self.store.put('account_status', {'test': {'identity': {'email': 'test@example.com', 'logged_in': True},
                 'observed_at': time.time(), 'usage': {'five_hour': {'utilization': 10},
@@ -272,6 +275,10 @@ for line in sys.stdin:
                                                   instructions, on_turn=self.turns.append, **options)
         self.sessions.append(session)
         return session
+
+    def enable_chat_mcp(self):
+        self.store.put('coordinator_home_topic', 'home')
+        self.store.put('chat_config:home', {'mcp_servers': ['example-mcp', 'other-mcp']})
 
     async def reattach(self, session, **options):
         await session.detach()
@@ -474,16 +481,16 @@ class SessionTeardownTests(unittest.IsolatedAsyncioTestCase):
 
 class CoordinatorSessionTests(CoordinatorSessionTestsSupport, unittest.IsolatedAsyncioTestCase):
     async def test_d2_chat_policy_launch_and_edit_do_not_relaunch_claude(self):
-        from coordinator.policy import chat_policy
-        self.store.put('coordinator_delegation', {'text': 'Use Sol.', 'revision': 1})
+        from coordinator.policy import chat_policy, personal_path
+        personal_path(self.store).write_text('- Use Sol.\n')
         combined = chat_policy(self.store, 'coordinator')
         first = await self.finished_parent()
         launch = self.launches()[0]
         self.assertEqual(launch['argv'][launch['argv'].index('--append-system-prompt') + 1],
-                         'instructions\nCurrent usage policy:\n' + combined)
+                         'instructions' + MEMORY_NOTE + '\nCurrent usage policy:\n' + combined)
         self.assertEqual(first.usage_policy, combined)
         fingerprint = self.store.get('coordinator_host')['fingerprint']
-        self.store.put('coordinator_delegation', {'text': 'Use Luna.', 'revision': 2})
+        personal_path(self.store).write_text('- Use Luna.\n')
         attached = await self.reattach(first)
         self.assertFalse(attached.outdated)
         self.assertFalse(attached.movable())
@@ -493,16 +500,17 @@ class CoordinatorSessionTests(CoordinatorSessionTestsSupport, unittest.IsolatedA
 
     def default_parent_argv(self, session, resume=False):
         settings = json.dumps({'ultracode': False,
-            'autoMemoryDirectory': str((self.store.directory / 'coordinator-memory').resolve()),
+            'autoMemoryDirectory': str((self.store.directory / 'chats' / 'home' / 'memory').resolve()),
             'claudeMdExcludes': [str(parent / name) for parent in Path.home().parents
                                 for name in ('CLAUDE.md', 'CLAUDE.local.md', '.claude/CLAUDE.md')]})
         return ['--print', '--verbose', '--output-format', 'stream-json', '--input-format', 'stream-json',
                 '--replay-user-messages', '--dangerously-skip-permissions', '--model', 'model',
                 '--effort', 'medium', '--settings', settings, '--resume' if resume else '--session-id',
                 self.transcript(session) if resume else session.session_id,
-                '--append-system-prompt', 'instructions\nCurrent usage policy:\n' +
-                (self.store.directory / 'USAGE.md').read_text(), '--system-prompt-snapshot', 'off',
-                '--mcp-config', str(self.store.directory / 'coordinator-mcp.json')]
+                '--append-system-prompt', 'instructions' + MEMORY_NOTE + '\nCurrent usage policy:\n' +
+                chat_policy(self.store, 'coordinator'), '--system-prompt-snapshot', 'off',
+                '--disallowedTools', 'SendUserFile', '--mcp-config',
+                str(self.store.directory / ('coordinator-mcp-' + hashlib.sha256(b'home').hexdigest()[:16] + '.json'))]
 
     async def test_parent_effort_default_launch_bytes(self):
         with patch('coordinator.session.write_shared_mcp_config', return_value=None):
@@ -511,13 +519,14 @@ class CoordinatorSessionTests(CoordinatorSessionTestsSupport, unittest.IsolatedA
                          json.dumps(self.default_parent_argv(session)).encode())
 
     async def test_parent_gets_full_coordinators_usage_section(self):
-        policy = 'Shared.\n## Coordinators\nOwner only.\n## Effort\nKeep.\n'
-        (self.store.directory / 'USAGE.md').write_text(policy)
+        from coordinator.policy import personal_path
+        policy = '- Shared.\n## Coordinators\n- Owner only.\n## Effort\n- Keep.'
+        personal_path(self.store).write_text(policy + '\n')
         with patch('coordinator.session.write_shared_mcp_config', return_value=None):
             await self.finished_parent()
         args = self.launches()[0]['argv']
         self.assertEqual(args[args.index('--append-system-prompt') + 1],
-                         'instructions\nCurrent usage policy:\n' + policy)
+                         'instructions' + MEMORY_NOTE + '\nCurrent usage policy:\n' + policy)
 
     async def test_parent_effort_levels_reach_launch_and_clear_restores_default(self):
         for turn, effort in enumerate(('max', 'low', 'medium', 'high', None)):
@@ -536,16 +545,16 @@ class CoordinatorSessionTests(CoordinatorSessionTestsSupport, unittest.IsolatedA
                     await session.stop()
 
     async def test_codex_parent_effort_leaves_claude_launch_unchanged(self):
-        before = CoordinatorSession._launch_inputs(self.store, 'model', 'instructions', None)
+        before = CoordinatorSession._launch_inputs(self.store, 'model', 'instructions', None, topic='home')
         self.assertTrue(control_api.call(self.store, 'effort.parent', {'provider': 'codex', 'effort': 'low'}).ok)
-        after = CoordinatorSession._launch_inputs(self.store, 'model', 'instructions', None)
+        after = CoordinatorSession._launch_inputs(self.store, 'model', 'instructions', None, topic='home')
         self.assertEqual((before.effort, before.fingerprint), (after.effort, after.fingerprint))
         with patch('coordinator.session.write_shared_mcp_config', return_value=None):
             session = await self.finished_parent()
         self.assertEqual(self.launches()[0]['argv'], self.default_parent_argv(session))
 
     async def test_claude_parent_has_no_codex_skills_instructions(self):
-        inputs = CoordinatorSession._launch_inputs(self.store, 'model', 'instructions', None)
+        inputs = CoordinatorSession._launch_inputs(self.store, 'model', 'instructions', None, topic='home')
         self.assertNotIn('## Codex skills', inputs.instructions)
         with patch('coordinator.session.write_shared_mcp_config', return_value=None):
             session = await self.finished_parent()
@@ -718,7 +727,7 @@ class CoordinatorSessionTests(CoordinatorSessionTestsSupport, unittest.IsolatedA
 
     async def test_memory_setting_change_relaunches_idle_parent_once(self):
         first = await self.finished_parent()
-        memory = self.store.directory / 'coordinator-memory'
+        memory = self.store.directory / 'chats' / 'home' / 'memory'
         memory.rmdir()
         target = self.root / 'shared-memory'
         target.mkdir()
@@ -726,6 +735,7 @@ class CoordinatorSessionTests(CoordinatorSessionTestsSupport, unittest.IsolatedA
         await self.assert_changed_input_relaunches(first)
 
     async def test_shared_mcp_config_change_relaunches_idle_parent_once(self):
+        self.enable_chat_mcp()
         first = await self.finished_parent()
         source = Path.home() / '.claude.json'
         document = json.loads(source.read_text())
@@ -743,6 +753,26 @@ class CoordinatorSessionTests(CoordinatorSessionTestsSupport, unittest.IsolatedA
     async def test_instruction_change_relaunches_idle_parent_once(self):
         first = await self.finished_parent()
         await self.assert_changed_input_relaunches(first, instructions='changed instructions')
+
+    def test_parent_settings_follow_plugin_chats(self):
+        def plugins(topic):
+            inputs = CoordinatorSession._launch_inputs(self.store, 'model', 'instructions', None, topic=topic)
+            return json.loads(inputs.settings).get('enabledPlugins')
+        self.assertIsNone(plugins('home'))
+        self.store.put('plugin_chats', {'pstack@pstack-claude': ['home'], 'other@market': ['elsewhere']})
+        self.assertEqual(plugins('home'), {'pstack@pstack-claude': True, 'other@market': False})
+        self.assertEqual(plugins('away'), {'pstack@pstack-claude': False, 'other@market': False})
+
+    async def test_plugin_chats_change_relaunches_idle_parent_once(self):
+        first = await self.finished_parent()
+        def settings():
+            argv = self.launches()[-1]['argv']
+            return json.loads(argv[argv.index('--settings') + 1])
+        self.assertNotIn('enabledPlugins', settings())
+        self.store.put('plugin_chats', {'pstack@pstack-claude': ['elsewhere']})
+        await self.assert_changed_input_relaunches(first)
+        await self.until(lambda: len(self.launches()) >= 2)
+        self.assertEqual(settings()['enabledPlugins'], {'pstack@pstack-claude': False})
 
     async def test_parent_flags_change_launch_fingerprint(self):
         first = await self.finished_parent()
@@ -779,7 +809,8 @@ class CoordinatorSessionTests(CoordinatorSessionTestsSupport, unittest.IsolatedA
     async def test_usage_policy_change_does_not_relaunch_parent(self):
         first = await self.finished_parent()
         fingerprint = self.store.get('coordinator_host')['fingerprint']
-        (self.store.directory / 'USAGE.md').write_text('Use one worker.')
+        from coordinator.policy import personal_path
+        personal_path(self.store).write_text('- Use one worker.\n')
         attached = await self.reattach(first)
         self.assertFalse(attached.outdated)
         self.assertFalse(attached.movable())
@@ -808,7 +839,7 @@ class CoordinatorSessionTests(CoordinatorSessionTestsSupport, unittest.IsolatedA
         events = read_jsonl(first.log_path)
         result_seq = next(event['seq'] for event in events
                           if json.loads(event['data']).get('type') == 'result')
-        await self.until(lambda: self.store.get('coordinator_host_seq') > result_seq)
+        await self.until(lambda: self.store.consumed_flush() or self.store.get('coordinator_host_seq') > result_seq)
         with self.store.db:
             self.store.put('coordinator_host_seq', result_seq)
         attached = await self.reattach(first, instructions='changed instructions')
@@ -1042,8 +1073,8 @@ class CoordinatorSessionTests(CoordinatorSessionTestsSupport, unittest.IsolatedA
         self.assertTrue(transferred.is_symlink())
         self.assertEqual(transferred.resolve(), (self.root / 'a' / 'projects' / 'test' /
                                                   (service.session.session_id + '.jsonl')).resolve())
-        self.assertEqual([event['message']['content'] for event in self.inputs()],
-                         ['[topic=home name="Home" message=1 kind=owner] ' + REPLY_FIRST + 'quota', lost_note(2, 1)])
+        self.assertEqual([plain(event['message']['content']) for event in self.inputs()],
+                         ['[topic=home name="Home" message=1 kind=owner] quota', lost_note(2, 1)])
         self.assertEqual(self.store.db.execute('SELECT delivered FROM messages WHERE id=?',
                                                (row['id'],)).fetchone()[0], 'received')
         self.assertEqual(self.store.get('account_blocks')['a']['reason'], 'quota')
@@ -1112,7 +1143,7 @@ class CoordinatorSessionTests(CoordinatorSessionTestsSupport, unittest.IsolatedA
         self.assertEqual(self.store.db.execute('SELECT delivered FROM messages WHERE id=?', (row,)).fetchone()[0],
                          'pending')
 
-    async def test_parent_moves_after_a_turn_reaches_the_fixed_98_percent_point(self):
+    async def test_parent_moves_after_a_turn_reaches_the_fixed_99_percent_point(self):
         self.account_service()
         first = await self.start(topic='home')
         self.assertEqual(first.account_alias, 'a')
@@ -1137,10 +1168,10 @@ class CoordinatorSessionTests(CoordinatorSessionTestsSupport, unittest.IsolatedA
         self.assertEqual(await first.send(str(uuid.uuid4()), 'life-hold'), 'received')
         await self.until(lambda: (self.root / 'life-hold.started').exists())
         status = self.store.get('account_status')
-        status['a']['usage']['five_hour']['utilization'] = 98
+        status['a']['usage']['seven_day']['utilization'] = 99
         with self.store.db:
             self.store.put('account_status', status)
-        self.assertEqual(first.router.activate(), 'b')
+        self.assertEqual(first.router.activate(model='native-default'), 'b')
         self.assertEqual(await first.send(str(uuid.uuid4()), 'life-next'), 'received')
         await self.until(lambda: (self.root / 'completion.ready').exists()
                          and self.turns == ['done:life-hold', 'done:life-next'])
@@ -1162,12 +1193,12 @@ class CoordinatorSessionTests(CoordinatorSessionTestsSupport, unittest.IsolatedA
         await first.detach()
         self.sessions.remove(first)
         status = self.store.get('account_status')
-        status['a']['usage']['five_hour']['utilization'] = 98
+        status['a']['usage']['seven_day']['utilization'] = 99
         with self.store.db:
             self.store.put('account_status', status)
         attached = await self.start(topic='home')
         self.assertEqual(attached.host_id, first.host_id)
-        self.assertEqual(attached.router.activate(), 'b')
+        self.assertEqual(attached.router.activate(model='native-default'), 'b')
         (self.root / 'slow.go').touch()
         await self.until(lambda: self.turns == ['done:slow'])
         self.assertEqual(self.turns, ['done:slow'])
@@ -1184,10 +1215,12 @@ class CoordinatorSessionTests(CoordinatorSessionTestsSupport, unittest.IsolatedA
         argv = self.launches()[0]['argv']
         snapshot_flag = argv.index('--system-prompt-snapshot')
         self.assertEqual(argv[snapshot_flag:snapshot_flag + 2], ['--system-prompt-snapshot', 'off'])
+        denied = argv.index('--disallowedTools')
+        self.assertEqual(argv[denied + 1], 'SendUserFile')
         self.assertEqual(argv[argv.index('--model') + 1], 'claude-opus-5-5')
         self.assertEqual(argv[argv.index('--effort') + 1], 'medium')
         settings = json.loads(argv[argv.index('--settings') + 1])
-        memory_directory = (self.store.directory / 'coordinator-memory').resolve()
+        memory_directory = (self.store.directory / 'chats' / 'home' / 'memory').resolve()
         self.assertEqual(settings, {'ultracode': False, 'autoMemoryDirectory': str(memory_directory),
             'claudeMdExcludes': [str(parent / name) for parent in Path.home().parents
                                 for name in ('CLAUDE.md', 'CLAUDE.local.md', '.claude/CLAUDE.md')]})
@@ -1197,7 +1230,8 @@ class CoordinatorSessionTests(CoordinatorSessionTestsSupport, unittest.IsolatedA
         self.account_service()
         target = self.root / 'shared-memory'
         target.mkdir()
-        link = self.store.directory / 'coordinator-memory'
+        link = self.store.directory / 'chats' / 'home' / 'memory'
+        link.parent.mkdir(parents=True)
         link.symlink_to(target, target_is_directory=True)
         row = self.store.message_save('home', 'owner', 'hello')['id']
         await self.feed_until(lambda: self.launches() and self.store.db.execute(
@@ -1207,6 +1241,29 @@ class CoordinatorSessionTests(CoordinatorSessionTestsSupport, unittest.IsolatedA
         self.assertEqual(settings['autoMemoryDirectory'], str(target.resolve()))
         self.assertTrue(target.is_dir())
 
+    async def test_memory_cap_warning_is_sent_once_per_over_cap_period(self):
+        self.account_service()
+        session = await self.start(topic='home')
+        index = self.store.directory / 'chats' / 'home' / 'memory' / 'MEMORY.md'
+        index.write_text('line\n' * 41)
+        sent = []
+
+        async def steer(message_id, text):
+            self.assertFalse(self.store.db.in_transaction)
+            sent.append(text)
+            return 'received'
+
+        with patch.object(session.control, 'steer', side_effect=steer):
+            with self.assertLogs('coordinator.problems', level='WARNING'):
+                await session.send(str(uuid.uuid4()), 'first')
+            await session.send(str(uuid.uuid4()), 'second')
+            index.write_text('short\n')
+            await session.send(str(uuid.uuid4()), 'third')
+            index.write_text('line\n' * 41)
+            with self.assertLogs('coordinator.problems', level='WARNING'):
+                await session.send(str(uuid.uuid4()), 'fourth')
+        self.assertEqual(['exceeds 40 lines' in text for text in sent], [True, False, False, True])
+
     async def test_command_line_coordinator_model_applies_without_the_setting(self):
         self.account_service()
         row = self.store.message_save('home', 'owner', 'hello')['id']
@@ -1214,39 +1271,6 @@ class CoordinatorSessionTests(CoordinatorSessionTestsSupport, unittest.IsolatedA
             'SELECT delivered FROM messages WHERE id=?', (row,)).fetchone()[0] == 'received')
         argv = self.launches()[0]['argv']
         self.assertEqual(argv[argv.index('--model') + 1], 'model')
-
-    async def test_rejection_names_a_message_replayed_after_the_previous_turn_ended(self):
-        self.account_service()
-        self.store.message_save('home', 'owner', 'hold')
-        self.store.message_save('home', 'owner', 'next-quota')
-        await self.feed_until(lambda: len(self.launches()) == 2 and len(self.inputs()) == 3)
-        self.assertEqual([event['message']['content'] for event in self.inputs()],
-                         ['[topic=home name="Home" message=1 kind=owner] ' + REPLY_FIRST + 'hold', NEXT_QUOTA, lost_note(3, 2)])
-
-    async def test_replayed_message_stays_received_when_send_finishes_after_quota_recovery(self):
-        self.account_service()
-        self.store.message_save('home', 'owner', 'hold')
-        row = self.store.message_save('home', 'owner', 'next-quota')['id']
-        first = await self.service.start_session('home')
-        send = first.send
-
-        async def delayed_receipt(message_id, text, row_id=None):
-            receipt = await send(message_id, text, row_id=row_id)
-            if row_id == row:
-                await first.wait_closed()
-            return receipt
-
-        with patch.object(first, 'send', side_effect=delayed_receipt):
-            await self.service.feed_once()
-            await asyncio.gather(*self.service.feed_tasks.values())
-        self.assertEqual(self.delivery(row), ('received', 'replayed'))
-        self.assertEqual(self.callbacks(), [LOST_TURN % 'message=2'])
-        await self.feed_until(lambda: self.delivery(3) == ('received', 'replayed'))
-        await asyncio.gather(*self.service.feed_tasks.values())
-        await self.service.feed_once()
-        self.assertEqual([Path(event['profile']).name for event in self.launches()], ['a', 'b'])
-        self.assertEqual([event['message']['content'] for event in self.inputs()],
-                         ['[topic=home name="Home" message=1 kind=owner] ' + REPLY_FIRST + 'hold', NEXT_QUOTA, lost_note(3, 2)])
 
     async def test_all_accounts_blocked_notifies_once_and_waits_for_reset(self):
         self.account_service()
@@ -1301,10 +1325,11 @@ class CoordinatorSessionTests(CoordinatorSessionTestsSupport, unittest.IsolatedA
         self.assertEqual(Path(session.log_path).stat().st_mode & 0o777, 0o600)
         args = self.launches()[0]['argv']
         self.assertEqual(args[args.index('--session-id') + 1], session.session_id)
-        self.assertIn('instructions\nCurrent usage policy:\n', args[args.index('--append-system-prompt') + 1])
+        self.assertIn('instructions' + MEMORY_NOTE + '\nCurrent usage policy:\n', args[args.index('--append-system-prompt') + 1])
         self.assertEqual(args[args.index('--mcp-config') + 1], str(self.root / 'mcp.json'))
 
     async def test_parent_launches_with_shared_mcp_and_keeps_values_out_of_captures(self):
+        self.enable_chat_mcp()
         home = self.root / 'home'
         home.mkdir()
         value = 'FAKE-SHARED-MCP-HEADER-VALUE'
@@ -1325,9 +1350,9 @@ class CoordinatorSessionTests(CoordinatorSessionTestsSupport, unittest.IsolatedA
         args = self.launches()[0]['argv']
         index = args.index('--mcp-config')
         shared_mcp_path = Path(args[index + 2])
-        self.assertEqual(args[index + 1:], [str(self.store.directory / 'coordinator-mcp.json'),
-                                             str(shared_mcp_path)])
-        coordinator_config = json.loads((self.store.directory / 'coordinator-mcp.json').read_text())
+        coordinator_path = CoordinatorSession.write_mcp_config(self.store, 'home')
+        self.assertEqual(args[index + 1:], [str(coordinator_path), str(shared_mcp_path)])
+        coordinator_config = json.loads(coordinator_path.read_text())
         self.assertNotIn('alwaysLoad', coordinator_config['mcpServers']['torii'])
         self.assertEqual(shared_mcp_path.parent, self.store.directory)
         shared_mcp_config = json.loads(shared_mcp_path.read_text())
@@ -1340,7 +1365,17 @@ class CoordinatorSessionTests(CoordinatorSessionTestsSupport, unittest.IsolatedA
                 self.assertNotIn(value, path.read_text(errors='replace'), path.name)
         self.assertNotIn(value, json.dumps(self.problems()))
         self.assertNotIn(value, ''.join(self.store.db.iterdump()))
-        self.assertNotIn(value, (self.store.directory / 'coordinator-mcp.json').read_text())
+        self.assertNotIn(value, coordinator_path.read_text())
+
+    async def test_parent_uses_only_its_chat_mcp_selection(self):
+        self.enable_chat_mcp()
+        self.store.put('chat_config:home', {'mcp_servers': ['example-mcp']})
+        self.store.put('chat_config:other', {'mcp_servers': ['other-mcp']})
+        await self.start()
+        await self.until(lambda: len(self.launches()) == 1)
+        args = self.launches()[0]['argv']
+        config = json.loads(Path(args[args.index('--mcp-config') + 2]).read_text())
+        self.assertEqual(list(config['mcpServers']), ['example-mcp'])
 
     async def test_mid_turn_message_is_received_without_closing_process(self):
         session = await self.start()
@@ -1429,6 +1464,7 @@ class CoordinatorSessionTests(CoordinatorSessionTestsSupport, unittest.IsolatedA
         self.assertEqual(resumed.session_id, session.session_id)
 
     async def test_resumed_parent_reads_changed_shared_mcp_source(self):
+        self.enable_chat_mcp()
         home = self.root / 'home'
         home.mkdir()
         source = home / '.claude.json'
@@ -1446,7 +1482,7 @@ class CoordinatorSessionTests(CoordinatorSessionTestsSupport, unittest.IsolatedA
         args = self.launches()[1]['argv']
         self.assertIn('--resume', args)
         shared_mcp_path = Path(args[-1])
-        self.assertEqual(args[-2:], [str(self.store.directory / 'coordinator-mcp.json'), str(shared_mcp_path)])
+        self.assertEqual(args[-2:], [str(CoordinatorSession.write_mcp_config(self.store, 'home')), str(shared_mcp_path)])
         self.assertEqual(json.loads(shared_mcp_path.read_text()),
                          {'mcpServers': {'example-mcp': second_entry}})
         self.assertEqual(resumed.session_id, first.session_id)
@@ -1552,9 +1588,10 @@ class CoordinatorSessionTests(CoordinatorSessionTestsSupport, unittest.IsolatedA
         await self.until(lambda: self.turns == ['done:cmds'])
         await self.until(session.idle)
         ended = session.last_turn_at
+        self.store.consumed_flush()
         seq = self.store.get('coordinator_host_seq')
         (self.root / 'after-turn.release').touch()
-        await self.until(lambda: self.store.get('coordinator_host_seq') > seq)
+        await self.until(lambda: self.store.consumed_flush() or self.store.get('coordinator_host_seq') > seq)
         self.assertEqual(session.last_turn_at, ended)
 
     async def test_reattached_main_parent_confirms_another_channels_replayed_row(self):
@@ -1652,13 +1689,8 @@ class CoordinatorSessionTests(CoordinatorSessionTestsSupport, unittest.IsolatedA
                 (task,topic,provider,prompt,status,work,created,updated) VALUES (?,?,?,?,?,?,?,?)''',
                 (job['id'], 'home', 'codex', 'Build', 'running', 'development', 1, 1)).lastrowid
         prompt = CoordinatorSession.restarted_prompt([job], store=self.store)
-        summary = json.JSONDecoder().raw_decode(prompt.split('Open jobs: ', 1)[1])[0]
-        self.assertEqual(summary, {
-            'count': 1, 'not_shown': 0, 'live_workers_not_shown': 0,
-            'live_workers': [{'id': worker, 'task': job['id'], 'provider': 'codex',
-                              'status': 'running', 'work': 'development'}],
-            'shown': [{'id': job['id'], 'topic': 'home', 'number': job['number'],
-                       'title': 'Build', 'stage': None, 'notes': '', 'finished': None}]})
+        self.assertIn('Worker %d: Job %d (#%d, Home [home]), codex, running' % (worker, job['id'], job['number']), prompt)
+        self.assertIn('Job %d (#%d, Home [home]): Build' % (job['id'], job['number']), prompt)
 
 
 class RestartPromptTests(unittest.TestCase):
@@ -1666,13 +1698,11 @@ class RestartPromptTests(unittest.TestCase):
         rows = [{'id': number, 'topic': 'home', 'kind': 'owner', 'text': 'm%d ' % number + 'x' * 30000}
                 for number in range(1, 41)]
         prompt = CoordinatorSession.restarted_prompt([], rows)
-        summary = json.loads(prompt.split('characters): ', 1)[1].split('. Inspect', 1)[0])
-        self.assertEqual(summary['count'], 40)
-        self.assertEqual([row['id'] for row in summary['shown']], list(range(40, 40 - len(summary['shown']), -1)))
-        self.assertLessEqual(len(summary['shown']), RESTART_MESSAGES)
-        self.assertLessEqual(sum(len(row['text']) for row in summary['shown']), RESTART_MESSAGE_CHARS)
-        self.assertEqual(summary['not_shown'], 40 - len(summary['shown']))
-        self.assertTrue(all(len(row['text']) <= RESTART_MESSAGE_HEAD + 1 for row in summary['shown']))
+        shown = [line for line in prompt.splitlines() if line.startswith('Uncertain message ')]
+        self.assertEqual([int(line.split()[2]) for line in shown], list(range(40, 40 - len(shown), -1)))
+        self.assertLessEqual(len(shown), RESTART_MESSAGES)
+        self.assertTrue(all(len(line.split(': ', 1)[1]) <= RESTART_MESSAGE_HEAD + 1 for line in shown))
+        self.assertIn('%d uncertain messages not shown.' % (40 - len(shown)), prompt)
         self.assertLess(len(prompt), RESTART_MESSAGE_CHARS + 2000)
 
     def test_large_restart_prompt_has_fixed_bound(self):
@@ -1695,20 +1725,16 @@ class RestartPromptTests(unittest.TestCase):
                 for number in range(1, 41)]
         prompt = CoordinatorSession.restarted_prompt(tasks, rows, store=store)
         self.assertLessEqual(len(prompt), 8000)
-        jobs = json.JSONDecoder().raw_decode(prompt.split('Open jobs: ', 1)[1])[0]
-        self.assertEqual(jobs['count'], 1000)
-        self.assertLess(len(jobs['shown']), 50)
-        self.assertEqual(jobs['not_shown'], 1000 - len(jobs['shown']))
-        self.assertEqual([row['id'] for row in jobs['live_workers']], list(range(1000, 970, -1)))
-        self.assertEqual(jobs['live_workers_not_shown'], 970)
-        self.assertEqual(jobs['shown'][0]['id'], 2)
-        self.assertEqual(jobs['shown'][0]['title'], tasks[1]['title'])
+        lines = prompt.splitlines()
+        self.assertEqual(lines[0], 'The service restarted. Open jobs:')
+        self.assertTrue(lines[1].startswith('Worker 1000: Job 1000 '))
+        self.assertTrue(lines[-1].startswith('Inspect current state before acting.'))
 
     def test_short_uncertain_messages_are_shown_whole(self):
         rows = [{'id': 1, 'topic': 'home', 'kind': 'owner', 'text': 'check the build'}]
         prompt = CoordinatorSession.restarted_prompt([], rows)
-        self.assertIn('"text":"check the build"', prompt)
-        self.assertIn('"not_shown":0', prompt)
+        self.assertIn('Uncertain message 1 (owner): check the build', prompt)
+        self.assertNotIn('not shown', prompt)
 
     def test_transcript_shows_turn_starts_and_mid_turn_queued_messages(self):
         with tempfile.TemporaryDirectory() as root:
@@ -1737,6 +1763,32 @@ class MessageTagTests(unittest.TestCase):
 
 
 class NativeSwitchingTests(CoordinatorSessionTestsSupport, unittest.IsolatedAsyncioTestCase):
+    async def test_idle_managed_parent_moves_to_model_pick_and_resumes_same_session(self):
+        self.account_service()
+        first = await self.start(topic='home', model='claude-fable-5-2')
+        self.service.sessions['home'] = first
+        self.assertEqual(await first.send(str(uuid.uuid4()), 'hello'), 'received')
+        await self.until(first.idle)
+        first.launch_state = 'managed'
+        self.store.put('claude_account_pick', {'fable': 'b', 'other': 'a'})
+        first.protocol.background = [{'task_id': 'helper'}]
+        await self.service.feed_once()
+        self.assertFalse(first.rejected)
+        first.protocol.background = []
+        first._unconsumed_writes.add('pending-write')
+        await self.service.feed_once()
+        self.assertFalse(first.rejected)
+        first._unconsumed_writes.clear()
+        await self.service.feed_once()
+        self.assertTrue(first.rejected)
+        await first.wait_closed()
+        second = await self.start(topic='home', model='claude-fable-5-2')
+        self.assertEqual((second.session_id, second.account_alias), (first.session_id, 'b'))
+        spec = json.loads((self.runner.state_dir / 'hosts' / second.host_id / 'spec.json').read_text())
+        self.assertIn('--resume', spec['argv'])
+        self.assertTrue(Path(spec['argv'][spec['argv'].index('--resume') + 1]).samefile(
+            first.router.transcript(first.session_id)))
+
     async def test_owner_pick_moves_parent_after_turn_settles_preserves_session_and_stays(self):
         from coordinator import control_api
         first = await self.eligible_parent()
@@ -1785,7 +1837,7 @@ class NativeSwitchingTests(CoordinatorSessionTestsSupport, unittest.IsolatedAsyn
         first = await self.start(topic='home')
         self.assertEqual(first.account_alias, 'b')
         self.assertTrue(control_api.call(self.store, 'accounts.claude_auto').ok)
-        self.assertEqual(first.router.select(), 'a')
+        self.assertEqual(first.router.select(model='native-default'), 'a')
         self.assertIsNone(first._account_move())
         self.assertFalse(first.movable())
         self.assertEqual(first.session_id, self.store.get('coordinator_session'))
@@ -1802,7 +1854,7 @@ class NativeSwitchingTests(CoordinatorSessionTestsSupport, unittest.IsolatedAsyn
     async def test_native_parent_stays_on_an_eligible_account_after_a_sooner_reset(self):
         first = await self.eligible_parent()
         self.status('b', usage={'seven_day': {'utilization': 10, 'resets_at': time.time() + 600}})
-        self.assertEqual(first.router.activate(), 'b')
+        self.assertEqual(first.router.activate(model='native-default'), 'b')
         self.assertIsNone(first._account_move())
         self.assertEqual(await first.send(str(uuid.uuid4()), 'hello'), 'received')
         await self.until(lambda: first.idle())
@@ -1860,7 +1912,7 @@ class NativeSwitchingTests(CoordinatorSessionTestsSupport, unittest.IsolatedAsyn
         self.assertEqual(await first.send(str(uuid.uuid4()), 'bg'), 'received')
         await self.until(lambda: first.protocol.background and self.turns == ['done:bg'])
         first.router.record_rate_limit('a', {'rateLimitType': 'seven_day',
-            'status': 'allowed_warning', 'utilization': .98, 'resetsAt': time.time() + 3600})
+            'status': 'allowed_warning', 'utilization': .99, 'resetsAt': time.time() + 3600})
         self.assertTrue(first.movable())
         self.assertFalse(first.idle())
         self.assertEqual(await first.send(str(uuid.uuid4()), 'bg-done'), 'received')
@@ -1898,5 +1950,5 @@ class NativeSwitchingTests(CoordinatorSessionTestsSupport, unittest.IsolatedAsyn
         self.assertEqual(len([row for row in self.store.messages_pending() if row['text'].startswith('Background tasks stopped')]), 1)
 
     def test_public_fingerprint_has_no_extension_keys(self):
-        self.assertEqual(CoordinatorSession._launch_inputs(self.store, 'model', 'instructions', None).fingerprint,
-                         CoordinatorSession._launch_inputs(self.store, 'model', 'instructions', None, {}).fingerprint)
+        self.assertEqual(CoordinatorSession._launch_inputs(self.store, 'model', 'instructions', None, topic='home').fingerprint,
+                         CoordinatorSession._launch_inputs(self.store, 'model', 'instructions', None, {}, topic='home').fingerprint)

@@ -2,26 +2,29 @@
 
 import argparse
 from contextlib import redirect_stdout
-import platform
 from pathlib import Path
 import sys
+
+if __package__:
+    from . import host_os
+else:
+    import host_os
 
 MAC_MODEL = ('mlx-community/whisper-large-v3-turbo', 'a4aaeec0636e6fef84abdcbe3544cb2bf7e9f6fb')
 LINUX_MODEL = ('mobiuslabsgmbh/faster-whisper-large-v3-turbo', '0a363e9161cbc7ed1431c9597a8ceaf0c4f78fcf')
 PARAKEET_MODEL = ('mlx-community/parakeet-tdt-0.6b-v3', 'ed2b7e8c15f9aaa0b5772e2efb986255eaef7e15')
 
 
-def uses_mlx():
-    return platform.system() == 'Darwin' and platform.machine() == 'arm64'
-
-
 def model_path(setup=False, repair=False, backend='parakeet'):
     from huggingface_hub import snapshot_download
 
-    repo, revision = PARAKEET_MODEL if backend == 'parakeet' else MAC_MODEL if uses_mlx() else LINUX_MODEL
-    required = (('config.json', 'model.safetensors') if backend == 'parakeet' else
-                ('config.json', 'weights.safetensors') if uses_mlx() else
-                ('config.json', 'model.bin', 'tokenizer.json', 'vocabulary.json'))
+    if backend == 'parakeet':
+        repo, revision = PARAKEET_MODEL
+        required = ('config.json', 'model.safetensors')
+    else:
+        (repo, revision), required = host_os.apple_silicon_choice(
+            (MAC_MODEL, ('config.json', 'weights.safetensors')),
+            (LINUX_MODEL, ('config.json', 'model.bin', 'tokenizer.json', 'vocabulary.json')))
     path = snapshot_download(repo_id=repo, revision=revision, local_files_only=not setup,
                              force_download=repair, token=False,
                              allow_patterns=list(required) + ['preprocessor_config.json', 'README.md',
@@ -44,6 +47,19 @@ def decode(path):
     if not frames:
         raise RuntimeError('audio has no samples')
     return np.concatenate(frames)
+
+
+def _whisper_mlx(samples, model):
+    import mlx_whisper
+
+    return mlx_whisper.transcribe(samples, path_or_hf_repo=model)['text']
+
+
+def _whisper_cpu(samples, model):
+    from faster_whisper import WhisperModel
+
+    segments, _ = WhisperModel(model, device='cpu', compute_type='int8').transcribe(samples)
+    return ' '.join(segment.text for segment in segments)
 
 
 def main():
@@ -72,13 +88,7 @@ def main():
                 args.audio, chunk_duration=120.0, overlap_duration=15.0).text
         else:
             samples = decode(args.audio)
-            if uses_mlx():
-                import mlx_whisper
-                text = mlx_whisper.transcribe(samples, path_or_hf_repo=model)['text']
-            else:
-                from faster_whisper import WhisperModel
-                segments, _ = WhisperModel(model, device='cpu', compute_type='int8').transcribe(samples)
-                text = ' '.join(segment.text for segment in segments)
+            text = host_os.apple_silicon_choice(_whisper_mlx, _whisper_cpu)(samples, model)
     print(text)
 
 

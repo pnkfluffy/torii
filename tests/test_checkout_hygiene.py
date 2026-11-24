@@ -19,13 +19,13 @@ class CheckoutHygieneTests(unittest.TestCase):
         result = subprocess.run(['git', 'check-ignore', '--no-index', '--stdin'], cwd=ROOT,
                                 input='\n'.join(paths) + '\n', text=True, capture_output=True, check=True)
         self.assertEqual(set(result.stdout.splitlines()), set(paths))
-        source = subprocess.run(['git', 'check-ignore', '--no-index', 'coordinator/defaults/USAGE.md'],
+        source = subprocess.run(['git', 'check-ignore', '--no-index', 'coordinator/defaults/Torii.md'],
                                 cwd=ROOT, capture_output=True)
         self.assertEqual(source.returncode, 1)
 
-    def test_shared_mcp_instructions_precede_license(self):
+    def test_chat_mcp_instructions_precede_license(self):
         readme = (ROOT / 'README.md').read_text()
-        self.assertLess(readme.index('## Shared MCP servers'), readme.index('## License'))
+        self.assertLess(readme.index('## Chat MCP servers'), readme.index('## License'))
 
 
 if __name__ == '__main__':

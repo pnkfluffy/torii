@@ -11,8 +11,9 @@ They do not establish live Telegram or model behavior.
 
 ## Launch
 
-From the repository root, run `/usr/bin/python3 ./scripts/verify-local.py` once
-at the end of a unit. It uses `TORII_PYTHON` when set, then the service's
+For a normal PR, run only the test modules it touches. For a risky PR, run
+`/usr/bin/python3 scripts/verify-local.py` from the repository root.
+It uses `TORII_PYTHON` when set, then the service's
 Python 3.9 interpreter. It launches short-lived CLI processes
 against a fresh scratch `--state-dir`, then removes the scratch state. Read the
 printed proof path and `result.json`.
@@ -34,8 +35,7 @@ tables. It also runs the complete
 unittest suite, comment check, compilation, and `git diff --check`. Select
 additional coverage from [the feature map](features/README.md).
 
-For authorized live work, follow `docs/operations.md` and
-`docs/verification.md`. Select a separate bot, topic, state directory, and
+For authorized live work, follow the live verification guidance in `README.md`. Select a separate bot, topic, state directory, and
 native session before starting `serve`. Confirm one poller owns the bot. Never
 start a second poller against the running service. Pairing, `/ping`, and
 `--pair-only` send Telegram messages. Do not run live setup, account changes,

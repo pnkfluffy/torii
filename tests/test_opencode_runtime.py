@@ -1,6 +1,7 @@
 import asyncio
 from dataclasses import replace
 import errno
+from functools import partial
 import json
 import os
 import signal
@@ -15,8 +16,9 @@ import time
 import unittest
 from unittest.mock import AsyncMock, patch
 
-from coordinator import control_api, opencode_runtime, worker_storage
+from coordinator import control_api, opencode_runtime, worker_storage, workspaces
 from coordinator.accounts import AccountBroker
+from coordinator.acp_protocol import AcpProtocol
 from coordinator.native_protocol import RunControl
 from coordinator.host import HostClient
 from coordinator.service import Service
@@ -25,7 +27,7 @@ from coordinator.providers import ProviderRunner
 from coordinator.store import Store
 from coordinator.workers import WorkerPool, host_directory
 from tests.fake_opencode import SESSION_ID, install_fake_opencode, install_versioned_opencode
-from tests.support import read_jsonl, stop_test_hosts
+from tests.support import SETTLE, finish_background_tasks, read_jsonl, settle, stop_test_hosts
 
 
 ACCOUNT = {'base_url': 'http://127.0.0.1:1/v1', 'model': 'example-model', 'small_model': 'other-title-model',
@@ -37,14 +39,21 @@ WEEKLY_REFUSAL = {'error': {'code': 'weekly_included_input_token_limit_exceeded'
     'resetAt': int(time.time() + 86400) * 1000}
 
 
+def threaded_delete(remove):
+    async def delete(path, **options):
+        return await worker_storage._background(remove, path)
+    return delete
+
+
 class OpenCodeRuntimeTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
-        platform = patch('coordinator.providers.platform', 'linux')
+        platform = patch('coordinator.host_os.uses_worker_coalitions', new=lambda: False)
         platform.start()
         self.addCleanup(platform.stop)
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
-        self.root = Path(self.temp.name)
+        self.addAsyncCleanup(finish_background_tasks)
+        self.root = Path(self.temp.name).resolve()
         self.addCleanup(stop_test_hosts, self.root)
         self.home = self.root / 'owner-home'
         self.home.mkdir()
@@ -90,7 +99,13 @@ class OpenCodeRuntimeTests(unittest.IsolatedAsyncioTestCase):
 
     async def run_worker(self, **options):
         return await asyncio.wait_for(self.runner.run('opencode', 'short prompt', self.cwd, None,
-                                     fresh=True, worker_id=31, **options), 20)
+                                     fresh=True, worker_id=31, topic='1:2', **options), 20)
+
+    async def test_background_reporting_does_not_apply_to_opencode(self):
+        result = await self.run_worker()
+        self.assertTrue(result.success, result.error)
+        spec = json.loads(Path(result.log_path).with_name('spec.json').read_text())
+        self.assertNotIn('report_background_killed', spec)
 
     def make_pool(self):
         self.store.db.execute("INSERT INTO topics(id,chat,thread,name,cwd,enabled) VALUES ('1:2',1,2,'test',?,1)",
@@ -104,13 +119,9 @@ class OpenCodeRuntimeTests(unittest.IsolatedAsyncioTestCase):
                                 'prompt': 'short prompt', **options}, topic='1:2')
 
     def shared_mcp(self, selection, entries):
-        overrides = self.root / 'local-overrides.json'
-        if selection is not None:
-            overrides.write_text(json.dumps(selection))
+        names = (selection or {}).get('mcp_servers', [])
+        self.store.put('chat_config:1:2', {'mcp_servers': names})
         (self.home / '.claude.json').write_text(json.dumps({'mcpServers': entries}))
-        selected = patch('coordinator.accounts.LOCAL_OVERRIDES_PATH', overrides)
-        selected.start()
-        self.addCleanup(selected.stop)
 
     def shared_problems(self):
         return [tuple(row) for row in self.store.db.execute(
@@ -123,7 +134,7 @@ class OpenCodeRuntimeTests(unittest.IsolatedAsyncioTestCase):
                                         'X-Client': 'DUMMY-CLIENT'}},
             'other.mcp': {'type': 'http', 'url': 'http://127.0.0.1:1/unavailable', 'headers': {}},
         }
-        self.shared_mcp({'shared_mcp_servers': list(entries)}, dict(entries, unselected=entries['example-mcp']))
+        self.shared_mcp({'mcp_servers': list(entries)}, dict(entries, unselected=entries['example-mcp']))
         expected = {name: {'type': 'remote', 'url': entry['url'], 'headers': entry['headers'], 'oauth': False}
                     for name, entry in entries.items()}
         for profile in (ACCOUNT, {'provider': 'opencode-go', 'model': 'example-model'}):
@@ -131,7 +142,7 @@ class OpenCodeRuntimeTests(unittest.IsolatedAsyncioTestCase):
             for fresh in (True, False):
                 with self.subTest(provider=profile.get('provider', 'torii-host'), fresh=fresh):
                     result = await self.runner.run('opencode', 'short prompt', self.cwd,
-                        None if fresh else SESSION_ID, fresh=fresh, worker_id=31, account_alias='one')
+                        None if fresh else SESSION_ID, fresh=fresh, worker_id=31, account_alias='one', topic='1:2')
                     self.assertTrue(result.success, result)
                     path = self.launch_root(result) / 'config/opencode/opencode.json'
                     self.assertEqual(path.stat().st_mode & 0o777, 0o600)
@@ -145,21 +156,35 @@ class OpenCodeRuntimeTests(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(config['permission']['external_directory'], 'deny')
         self.assertEqual(self.shared_problems(), [])
 
+    async def test_worker_uses_only_its_chat_mcp_selection(self):
+        entry = {'type': 'http', 'url': 'https://example.invalid/mcp', 'headers': {}}
+        self.shared_mcp({'mcp_servers': ['example-mcp']}, {'example-mcp': entry, 'other-mcp': entry})
+        self.store.put('chat_config:other', {'mcp_servers': ['other-mcp']})
+        selected = await self.run_worker()
+        self.assertTrue(selected.success, selected.error)
+        config = json.loads((self.launch_root(selected) / 'config/opencode/opencode.json').read_text())
+        self.assertEqual(list(config['mcp']), ['example-mcp'])
+        empty = await self.runner.run('opencode', 'short prompt', self.cwd, None,
+                                      fresh=True, worker_id=32, topic='empty')
+        self.assertTrue(empty.success, empty.error)
+        config = json.loads((self.launch_root(empty) / 'config/opencode/opencode.json').read_text())
+        self.assertEqual(config['mcp'], {})
+
     async def test_shared_mcp_selection_and_entry_problems_once_per_launch(self):
         good = {'type': 'http', 'url': 'https://example.invalid/mcp', 'headers': {}}
         cases = (
             ('no-file', None, {}, {}, []),
             ('no-selection', {}, {}, {}, []),
-            ('empty', {'shared_mcp_servers': []}, {}, {}, []),
-            ('invalid-list', {'shared_mcp_servers': ['good', 3]}, {}, {},
+            ('empty', {'mcp_servers': []}, {}, {}, []),
+            ('invalid-list', {'mcp_servers': ['good', 3]}, {}, {},
              [('shared-mcp', 'selection-invalid', None)]),
-            ('invalid-type', {'shared_mcp_servers': 'good'}, {}, {},
+            ('invalid-type', {'mcp_servers': 'good'}, {}, {},
              [('shared-mcp', 'selection-invalid', None)]),
-            ('partial', {'shared_mcp_servers': ['good', 'stdio', 'missing', 'stdio']},
+            ('partial', {'mcp_servers': ['good', 'stdio', 'missing', 'stdio']},
              {'good': good, 'stdio': {'type': 'stdio', 'command': 'never-run'}},
              {'good': {'type': 'remote', 'url': good['url'], 'headers': {}, 'oauth': False}},
              [('shared-mcp', 'entry-invalid', 'entry=stdio'), ('shared-mcp', 'entry-missing', 'entry=missing')]),
-            ('none-valid', {'shared_mcp_servers': ['stdio']},
+            ('none-valid', {'mcp_servers': ['stdio']},
              {'stdio': {'type': 'stdio', 'command': 'never-run'}}, {},
              [('shared-mcp', 'entry-invalid', 'entry=stdio')]),
         )
@@ -174,7 +199,7 @@ class OpenCodeRuntimeTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(config['mcp'], expected)
 
     async def test_shared_mcp_missing_and_invalid_source_keep_worker_available(self):
-        self.shared_mcp({'shared_mcp_servers': ['example-mcp']}, {})
+        self.shared_mcp({'mcp_servers': ['example-mcp']}, {})
         source = self.home / '.claude.json'
         for mode, code in (('missing', 'source-missing'), ('json', 'source-invalid-json'),
                            ('directory', 'source-unreadable')):
@@ -195,7 +220,7 @@ class OpenCodeRuntimeTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_shared_mcp_output_and_errors_are_scrubbed_before_persistence(self):
         url, value = 'https://example.invalid/DUMMY-PRIVATE-URL', 'DUMMY-PRIVATE-HEADER'
-        self.shared_mcp({'shared_mcp_servers': ['example-mcp']}, {
+        self.shared_mcp({'mcp_servers': ['example-mcp']}, {
             'example-mcp': {'type': 'http', 'url': url, 'headers': {'Authorization': value}}})
         pool, task = self.make_pool()
         for status in (None, 401, 402):
@@ -227,7 +252,7 @@ class OpenCodeRuntimeTests(unittest.IsolatedAsyncioTestCase):
                     self.assertTrue(result['quota_limited'])
 
     async def test_shared_mcp_tools_pass_worker_guard(self):
-        self.shared_mcp({'shared_mcp_servers': ['example-mcp']}, {
+        self.shared_mcp({'mcp_servers': ['example-mcp']}, {
             'example-mcp': {'type': 'http', 'url': 'https://example.invalid/mcp', 'headers': {}}})
         result = await self.run_worker()
         self.assertTrue(result.success, result)
@@ -251,7 +276,7 @@ console.log(JSON.stringify(output))
 
     async def test_shared_mcp_reattach_scrubs_saved_launch_values_without_reading_selection(self):
         url, value = 'https://example.invalid/DUMMY-SAVED-URL', 'DUMMY-SAVED-HEADER'
-        self.shared_mcp({'shared_mcp_servers': ['example-mcp']}, {
+        self.shared_mcp({'mcp_servers': ['example-mcp']}, {
             'example-mcp': {'type': 'http', 'url': url, 'headers': {'Authorization': value}}})
         release = self.root / 'release'
         self.scenario(release=str(release), chunks=[url + ' ' + value])
@@ -270,7 +295,7 @@ console.log(JSON.stringify(output))
         config.write_text(json.dumps(saved))
         before = len(self.calls())
         (self.home / '.claude.json').write_text('{}')
-        (self.root / 'local-overrides.json').write_text('{')
+        self.store.put('chat_config:1:2', {'mcp_servers': ['changed']})
         replacement = WorkerPool(self.store, ProviderRunner(self.store.directory, opencode_store=self.store),
                                  AccountBroker(self.store))
         ready = asyncio.Event()
@@ -298,7 +323,7 @@ console.log(JSON.stringify(output))
     async def reattach_shared_mcp_after_config_error(self, damage):
         url, value = 'https://example.invalid/DUMMY-REATTACH-URL', 'DUMMY-REATTACH-HEADER'
         entry = {'type': 'http', 'url': url, 'headers': {'Authorization': value}}
-        self.shared_mcp({'shared_mcp_servers': ['example-mcp']}, {'example-mcp': entry})
+        self.shared_mcp({'mcp_servers': ['example-mcp']}, {'example-mcp': entry})
         release = self.root / 'release'
         self.scenario(release=str(release), chunks=[url + ' ' + value])
         pool, task = self.make_pool()
@@ -328,7 +353,7 @@ console.log(JSON.stringify(output))
             config.write_text(json.dumps(saved))
         else:
             config.write_text(damage)
-        self.shared_mcp({'shared_mcp_servers': ['example-mcp', 'other-mcp']}, {
+        self.shared_mcp({'mcp_servers': ['example-mcp', 'other-mcp']}, {
             'example-mcp': entry,
             'other-mcp': {'type': 'http', 'url': 'https://other.invalid/mcp', 'headers': {}},
         })
@@ -403,13 +428,13 @@ console.log(JSON.stringify(output))
 
     async def test_shared_mcp_reserved_torii_is_skipped_on_fresh_and_resume(self):
         good = {'type': 'http', 'url': 'https://example.invalid/mcp', 'headers': {}}
-        self.shared_mcp({'shared_mcp_servers': ['torii', 'example-mcp', 'torii']},
+        self.shared_mcp({'mcp_servers': ['torii', 'example-mcp', 'torii']},
                         {'torii': dict(good, url='https://collision.invalid/mcp'), 'example-mcp': good})
         for fresh in (True, False):
             with self.subTest(fresh=fresh):
                 before = len(self.shared_problems())
                 result = await self.runner.run('opencode', 'short prompt', self.cwd,
-                    None if fresh else SESSION_ID, fresh=fresh, worker_id=31, account_alias='one')
+                    None if fresh else SESSION_ID, fresh=fresh, worker_id=31, account_alias='one', topic='1:2')
                 self.assertTrue(result.success, result)
                 self.assertEqual(self.calls()[-1]['config']['mcp'], {
                     'example-mcp': {'type': 'remote', 'url': good['url'], 'headers': {}, 'oauth': False},
@@ -447,7 +472,7 @@ console.log(JSON.stringify(output))
         self.assertTrue(set(forbidden).isdisjoint(env))
         for name in ('HOME', 'XDG_CONFIG_HOME', 'XDG_DATA_HOME', 'XDG_CACHE_HOME', 'XDG_STATE_HOME', 'TMPDIR'):
             self.assertEqual(Path(env[name]).parent, root if name == 'XDG_DATA_HOME' else launch)
-            if name == 'TMPDIR':
+            if name in ('XDG_CACHE_HOME', 'TMPDIR'):
                 self.assertFalse(Path(env[name]).exists())
             else:
                 self.assertEqual(Path(env[name]).stat().st_mode & 0o777, 0o700)
@@ -474,6 +499,7 @@ console.log(JSON.stringify(output))
             task = self.store.task_create('1:2', 'Direct provider fixture', worktree=str(self.cwd))
             self.store.db.execute("""INSERT INTO workers(id,task,topic,provider,prompt,cwd,status,created,updated)
                 VALUES (31,?,'1:2','opencode','short prompt',?,'running',1,1)""", (task['id'], str(self.cwd)))
+            self.store.db.commit()
         storage = worker_storage.storage_for(self.store)
         host = Path(result.log_path).parent.name
         storage.register_host(31, host)
@@ -566,7 +592,7 @@ console.log(JSON.stringify(output))
             return original(path)
 
         result = await self.run_worker()
-        with patch.object(worker_storage, '_remove_tree', side_effect=remove):
+        with patch.object(workspaces, 'delete_tree', new=threaded_delete(remove)):
             storage = await self.cleanup_storage(result)
         self.assertEqual(replace(result, pid=baseline.pid, log_path=baseline.log_path), baseline)
         problems = self.cleanup_problems()
@@ -647,7 +673,7 @@ console.log(JSON.stringify(output))
                     finished.set()
             return original(path)
 
-        with patch.object(worker_storage, '_remove_tree', side_effect=remove):
+        with patch.object(workspaces, 'delete_tree', new=threaded_delete(remove)):
             cleanup = asyncio.create_task(self.cleanup_storage(result))
             try:
                 await self.wait_until(entered.is_set)
@@ -678,7 +704,7 @@ console.log(JSON.stringify(output))
             recorded.append((threading.get_ident(), area, code))
             return record(store, area, code, detail, **kwargs)
 
-        with patch.object(worker_storage, '_remove_tree', side_effect=remove), \
+        with patch.object(workspaces, 'delete_tree', new=threaded_delete(remove)), \
                 patch.object(worker_storage.problems, 'record', side_effect=problem):
             await self.cleanup_storage(result)
         self.assertTrue(result.success, result)
@@ -706,7 +732,7 @@ console.log(JSON.stringify(output))
                     finished.set()
             return original(path)
 
-        with patch.object(worker_storage, '_remove_tree', side_effect=remove):
+        with patch.object(workspaces, 'delete_tree', new=threaded_delete(remove)):
             cleanup = asyncio.create_task(self.cleanup_storage(result))
             try:
                 await self.wait_until(entered.is_set)
@@ -1441,9 +1467,10 @@ console.log(JSON.stringify(output))
         self.assertEqual([row['detail'] for row in problems], [])
 
     async def test_pool_owner_stop_survives_exit_during_cancel_grace(self):
-        pool, wid, run = await self.start_cancel_case('exit')
-        await asyncio.wait_for(pool.stop(wid), 10)
-        self.assert_owner_stopped(await asyncio.wait_for(run, 10))
+        with patch('coordinator.providers.AcpProtocol', partial(AcpProtocol, cancel_grace=SETTLE)):
+            pool, wid, run = await self.start_cancel_case('exit')
+        await settle(pool.stop(wid), timeout=60)
+        self.assert_owner_stopped(await settle(run))
 
     async def test_pool_owner_stop_survives_stdout_close_during_cancel_grace(self):
         pool, wid, run = await self.start_cancel_case('close_stdout')

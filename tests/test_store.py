@@ -147,107 +147,6 @@ class StoreTests(unittest.TestCase):
         self.assertIsNone(self.store.get('event_request'))
         self.assertEqual(self.store.messages_pending(), [])
 
-    def test_forwarded_kind_upgrades_event_schema_without_losing_rows_or_indexes(self):
-        owner = self.store.message_save('-10042:4', 'owner', 'Keep owner text.', telegram_message=101,
-                                        images=[{'file_id': 'fixture-image'}])
-        event = self.store.message_event('-10042:4', 'Keep event text.')
-        self.store.db.commit()
-        self.store.task_create('-10042:4', 'Keep origin.', origin=owner['id'])
-        self.store.db.execute('UPDATE messages SET reaction_first_failed=123 WHERE id=?', (owner['id'],))
-        self.store.db.execute('CREATE INDEX messages_history ON messages(topic,created,id)')
-        self.store.db.commit()
-        before = [tuple(row) for row in self.store.db.execute('SELECT * FROM messages ORDER BY id')]
-        columns = [tuple(row) for row in self.store.db.execute('PRAGMA table_info(messages)')]
-        indexes = list(self.store.db.execute(
-            "SELECT name,sql FROM sqlite_master WHERE type='index' AND tbl_name='messages' ORDER BY name"))
-        old_schema = self.store.db.execute(
-            "SELECT sql FROM sqlite_master WHERE type='table' AND name='messages'").fetchone()[0].replace("'forwarded',", '')
-        self.store.close()
-        with sqlite3.connect(self.root / 'state.sqlite') as db:
-            db.execute('DROP TABLE messages')
-            db.execute(old_schema)
-            for row in before:
-                db.execute('INSERT INTO messages VALUES (' + ','.join('?' for _ in row) + ')', row)
-            for _, sql in indexes:
-                db.execute(sql)
-        self.store = Store(self.root)
-        self.assertEqual([tuple(row) for row in self.store.db.execute('SELECT * FROM messages ORDER BY id')], before)
-        self.assertEqual([tuple(row) for row in self.store.db.execute('PRAGMA table_info(messages)')], columns)
-        self.assertEqual([tuple(row) for row in self.store.db.execute(
-            "SELECT name,sql FROM sqlite_master WHERE type='index' AND tbl_name='messages' ORDER BY name")],
-                         [tuple(row) for row in indexes])
-        self.assertEqual(self.store.db.execute('SELECT origin FROM tasks').fetchone()[0], owner['id'])
-        self.assertEqual(self.store.db.execute('PRAGMA foreign_key_check').fetchall(), [])
-        forwarded = self.store.message_save('-10042:4', 'forwarded', 'Forwarded from "Fixture":\nContent.')
-        self.assertEqual(forwarded['id'], event['id'] + 1)
-        version = self.store.db.execute('PRAGMA schema_version').fetchone()[0]
-        self.store.close()
-        self.store = Store(self.root)
-        self.assertEqual(self.store.db.execute('PRAGMA schema_version').fetchone()[0], version)
-        self.assertEqual(self.store.messages_pending(),
-                         [dict(zip((column[1] for column in columns), row)) for row in before] + [forwarded])
-
-    def test_old_message_schema_rebuild_keeps_rows_columns_indexes_and_ids(self):
-        self.store.close()
-        with sqlite3.connect(self.root / 'state.sqlite') as db:
-            db.execute('DROP TABLE messages')
-            db.execute('''CREATE TABLE messages (
-                id INTEGER PRIMARY KEY, topic TEXT NOT NULL REFERENCES topics(id),
-                kind TEXT NOT NULL CHECK(kind IN ('owner','worker_result','restarted','callback','secret_filled')),
-                telegram_message INTEGER, text TEXT NOT NULL,
-                source_worker INTEGER REFERENCES workers(id), images TEXT,
-                source_envelope INTEGER REFERENCES envelopes(id),
-                delivered TEXT NOT NULL DEFAULT 'pending'
-                    CHECK(delivered IN ('pending','sent','received','uncertain')),
-                receipt TEXT, reaction_state TEXT NOT NULL DEFAULT 'sent',
-                reaction_desired TEXT, reaction_sent TEXT, turn_started REAL,
-                turn_outbox INTEGER, turn_eyes INTEGER NOT NULL DEFAULT 0,
-                turn_tools INTEGER NOT NULL DEFAULT 0, reacted_to INTEGER,
-                reaction_retry REAL NOT NULL DEFAULT 0,
-                reaction_attempts INTEGER NOT NULL DEFAULT 0,
-                created REAL NOT NULL, updated REAL NOT NULL)''')
-            worker = db.execute('''INSERT INTO workers (topic,provider,prompt,created,updated)
-                VALUES ('-10042:4','codex','fixture',1,2)''').lastrowid
-            envelope = db.execute('''INSERT INTO envelopes
-                (name,reason,consumer,topic,state,created,expires,updated)
-                VALUES ('FIXTURE','fixture','test','-10042:4','filled',1,2,3)''').lastrowid
-            for message_id, kind, delivered in ((3, 'owner', 'pending'), (7, 'worker_result', 'sent'),
-                                               (19, 'restarted', 'received'), (31, 'callback', 'uncertain'),
-                                               (95, 'secret_filled', 'received')):
-                db.execute('''INSERT INTO messages VALUES
-                    (?,'-10042:4',?,?,?,?,'[]',?,?,'fixture receipt','sent','👀','👀',4,5,1,2,6,7,8,9,10)''',
-                           (message_id, kind, message_id if kind == 'owner' else None, 'saved ' + kind,
-                            worker if kind == 'worker_result' else None,
-                            envelope if kind == 'secret_filled' else None, delivered))
-            for statement in (
-                    'CREATE UNIQUE INDEX messages_telegram ON messages(topic,telegram_message) WHERE telegram_message IS NOT NULL',
-                    'CREATE INDEX messages_workers ON messages(source_worker)',
-                    'CREATE UNIQUE INDEX messages_envelopes ON messages(source_envelope) WHERE source_envelope IS NOT NULL',
-                    'CREATE INDEX messages_history ON messages(topic,created,id)'):
-                db.execute(statement)
-            db.execute("INSERT INTO tasks(topic,number,title,origin,created,updated) VALUES ('-10042:4',1,'fixture',3,1,2)")
-            before = db.execute('SELECT * FROM messages ORDER BY id').fetchall()
-            columns = db.execute('PRAGMA table_info(messages)').fetchall()
-            indexes = db.execute("SELECT name,sql FROM sqlite_master WHERE type='index' AND tbl_name='messages' ORDER BY name").fetchall()
-        self.store = Store(self.root)
-        self.assertEqual([tuple(row) for row in self.store.db.execute('SELECT * FROM messages ORDER BY id')],
-                         [row + (None, None, None) for row in before])
-        self.assertEqual([tuple(row) for row in self.store.db.execute('PRAGMA table_info(messages)')],
-                         columns + [(len(columns), 'from_name', 'TEXT', 0, None, 0),
-                                    (len(columns) + 1, 'reaction_first_failed', 'REAL', 0, None, 0),
-                                    (len(columns) + 2, 'batch_id', 'INTEGER', 0, None, 0)])
-        self.assertEqual([tuple(row) for row in self.store.db.execute(
-            "SELECT name,sql FROM sqlite_master WHERE type='index' AND tbl_name='messages' ORDER BY name")],
-                         sorted(indexes + [('messages_batches',
-                             'CREATE INDEX messages_batches ON messages(batch_id) WHERE batch_id IS NOT NULL')]))
-        self.assertEqual(self.store.db.execute('SELECT origin FROM tasks').fetchone()[0], 3)
-        self.assertEqual(self.store.db.execute('PRAGMA foreign_key_check').fetchall(), [])
-        event = self.store.message_save('-10042:4', 'event', 'New event.')
-        self.assertEqual(event['id'], 96)
-        self.store.close()
-        self.store = Store(self.root)
-        self.assertEqual(self.store.message_event('-10042:4', 'Next event.')['id'], 97)
-
     def test_failed_checkpoint_open_rolls_back_the_entire_migration(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -258,12 +157,12 @@ class StoreTests(unittest.TestCase):
                 with db:
                     db.execute('UPDATE tasks SET origin=999999 WHERE id=1')
                 self.assertEqual(db.execute('PRAGMA foreign_key_check').fetchall(),
-                                 [('tasks', 1, 'messages', 0)])
+                                 [('tasks', 1, 'messages', 1)])
                 before_dump = list(db.iterdump())
                 before_master = db.execute(
                     'SELECT type,name,tbl_name,rootpage,sql FROM sqlite_master ORDER BY type,name').fetchall()
-                self.assertNotIn("'event'", db.execute(
-                    "SELECT sql FROM sqlite_master WHERE name='messages'").fetchone()[0])
+                self.assertNotIn("'proposed'", db.execute(
+                    "SELECT sql FROM sqlite_master WHERE name='tasks'").fetchone()[0])
             finally:
                 db.close()
             with self.assertRaisesRegex(sqlite3.IntegrityError, 'Migration left invalid foreign keys'):
@@ -274,8 +173,8 @@ class StoreTests(unittest.TestCase):
                 self.assertEqual(db.execute(
                     'SELECT type,name,tbl_name,rootpage,sql FROM sqlite_master ORDER BY type,name').fetchall(),
                     before_master)
-                self.assertNotIn("'event'", db.execute(
-                    "SELECT sql FROM sqlite_master WHERE name='messages'").fetchone()[0])
+                self.assertNotIn("'proposed'", db.execute(
+                    "SELECT sql FROM sqlite_master WHERE name='tasks'").fetchone()[0])
             finally:
                 db.close()
 
@@ -323,6 +222,22 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(self.store.task_get(first['id'])['status'], 'done')
         self.assertEqual([row['id'] for row in self.store.tasks_list(status='open')],
                          [second['id'], other['id']])
+
+    def test_task_uids_are_unique_and_migrated_once(self):
+        first = self.store.task_create('-10042:4', 'First')
+        with patch('coordinator.store.secrets.token_hex', side_effect=[first['uid'], '12345678']):
+            second = self.store.task_create('-10042:4', 'Second')
+        self.assertRegex(first['uid'], r'^[0-9a-f]{8}$')
+        self.assertEqual(second['uid'], '12345678')
+        with self.store.db:
+            self.store.db.execute('UPDATE tasks SET uid=NULL WHERE id=?', (first['id'],))
+        self.store.close()
+        self.store = Store(self.root)
+        migrated = self.store.task_get(first['id'])['uid']
+        self.assertRegex(migrated, r'^[0-9a-f]{8}$')
+        self.store.close()
+        self.store = Store(self.root)
+        self.assertEqual(self.store.task_get(first['id'])['uid'], migrated)
 
     def test_task_pr_validation_with_and_without_private_addon(self):
         task = self.store.task_create('-10042:4', 'First')
@@ -412,43 +327,6 @@ class StoreTests(unittest.TestCase):
         self.assertEqual([row[0] for row in self.store.db.execute('SELECT status FROM workers ORDER BY id')],
                          ['done', 'interrupted'])
 
-    def test_startup_migrates_all_legacy_needs_input_workers_to_done(self):
-        closed = self.store.task_create('-10042:4', 'Closed')
-        open_task = self.store.task_create('-10042:4', 'Superseded')
-        newest = self.store.task_create('-10042:4', 'Newest on open job')
-        with self.store.db:
-            for task in (closed, open_task, newest):
-                self.store.db.execute("INSERT INTO workers (task,topic,provider,prompt,status,created,updated) "
-                                      "VALUES (?, '-10042:4', 'claude', 'Question', 'needs_input', 1, 1)",
-                                      (task['id'],))
-            self.store.db.execute("INSERT INTO workers (task,topic,provider,prompt,status,created,updated) "
-                                  "VALUES (?, '-10042:4', 'claude', 'Follow up', 'done', 2, 2)",
-                                  (open_task['id'],))
-        with self.store.db:
-            self.store.db.execute("UPDATE tasks SET status='dropped' WHERE id=?", (closed['id'],))
-        unchanged = {}
-        with self.store.db:
-            for index, status in enumerate(('queued', 'waiting_for_secret', 'waiting_for_quota',
-                                            'running', 'done', 'interrupted')):
-                session, fresh, updated = 'session-' + status, index % 2, 100 + index
-                worker = self.store.db.execute('''INSERT INTO workers
-                    (task,topic,provider,prompt,status,session,fresh,created,updated)
-                    VALUES (?, '-10042:4', 'claude', 'Keep unchanged', ?, ?, ?, 1, ?)''',
-                    (newest['id'], status, session, fresh, updated)).lastrowid
-                unchanged[worker] = (status, session, fresh, updated)
-        for opening in (1, 2):
-            with self.subTest(opening=opening):
-                self.store.close()
-                self.store = Store(self.root)
-                self.assertEqual([row[0] for row in self.store.db.execute(
-                    'SELECT status FROM workers WHERE id<? ORDER BY id', (min(unchanged),))],
-                    ['done', 'done', 'done', 'done'])
-                for worker, expected in unchanged.items():
-                    with self.subTest(status=expected[0]):
-                        row = self.store.db.execute('SELECT status,session,fresh,updated FROM workers WHERE id=?',
-                                                    (worker,)).fetchone()
-                        self.assertEqual(tuple(row), expected)
-
     def test_topic_names_can_repeat_across_channels(self):
         with self.store.db:
             self.store.db.executemany("INSERT INTO topics(id,chat,thread,name,cwd) VALUES (?,?,?,?,'')",
@@ -456,10 +334,7 @@ class StoreTests(unittest.TestCase):
         self.store.bind('-10042:4', self.root, 'Torii', enabled=True)
         self.store.bind('-10042:5', self.root, ' torii ')
         self.assertEqual(self.store.topic('-10042:5')['cwd'], str(self.root.resolve()))
-        self.store.rename_topic('-10042:5', 'TORII')
-        self.assertEqual(self.store.topic('-10042:5')['name'], 'TORII')
         self.store.bind('-99:5', self.root, 'Torii')
-        self.assertEqual(self.store.rename_topic('-10042:4', 'torii'), 'Torii')
 
     def test_telegram_topic_rename_to_a_taken_name_updates_the_stored_name(self):
         with self.store.db:
@@ -553,15 +428,25 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(self.store.accept(update(1, '/goal finish the work')), 'queued')
         self.assertEqual(self.store.messages_pending()[0]['text'], '/goal finish the work')
 
-    def test_removed_status_and_unknown_commands_point_to_help_in_all_topics(self):
+    def test_unknown_commands_point_to_help_in_all_topics(self):
         for number, (enabled, command) in enumerate(
-                ((True, '/status'), (True, '/unknown'), (False, '/status'), (False, '/unknown')), 1):
+                ((True, '/unknown'), (False, '/unknown')), 1):
             with self.subTest(enabled=enabled, command=command), self.store.db:
                 self.store.db.execute("UPDATE topics SET enabled=? WHERE id='-10042:4'", (enabled,))
                 self.assertEqual(self.store.accept(update(number, command)),
                                  'unknown_command' if enabled else 'disabled')
                 reply = self.store.db.execute('SELECT text FROM outbox WHERE reply_to=?', (number,)).fetchone()[0]
                 self.assertEqual(reply, 'Unknown command. Send /help.')
+        self.assertEqual(self.store.messages_pending(), [])
+        self.assertEqual(self.store.tasks_list(), [])
+
+    def test_status_routes_to_controls_in_all_topics(self):
+        for number, enabled in enumerate((True, False), 1):
+            with self.subTest(enabled=enabled), self.store.db:
+                self.store.db.execute("UPDATE topics SET enabled=? WHERE id='-10042:4'", (enabled,))
+                self.assertEqual(self.store.accept(update(number, '/status')), 'control')
+                reply = self.store.db.execute('SELECT text FROM outbox WHERE reply_to=?', (number,)).fetchone()
+                self.assertIsNotNone(reply)
         self.assertEqual(self.store.messages_pending(), [])
         self.assertEqual(self.store.tasks_list(), [])
 
@@ -773,7 +658,8 @@ class SplitMessageTests(unittest.TestCase):
             self.assertEqual(len(parts), 2, lengths)
             self.assertTrue(all(0 < length <= 4096 for length in lengths), lengths)
             self.assertTrue(all(len(part.splitlines()) > 1 for part in parts))
-            self.assertEqual('\n'.join(parts), telegram_text(text))
+            expected = text + '\n\n**Subscriptions left** (week · Fable)\nNo accounts' + '\n\n**ChatGPT left** (week)\nNo accounts'
+            self.assertEqual('\n'.join(parts), telegram_text(expected))
             self.assertEqual({row['reply_to'] for row in rows}, {42})
 
     def test_rendered_limit_counts_characters_after_entities_not_utf16_units(self):

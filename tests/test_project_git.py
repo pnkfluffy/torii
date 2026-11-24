@@ -291,6 +291,9 @@ class ProjectGitTests(unittest.TestCase):
             self.hook(template / 'hooks', name, 'echo template-hook-ran > "' +
                       str(self.root / name) + '"\nexit 1')
         self.git('config', '--global', 'init.templateDir', str(template))
+        self.git('init', '-q', str(self.root / 'probe'))
+        if not (self.root / 'probe' / '.git' / 'hooks' / 'pre-commit').is_file():
+            self.skipTest('this git ignores init.templateDir, for example through GIT_TEMPLATE_DIR in a wrapper')
         self.store.accept(group_update(1, '/setup new Website'))
         self.assert_linked()
         for name in ('pre-commit', 'prepare-commit-msg', 'commit-msg', 'post-commit'):
@@ -320,10 +323,10 @@ class ProjectGitTests(unittest.TestCase):
         self.assertIsNone(self.store.get('projects_root'))
 
     def test_commit_failure_logs_git_stderr(self):
-        with self.assertLogs('coordinator.onboarding', level='ERROR') as logs:
+        with self.assertLogs('coordinator.problems', level='ERROR') as logs:
             with self.fail_commit():
                 op_setup_new(self.store, None, topic='-10042:10', name='Website')
-        self.assertIn('fatal: synthetic commit failure\nDetails', '\n'.join(logs.output))
+        self.assertIn('fatal: synthetic commit failure', '\n'.join(logs.output))
 
     def test_commit_failure_api_reports_failure(self):
         with self.fail_commit():

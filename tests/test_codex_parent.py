@@ -23,6 +23,9 @@ from tests.support import expected_codex_skills_pointer, isolate_shared_mcp_home
 
 APP_SERVER = '''#!/usr/bin/env python3
 import json,os,sys,time,uuid
+if sys.argv[1:]==['mcp','list','--json']:
+    print('[]')
+    sys.exit(0)
 from pathlib import Path
 root=Path(__file__).parent
 home=Path(os.environ['CODEX_HOME'])
@@ -54,6 +57,7 @@ for line in sys.stdin:
             continue
         thread=params.get('threadId') or str(uuid.uuid4())
         path=home/'sessions'/('rollout-test-'+thread+'.jsonl')
+        assert path.resolve().is_relative_to(root.resolve())
         path.parent.mkdir(parents=True,exist_ok=True)
         path.touch(exist_ok=True)
         emit({'method':'thread/started','params':{'thread':{'id':thread}}})
@@ -122,6 +126,17 @@ for line in sys.stdin:
 
 
 class CodexParentTests(unittest.IsolatedAsyncioTestCase):
+    async def test_shared_home_replaces_an_inherited_codex_home(self):
+        root = self.root / 'other-fixture'
+        root.mkdir()
+        fixture = unittest.TestCase()
+        with patch.dict(os.environ, {'CODEX_HOME': str(self.root / 'outside')}):
+            try:
+                isolate_shared_mcp_home(fixture, root)
+                self.assertEqual(Path(os.environ['CODEX_HOME']), root / 'shared_mcp-home' / '.codex')
+            finally:
+                fixture.doCleanups()
+
     async def test_a2_parent_skills_paths_match_each_launch_environment(self):
         other = self.root / 'account Y'
         other.mkdir()
@@ -157,21 +172,18 @@ class CodexParentTests(unittest.IsolatedAsyncioTestCase):
         return expected_codex_skills_pointer(os.environ['HOME'], self.store.get('codex_accounts')[alias]['config_dir'])
 
     async def test_codex_skills_pointer_is_outside_this_chat_section(self):
-        from coordinator.policy import chat_policy
-        self.store.put('coordinator_delegation', {'text': 'Research to Sol.\nUI to Claude.', 'revision': 1})
+        from coordinator.policy import chat_policy, personal_path
+        personal_path(self.store).write_text('- Research to Sol.\n- UI to Claude.\n')
         session = await self.start()
         requests = read_jsonl(self.root / 'requests')
         prompt = next(row['params']['developerInstructions'] for row in requests if row.get('method') == 'thread/start')
-        sections = prompt.split('\n## ')
-        chat = next(section for section in sections if section.startswith('This chat\n'))
-        self.assertIn('Research to Sol.\nUI to Claude.', chat)
-        self.assertNotIn(self.skills_pointer(), chat)
+        self.assertIn('- Research to Sol.\n- UI to Claude.', prompt)
         self.assertEqual(prompt.count(self.skills_pointer()), 1)
+        self.assertLess(prompt.index('UI to Claude.'), prompt.index(self.skills_pointer()))
         self.assertEqual(session.usage_policy, chat_policy(self.store, 'coordinator'))
 
     async def test_codex_skills_pointer_ends_all_launch_prompts(self):
-        baseline = '370f8625e13e9103bd0f20b3ed2ea3a7d1799a130732c33b4c65df0515a3d53b'
-        (self.store.directory / 'USAGE.md').write_text('Fixture usage.\n')
+        baseline = 'dc8f3171d9d920a318a7541f3e2c9ea0de42b2de249ccb131c578b04b5f4b6ac'
         session = await self.start()
         await session.stop()
         (self.root / 'reject-resume').touch()
@@ -184,9 +196,7 @@ class CodexParentTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreaterEqual(len(starts), 2)
 
     async def test_d3_chat_policy_in_codex_developer_instructions_and_sibling_default(self):
-        from coordinator.policy import chat_policy, usage_policy
-        self.store.put('coordinator_delegation', {'text': 'Home text.', 'revision': 1})
-        self.store.put('coordinator:sibling_delegation', {'text': 'Sibling text.', 'revision': 1})
+        from coordinator.policy import chat_policy
         session = await self.start()
         starts = [row for row in read_jsonl(self.root / 'requests') if row.get('method') == 'thread/start']
         self.assertEqual(starts[-1]['params']['developerInstructions'],
@@ -199,7 +209,7 @@ class CodexParentTests(unittest.IsolatedAsyncioTestCase):
                                                            'policy', topic='plain', receipt_timeout=1)
         starts = [row for row in read_jsonl(self.root / 'requests') if row.get('method') == 'thread/start']
         self.assertEqual(starts[-1]['params']['developerInstructions'],
-                         'policy\nCurrent usage policy:\n' + usage_policy(self.store.directory) + '\n## Codex skills\n\n' + self.skills_pointer())
+                         'policy\nCurrent usage policy:\n' + chat_policy(self.store, 'coordinator:plain') + '\n## Codex skills\n\n' + self.skills_pointer())
 
     def expected_parent_overrides(self, effort='medium'):
         values = {'model_reasoning_effort': effort, 'mcp_servers.torii.command': sys.executable,
@@ -214,7 +224,7 @@ class CodexParentTests(unittest.IsolatedAsyncioTestCase):
 
     def expected_parent_fingerprint(self, effort='medium'):
         content = {'tools': tools_hash(), 'model': 'test-codex', 'effort': effort,
-                   'instructions': 'policy\nCurrent usage policy:\n' + (self.store.directory / 'USAGE.md').read_text() + '\n## Codex skills\n\n' + self.skills_pointer(),
+                   'instructions': 'policy\n## Codex skills\n\n' + self.skills_pointer(),
                    'overrides': self.expected_parent_overrides(effort), 'binary': str(self.binary),
                    'cli': identity(str(self.binary), PACKAGES['codex'])}
         return hashlib.sha256(json.dumps(content, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
@@ -225,15 +235,75 @@ class CodexParentTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(json.dumps(read_jsonl(self.root / 'launches')[0]).encode(), json.dumps(expected).encode())
         self.assertEqual(self.store.get('coordinator_host')['fingerprint'], self.expected_parent_fingerprint())
 
+    async def test_parent_chat_mcp_header_is_private_and_scrubbed(self):
+        from coordinator.shared_mcp import codex_launch
+        value = 'DUMMY-CODEX-PARENT-HEADER'
+        entry = {'type': 'http', 'url': 'https://example.invalid/personal', 'headers': {'Authorization': value}}
+        (Path.home() / '.claude.json').write_text(json.dumps({'mcpServers': {'personal': entry}}))
+        self.store.put('chat_config:home', {'mcp_servers': ['personal']})
+        _, private = codex_launch({'personal': entry})
+        variable = next(iter(private))
+        self.binary.write_text(APP_SERVER.replace('root=Path(__file__).parent\n',
+            'root=Path(__file__).parent\nprint(os.environ[%r],file=sys.stderr,flush=True)\n' % variable))
+        session = await self.start()
+        host = session.process.directory
+        spec = json.loads((host / 'spec.json').read_text())
+        self.assertIn('env_http_headers', json.dumps(spec['argv']))
+        self.assertNotIn(value, json.dumps(spec))
+        self.assertNotIn(variable, spec['env'])
+        for path in host.iterdir():
+            if path.is_file():
+                self.assertNotIn(value, path.read_text(errors='replace'))
+
+    async def test_parent_keeps_native_codex_servers_and_adds_the_chat_ones(self):
+        entry = {'type': 'http', 'url': 'https://example.invalid/mcp', 'headers': {}}
+        (Path.home() / '.claude.json').write_text(json.dumps({'mcpServers': {'personal': entry, 'work': entry}}))
+        self.store.put('chat_config:home', {'mcp_servers': ['personal', 'work']})
+        with patch('coordinator.codex_session.codex_inherited', AsyncMock(return_value={'native', 'personal'})):
+            session = await self.start()
+        argv = json.loads((session.process.directory / 'spec.json').read_text())['argv']
+        servers = next(argv[index + 1] for index, item in enumerate(argv[:-1])
+                       if item == '-c' and argv[index + 1].startswith('mcp_servers='))
+        self.assertIn('work', servers)
+        self.assertNotIn('personal', servers)
+        self.assertNotIn('native', servers)
+        self.assertNotIn('enabled', json.dumps(argv))
+
+    def test_parent_overrides_follow_plugin_chats(self):
+        base = self.expected_parent_overrides()
+        self.assertEqual(CodexCoordinatorSession.overrides(self.store, topic='home'), base)
+        self.store.put('plugin_chats', {'pstack@pstack-claude': ['home'], 'other@market': ['elsewhere']})
+        self.assertEqual(CodexCoordinatorSession.overrides(self.store, topic='home'),
+                         base + ['-c', 'plugins.pstack@pstack-claude.enabled=true',
+                                 '-c', 'plugins.other@market.enabled=false'])
+
+    async def test_plugin_off_chat_launches_without_pstack_and_relaunches_on_change(self):
+        session = await self.start()
+        original = self.store.get('coordinator_host')['fingerprint']
+        self.assertEqual(original, self.expected_parent_fingerprint())
+        await session.detach()
+        self.store.put('plugin_chats', {'pstack@pstack-claude': ['elsewhere']})
+        session = await self.start()
+        self.assertTrue(session.outdated)
+        await settle(session.wait_closed())
+        session = await self.start()
+        self.assertEqual(read_jsonl(self.root / 'launches')[-1], self.expected_parent_overrides() + [
+            '-c', 'plugins.pstack@pstack-claude.enabled=false', 'app-server', '--listen', 'stdio://'])
+        request = [item for item in read_jsonl(self.root / 'requests')
+                   if item.get('method') in ('thread/start', 'thread/resume')][-1]
+        note = request['params']['developerInstructions'].split('\n## Codex skills\n\n')[1]
+        self.assertEqual(note, self.skills_pointer().replace('For pstack, <source>/<plugin> is pstack-claude/pstack. ', ''))
+        self.assertNotEqual(self.store.get('coordinator_host')['fingerprint'], original)
+
     async def test_parent_gets_full_coordinators_usage_section(self):
-        policy = 'Shared.\n## Coordinators\nOwner only.\n## Effort\nKeep.\n'
-        (self.store.directory / 'USAGE.md').write_text(policy)
+        from coordinator.policy import personal_path
+        policy = '- Shared.\n## Coordinators\n- Owner only.\n## Effort\n- Keep.'
+        personal_path(self.store).write_text(policy + '\n')
         await self.start()
         request = next(item for item in read_jsonl(self.root / 'requests') if item.get('method') == 'thread/start')
         self.assertEqual(request['params']['developerInstructions'], 'policy\nCurrent usage policy:\n' + policy + '\n## Codex skills\n\n' + self.skills_pointer())
 
     async def test_codex_skills_fingerprint_includes_absolute_note(self):
-        (self.store.directory / 'USAGE.md').write_text('Fixture usage.\n')
         launch = AsyncMock(return_value=False)
         with patch('coordinator.codex_session.codex_binary', return_value='/fixture/codex'), \
                 patch.object(CodexCoordinatorSession, 'overrides', return_value=['-c', 'fixture=true']), \
@@ -242,15 +312,13 @@ class CodexParentTests(unittest.IsolatedAsyncioTestCase):
                 patch('coordinator.parent_state.launch', launch):
             await self.start()
         expected = {'tools': 'fixture-tools', 'model': 'test-codex', 'effort': 'medium',
-            'instructions': 'policy\nCurrent usage policy:\nFixture usage.\n\n## Codex skills\n\n' + self.skills_pointer(),
+            'instructions': 'policy\n## Codex skills\n\n' + self.skills_pointer(),
             'overrides': ['-c', 'fixture=true'], 'binary': '/fixture/codex', 'cli': 'fixture-cli'}
         self.assertEqual(launch.await_args.args[2], hashlib.sha256(json.dumps(
             expected, sort_keys=True, separators=(',', ':')).encode()).hexdigest())
 
-    async def test_codex_skills_parent_launch_matches_origin_main(self):
-        """Switch-on launch captured from origin/main at d5d0a00eb9dd42547135705bb88dca995b8e5c0b."""
+    async def test_codex_skills_parent_launch_matches_fixture(self):
         self.store.put('codex_parent_effort', 'max')
-        (self.store.directory / 'USAGE.md').write_text('Fixture usage.\n')
         session = await self.start()
         try:
             command = json.dumps(read_jsonl(self.root / 'launches')[-1])
@@ -261,7 +329,7 @@ class CodexParentTests(unittest.IsolatedAsyncioTestCase):
             requests = read_jsonl(self.root / 'requests')
             prompt = [item['params']['developerInstructions'] for item in requests
                       if item.get('method') in ('thread/start', 'thread/resume')][-1]
-            self.assertEqual(hashlib.sha256(json.dumps(prompt.replace(self.skills_pointer(), CODEX_SKILLS_POINTER)).encode()).hexdigest(), '370f8625e13e9103bd0f20b3ed2ea3a7d1799a130732c33b4c65df0515a3d53b')
+            self.assertEqual(hashlib.sha256(json.dumps(prompt.replace(self.skills_pointer(), CODEX_SKILLS_POINTER)).encode()).hexdigest(), 'dc8f3171d9d920a318a7541f3e2c9ea0de42b2de249ccb131c578b04b5f4b6ac')
             self.assertEqual(prompt.count(self.skills_pointer()), 1)
             self.assertTrue(prompt.endswith('\n## Codex skills\n\n' + self.skills_pointer()))
             self.assertEqual(self.store.get('coordinator_host')['fingerprint'], self.expected_parent_fingerprint('xhigh'))
@@ -317,6 +385,23 @@ class CodexParentTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(request['params']['threadId'], sid)
         self.assertTrue(request['params']['developerInstructions'].endswith(self.skills_pointer()))
 
+    async def test_rule_file_edit_keeps_codex_launch_fingerprint(self):
+        from coordinator.policy import personal_path
+        session = await self.start()
+        host = session.host_id
+        fingerprint = self.store.get('coordinator_host')['fingerprint']
+        await session.detach()
+        personal_path(self.store).write_text('# Personal\n- Updated rule\n')
+        session = await self.start()
+        self.assertFalse(session.outdated)
+        self.assertEqual(session.host_id, host)
+        self.assertEqual(self.store.get('coordinator_host')['fingerprint'], fingerprint)
+        from coordinator.service import Service
+        row = self.store.message_save('home', 'owner', 'next')
+        with patch.object(session, 'send', new_callable=AsyncMock, return_value='received') as send:
+            await Service(self.store, None, self.runner, self.root)._send_message(row, 'next', session)
+        self.assertIn('Updated rule', send.await_args.args[1])
+
     async def test_eligible_account_keeps_the_same_parent(self):
         session = await self.start()
         sid, host, pid = session.session_id, session.host_id, session.process.pid
@@ -329,6 +414,24 @@ class CodexParentTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(session.closed)
         self.assertEqual((session.session_id, session.host_id, session.process.pid), (sid, host, pid))
         self.assertEqual(self.store.get('coordinator_host')['fingerprint'], fingerprint)
+
+    async def test_funded_parent_runs_multiple_turns_at_weekly_limit_with_one_home_notice(self):
+        self.store.put('codex_auto_switch', True)
+        status = self.store.get('codex_account_status')
+        status['gpt'].update(usage_allowed=False, observed_at=time.time(),
+                             credits={'has_credits': True, 'balance': '22849', 'unlimited': False},
+                             usage={'seven_day': {'utilization': 100, 'resets_at': time.time() + 86400}})
+        self.store.put('codex_account_status', status)
+        session = await self.start()
+        for number in (1, 2):
+            self.assertEqual((await self.send('work'))[1], 'received')
+            await until(lambda: len(self.turns) == number)
+            self.assertFalse(session.movable())
+        from coordinator.codex_accounts import CodexBroker
+        CodexBroker(self.store).notify_credit_use('gpt')
+        notices = self.store.db.execute("SELECT topic,text FROM outbox WHERE text LIKE '%now runs on credits.%'").fetchall()
+        self.assertEqual([tuple(row) for row in notices], [
+            ('home', 'ChatGPT weekly limits are used; ChatGPT work now runs on credits.')])
 
     async def test_signed_out_accounts_without_a_host_cannot_start(self):
         self.store.put('codex_account_status', {'gpt': {
@@ -404,9 +507,11 @@ class CodexParentTests(unittest.IsolatedAsyncioTestCase):
 
     async def asyncSetUp(self):
         self.temp = tempfile.TemporaryDirectory()
-        self.root = Path(self.temp.name)
+        self.root = Path(self.temp.name).resolve()
         self.addCleanup(self.temp.cleanup)
         isolate_shared_mcp_home(self, self.root)
+        from tests.support import fake_codex_hook_trust
+        fake_codex_hook_trust(self)
         self.addCleanup(stop_test_hosts, self.root)
         self.binary = self.root / 'codex'
         self.binary.write_text(APP_SERVER)
@@ -486,9 +591,8 @@ class CodexParentTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sum(request.get('method') == 'turn/start' for request in requests), 2)
         self.assertEqual(codex_transcript_receipts(session.transcript_path, [row['id']]), {row['id']})
 
-    def assert_queued_reply_cursor(self, tool_reply=False, previous_host=None, batching=True, persisted=False):
+    def assert_queued_reply_cursor(self, tool_reply=False, previous_host=None):
         from coordinator import parent_replies, reactions
-        self.store.put('coordinator_intake_batching', batching)
         session = CodexCoordinatorSession(self.store, self.runner, None, 1, 'coordinator')
         session.host_id = 'queued-host'
         previous = CodexCoordinatorSession(self.store, self.runner, None, 1, 'coordinator')
@@ -496,10 +600,7 @@ class CodexParentTests(unittest.IsolatedAsyncioTestCase):
         owners = [self.store.message_save('home', 'owner', text, telegram_message=number)
                   for number, text in ((701, 'Previous owner'), (702, 'Queued owner'))]
         for row in owners:
-            if persisted and row['id'] == owners[1]['id']:
-                self.assertTrue(self.store.message_batch_sending([row['id']]))
-            else:
-                self.store.message_sending(row['id'])
+            self.store.message_sending(row['id'])
             with self.store.db:
                 reactions.handed_off(self.store, row['id'])
             self.store.messages_confirm([row['id']], 'replayed')
@@ -510,14 +611,14 @@ class CodexParentTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreater(len(previous_outputs), 1)
         if tool_reply:
             with self.store.db:
-                self.store.enqueue_report('home', 'Owner-directed tool answer', reply_to=702)
+                self.store.enqueue_report('home', 'Owner-directed tool answer', reply_to=702, sender='home')
         session._reply_started('new-turn', cursor, {owners[1]['id']})
         session._reply_started('new-turn', rows={owners[1]['id']})
         parent_replies.completed(session, 'new-turn', {owners[1]['id']}, 'Next owner answer')
         output = [dict(row) for row in self.store.db.execute('SELECT * FROM outbox WHERE reply_to=702 ORDER BY id')]
         if tool_reply:
             self.assertEqual([row['text'] for row in output], ['Owner-directed tool answer'])
-        elif previous_host is not None or not batching and not persisted:
+        elif previous_host is not None:
             self.assertEqual(output, [])
         else:
             self.assertEqual([row['text'] for row in output], ['Next owner answer'])
@@ -530,12 +631,6 @@ class CodexParentTests(unittest.IsolatedAsyncioTestCase):
 
     def test_queued_native_start_does_not_ignore_another_hosts_output(self):
         self.assert_queued_reply_cursor(previous_host='another-host')
-
-    def test_legacy_native_start_keeps_fifo_reply_guard_while_batching_is_off(self):
-        self.assert_queued_reply_cursor(batching=False)
-
-    def test_saved_batch_native_start_corrects_reply_cursor_while_batching_is_off(self):
-        self.assert_queued_reply_cursor(batching=False, persisted=True)
 
     async def test_batch_reattach_keeps_every_owner_on_the_same_native_turn(self):
         session = await self.start()
@@ -851,7 +946,7 @@ class CodexParentTests(unittest.IsolatedAsyncioTestCase):
         self.store.put('owner', 1)
         self.store.put('group', 1)
         self.store.put('mode', 'group')
-        self.store.put('codex_auto_switch', True)
+        self.store.put('codex_auto_switch', False)
         service = Service(self.store, FakeTelegram(), self.runner, self.root)
         self.session = await service.start_session('home')
         self.assertEqual(self.session.provider, 'codex')

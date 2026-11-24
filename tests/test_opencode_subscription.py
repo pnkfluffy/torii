@@ -37,9 +37,9 @@ class OpenCodeSubscriptionTests(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(stop_test_hosts, self.root)
         self.home = self.root / 'home'
         self.home.mkdir()
-        for target, value in (('coordinator.providers.platform', 'linux'),
+        for target, value in (('coordinator.host_os.uses_worker_coalitions', lambda: False),
                               ('coordinator.opencode_runtime.managed_preference_paths', ())):
-            handle = patch(target, value) if isinstance(value, str) else patch(target, return_value=value)
+            handle = patch(target, value) if callable(value) else patch(target, return_value=value)
             handle.start()
             self.addCleanup(handle.stop)
         environment = patch.dict(os.environ, HOME=str(self.home))
@@ -118,6 +118,11 @@ class OpenCodeSubscriptionTests(unittest.IsolatedAsyncioTestCase):
         with self.store.db:
             return control_api.call(self.store, operation, params, topic='1:2' if operation.startswith('workers.') else None)
 
+    def account_views(self):
+        return (self.call('health.show').text, self.call('accounts.list').text,
+                self.call('account.show', alias='go').text, control_ui._accounts_view(self.store, 0)[0],
+                control_ui._account_view(self.store, 'go')[0])
+
     def usage_payload(self, limited=False, reset=True):
         when = datetime.fromtimestamp(time.time() + 3600, timezone.utc).isoformat() if reset else None
         return {'usage': {name: {'status': 'rate-limited' if limited else 'ok',
@@ -174,15 +179,37 @@ class OpenCodeSubscriptionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(config.read_bytes(), golden.read_bytes())
 
     async def test_t3_refresh_path_and_every_account_view_show_three_meters(self):
-        self.assertFalse(await opencode_subscription.refresh_accounts(self.store))
+        now = int(time.time())
+        for name, hours in (('rolling', 168), ('weekly', 115), ('monthly', 240)):
+            self.payload['usage'][name]['resetsAt'] = datetime.fromtimestamp(now + hours * 3600, timezone.utc).isoformat()
+        with patch('time.time', return_value=now):
+            self.assertFalse(await opencode_subscription.refresh_accounts(self.store))
+            views = self.account_views()
         self.assertEqual(self.requests, [('/usage', 'Bearer offline-go-placeholder')])
-        views = [self.call('accounts.list').text, self.call('account.show', alias='go').text,
-                 control_ui._accounts_view(self.store, 0)[0], control_ui._account_view(self.store, 'go')[0]]
+        section = '**OpenCode** (left: 5-hour · week · month)\n🟢 go: 90% · 80% · 70%, week resets in 4d 19h'
         for text in views:
-            for label, left in (('5-hour', 90), ('weekly', 80), ('monthly', 70)):
-                self.assertIn('%s: %d%% left; resets ' % (label, left), text)
-            self.assertEqual(text.count(' UTC'), 3)
+            self.assertIn(section, text)
+            self.assertEqual(text.count(' resets in '), 1)
             self.assertNotIn('offline-go-placeholder', text)
+
+    async def test_limited_account_rows_show_when_the_account_can_resume(self):
+        now = int(time.time())
+        with patch('time.time', return_value=now):
+            self.payload = self.usage_payload()
+            reset = datetime.fromtimestamp(now + 7200, timezone.utc).isoformat()
+            self.payload['usage']['monthly'].update(status='rate-limited', percent=100, resetsAt=reset)
+            self.assertFalse(await opencode_subscription.refresh_accounts(self.store))
+            for text in self.account_views():
+                self.assertIn('🔴 go: 90% · 80% · 0%, back in 2h 0m', text)
+                self.assertNotIn(' resets in ', text)
+
+    def test_account_error_rows_keep_the_error_message(self):
+        for error, detail in opencode_subscription.ERRORS.items():
+            with self.subTest(error=error):
+                self.store.put('opencode_account_status', {'go': {'observed_at': time.time(), 'error': error}})
+                state = 'usage unavailable' if error == 'usage_unavailable' else 'signed out'
+                for text in self.account_views():
+                    self.assertIn(f'⚪ go: {state}\n{detail}', text)
 
     async def test_u1_usage_request_sends_opencode_user_agent_and_existing_headers(self):
         self.assertFalse(await opencode_subscription.refresh_accounts(self.store))
@@ -443,25 +470,26 @@ class OpenCodeSubscriptionTests(unittest.IsolatedAsyncioTestCase):
         self.requests.clear()
         self.assertFalse(await opencode_subscription.refresh_accounts(self.store))
         self.assertEqual(self.requests, [])
-        for text in (self.call('accounts.list').text, self.call('account.show', alias='go').text,
-                     control_ui._accounts_view(self.store, 0)[0]):
-            self.assertNotIn('% left', text)
+        for text in (self.call('health.show').text, self.call('accounts.list').text,
+                     self.call('account.show', alias='go').text, control_ui._accounts_view(self.store, 0)[0]):
+            self.assertNotIn('**OpenCode**', text)
             self.assertNotIn('OpenCode subscription', text)
         self.assertFalse(self.call('workers.spawn', task=self.task['id'], provider='opencode', prompt='test').ok)
         result = await self.runner.run('opencode', 'test', self.cwd, None, fresh=True, worker_id=31)
         self.assertFalse(result.success)
         self.assertEqual(self.calls(), [])
-        self.assertFalse(await self.pool.broker('opencode').ready('go'))
+        self.assertFalse(await self.pool.broker('opencode').ready({'account_alias': 'go', 'id': None}))
         self.assertEqual(self.requests, [])
 
-    def test_subscription_account_is_shown_without_its_alias_and_generic_accounts_keep_names(self):
+    def test_subscription_account_row_shows_alias_and_generic_accounts_keep_names(self):
         self.assertTrue(self.call('opencode.account', alias='other', **GENERIC).ok)
         text, rows = control_ui._accounts_view(self.store, 0)
         self.assertEqual([action for row in rows for label, action in row if label == 'OpenCode subscription'],
                          [{'view': 'account:go'}])
         card = control_ui._account_view(self.store, 'go')[0]
-        self.assertEqual(card.splitlines()[0], 'OpenCode subscription')
-        self.assertIn('\nOpenCode subscription\n', text)
+        self.assertEqual(card, '**OpenCode** (left: 5-hour · week · month)\n⚪ go: usage unavailable\n'
+                               'Usage has not been checked yet.')
+        self.assertIn(card, text)
         self.assertNotIn('go (OpenCode subscription)', text)
         self.assertEqual(self.call('opencode.use', alias='go').text, 'OpenCode subscription selected for new work.')
         self.assertEqual(self.call('opencode.account', alias='go', provider='opencode-go', model='example-model').text,
@@ -628,7 +656,7 @@ class OpenCodeSubscriptionTests(unittest.IsolatedAsyncioTestCase):
         block = self.store.get('opencode_account_blocks')['go']
         self.assertLessEqual(block['until'], time.time() + 32 * 86400)
         self.assertGreaterEqual(block['until'], before + 32 * 86400)
-        self.assertIn('Paused until', control_ui._accounts_view(self.store, 0)[0])
+        self.assertIn('🔴 go: 90% · 80% · 70%, back in ', control_ui._accounts_view(self.store, 0)[0])
         self.assertLessEqual(opencode_subscription.retry_at({'responseHeaders': {
             'retry-after': 'Fri, 01 Jan 9999 00:00:00 GMT'}}), time.time() + 32 * 86400)
         self.payload = self.usage_payload(limited=True)
@@ -637,7 +665,7 @@ class OpenCodeSubscriptionTests(unittest.IsolatedAsyncioTestCase):
         await opencode_subscription.refresh_accounts(self.store)
         for window in self.store.get('opencode_account_status')['go']['usage'].values():
             self.assertLessEqual(window['resets_at'], time.time() + 32 * 86400)
-        self.assertIn('Paused until', control_ui._accounts_view(self.store, 0)[0])
+        self.assertIn('🔴 go: 0% · 0% · 0%, back in ', control_ui._accounts_view(self.store, 0)[0])
 
     def test_tf7_oversized_key_is_rejected_at_setup(self):
         from coordinator.opencode_accounts import check_key
@@ -652,14 +680,14 @@ class OpenCodeSubscriptionTests(unittest.IsolatedAsyncioTestCase):
         self.store.put('opencode_account_blocks', {'go': {
             'until': now - 1, 'observed_at': now - 60, 'reason': 'quota', 'reset_known': True}})
         count = len(self.requests)
-        self.assertFalse(await self.pool.broker('opencode').ready('go'))
+        self.assertFalse(await self.pool.broker('opencode').ready({'account_alias': 'go', 'id': None}))
         self.assertEqual(len(self.requests), count)
         old = dict(self.store.get('opencode_account_status')['go'], observed_at=now - 2)
         with patch.object(opencode_subscription, 'collect_status', return_value=old):
             await opencode_subscription.refresh_accounts(self.store)
-        self.assertFalse(await self.pool.broker('opencode').ready('go'))
+        self.assertFalse(await self.pool.broker('opencode').ready({'account_alias': 'go', 'id': None}))
         await opencode_subscription.refresh_accounts(self.store)
-        self.assertTrue(await self.pool.broker('opencode').ready('go'))
+        self.assertTrue(await self.pool.broker('opencode').ready({'account_alias': 'go', 'id': None}))
 
     async def test_subscription_monitor_schedule_owner_request_due_hold_and_gates(self):
         from types import SimpleNamespace

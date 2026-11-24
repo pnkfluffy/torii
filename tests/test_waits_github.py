@@ -35,7 +35,6 @@ def pull_request(number=12, state='OPEN', checks='PENDING', auto_merge=False):
 class WaitGithubTests(WaitReviewSupport, unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         await super().asyncSetUp()
-        self.store.put('waits_enabled', True)
         self.now = 10000
         self.responses = {12: pull_request()}
         self.github = AsyncMock(side_effect=self.github_reply)
@@ -165,6 +164,16 @@ class WaitGithubTests(WaitReviewSupport, unittest.IsolatedAsyncioTestCase):
         proof = self.store.wait_get(wait['id'])['detail']['proof']
         self.assertEqual((proof['url'], proof['mergeCommit']['oid']), (PR, SHA))
 
+    async def test_verified_merge_close_gets_no_finish_reminder(self):
+        task = self.job()
+        self.store.task_update(task['id'], finish='merged')
+        task, wait = self.arm_pr(task, until='merged')
+        self.responses[12] = pull_request(state='MERGED')
+        await self.poll()
+        self.assertEqual(self.store.task_get(task['id'])['status'], 'done')
+        self.assertEqual(self.service.jobs.finish_reminders(TOPIC), 0)
+        self.assertFalse(any('reached its finish stage' in row['text'] for row in self.callbacks()))
+
     async def test_merged_live_finish_stamps_and_arms_declared_followup(self):
         task = self.job()
         self.store.task_update(task['id'], finish='live')
@@ -210,6 +219,9 @@ class WaitGithubTests(WaitReviewSupport, unittest.IsolatedAsyncioTestCase):
         await self.poll()
         pending = self.store.wait_get(wait['id'])
         self.assertEqual((pending['state'], pending['next_check']), ('armed', self.now + 900))
+        [row] = self.store.db.execute("SELECT area,code,detail FROM problems WHERE code='github-poll-failed'").fetchall()
+        self.assertEqual(row['area'], 'waits')
+        self.assertRegex(row['detail'], r'^item=\S+ failures=1 RuntimeError: Fixture GitHub failure at ')
         await self.poll(self.now + 899)
         self.assertEqual(self.github.await_count, 1)
         self.assertEqual(self.store.task_get(task['id'])['status'], 'waiting')
@@ -270,24 +282,6 @@ class WaitGithubTests(WaitReviewSupport, unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(self.store.wait_get(wait['id'])['next_check'], self.now + 900)
                 self.now += 900
         self.assertEqual(self.store.task_get(task['id'])['status'], 'waiting')
-
-    async def test_switch_off_makes_no_calls_no_update_work_no_signals(self):
-        task, pr = self.arm_pr()
-        update = self.wait(self.job('Update'), kind='torii_update', commit=SHA)
-        signal = self.wait(self.job('Signal'), kind='signal', signal='service.started')
-        self.store.put('waits_enabled', False)
-        before = [tuple(row) for row in self.store.db.execute('SELECT * FROM waits ORDER BY id')]
-        with patch('coordinator.updates.git') as git:
-            await self.poll()
-            await self.service.waits_started()
-            await self.service.updater.once()
-        result = control_api.call(self.store, 'pending.signal', {'name': 'service.started'})
-        self.assertFalse(result.ok)
-        self.assertEqual(result.text, "Waits aren't switched on yet.")
-        git.assert_not_called()
-        self.github.assert_not_awaited()
-        self.assertEqual([tuple(row) for row in self.store.db.execute('SELECT * FROM waits ORDER BY id')], before)
-        self.assertEqual(self.callbacks(), [])
 
     async def test_update_waits_fire_at_start_and_after_success_using_running_commit(self):
         self.service.updater.commit = RUNNING
@@ -415,21 +409,6 @@ class WaitGithubTests(WaitReviewSupport, unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.github.await_count, 2)
         self.assertEqual([self.store.wait_get(item['id'])['state'] for item in (a, b)], ['armed', 'armed'])
         self.assertTrue(all(call.args[0][:3] == ['gh', 'api', 'graphql'] for call in self.github.await_args_list))
-
-    async def test_disabling_while_github_is_running_discards_the_observation(self):
-        task, wait = self.arm_pr()
-        self.responses[12] = pull_request(state='MERGED')
-
-        async def disabled(argv, timeout):
-            result = await self.github_reply(argv, timeout)
-            self.store.put('waits_enabled', False)
-            return result
-
-        self.github.side_effect = disabled
-        await self.poll()
-        self.assertEqual(self.store.wait_get(wait['id'])['state'], 'armed')
-        self.assertEqual(self.store.task_get(task['id'])['status'], 'waiting')
-        self.assertEqual(self.callbacks(), [])
 
     async def test_incomplete_merge_proof_never_settles(self):
         task, wait = self.arm_pr(until='merged')
@@ -739,7 +718,7 @@ class WaitGithubTests(WaitReviewSupport, unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.store.wait_get(wait['id'])['state'], 'armed')
         self.assertEqual(self.callbacks(), [])
 
-    async def test_review_note1_shared_github_uses_account_home_fallback_and_respects_override(self):
+    async def test_shared_github_respects_home_and_existing_config_override(self):
         from coordinator import github
         self.github_patch.stop()
         for configured in (None, '/sample/gh-config'):
@@ -754,7 +733,7 @@ class WaitGithubTests(WaitReviewSupport, unittest.IsolatedAsyncioTestCase):
                         patch('coordinator.github.asyncio.create_subprocess_exec', new=AsyncMock(return_value=process)) as spawn:
                     await github.run_github(['gh', 'api', 'graphql'], 30)
                 actual = spawn.await_args.kwargs.get('env', {})
-                self.assertEqual(actual.get('GH_CONFIG_DIR'), configured or '/sample/account-home/.config/gh')
+                self.assertEqual(actual.get('GH_CONFIG_DIR'), configured)
                 self.assertEqual(actual.get('HOME'), '/sample/service-home')
 
     async def test_review_note2_update_hook_failure_records_problem_and_keeps_essential_loop_alive(self):
@@ -801,9 +780,28 @@ class WaitGithubTests(WaitReviewSupport, unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.text, 'Signal sample.deploy received. 1 wait fired.')
 
     async def test_review_docs_signal_describes_source_boundary(self):
-        text = (Path(__file__).resolve().parents[1] / 'docs/control-api.md').read_text()
+        text = (Path(__file__).resolve().parents[1] / 'README.md').read_text()
         self.assertIn('local CLI only, refused over MCP and from worker sources', ' '.join(text.split()))
         self.assertNotIn('workers cannot call it', text)
+
+    async def poll_waits_at(self, when):
+        with patch('coordinator.waits.time.time', return_value=when), patch('time.time', return_value=when):
+            await self.service.waits_once()
+
+    async def test_fifteen_minute_recheck_survives_an_outage(self):
+        task, wait = self.arm_pr()
+        self.github.side_effect = RuntimeError('Fixture GitHub outage')
+        for step in range(16):
+            await self.poll_waits_at(self.now + step * 900 + 1)
+        when = self.now + 16 * 900 + 1
+        calls = self.github.await_count
+        self.github.side_effect = self.github_reply
+        self.responses[12] = pull_request(checks='SUCCESS')
+        for step in range(4):
+            await self.poll_waits_at(when + step * 900)
+        self.assertEqual(calls, 16)
+        self.assertGreater(self.github.await_count, calls, 'no PR check in the hour after GitHub recovered')
+        self.assertEqual(self.store.wait_get(wait['id'])['state'], 'fired')
 
 
 if __name__ == '__main__':

@@ -20,7 +20,7 @@ from .extension import optional
 
 
 KEY = 'telegram_update_v1'
-OFF = ('Updates from Telegram are off. Turn them on in /accounts → Models & Codex, '
+OFF = ('Updates from Telegram are off. Ask the coordinator to turn them on, '
        'or run python3 -m coordinator ctl call service.updates enabled=true on the host.')
 TERMINAL = ('updated', 'failed', 'rolled_back', 'cancelled', 'current')
 WATCHED = ('armed', 'merge', 'tools', 'restart', 'rolling_back', 'rollback_restart', 'recovering')
@@ -240,8 +240,10 @@ def accept_reply(store, topic, message):
 def prepare(record):
     root = record['root']
     git(root, 'fetch', 'origin', 'main')
-    if git(root, 'rev-parse', 'origin/main') != record['target']:
-        raise RuntimeError('origin/main changed since this card. Run /update again. Nothing changed.')
+    try:
+        git(root, 'merge-base', '--is-ancestor', record['target'], 'origin/main')
+    except RuntimeError:
+        raise RuntimeError('origin/main no longer contains the offered commit. Run /update again. Nothing changed.') from None
     if checkout(root, record['target']) != record['old']:
         raise RuntimeError('Checkout changed since this card. Nothing changed.')
 
@@ -449,8 +451,6 @@ class Updater:
 
     async def waits_changed(self, started=False, armed=False):
         try:
-            if not self.store.get('waits_enabled', False):
-                return
             from .waits import update_landed
             record = self.store.get(KEY) or {}
             update = record.get('id') if record.get('phase') == 'updated' else None

@@ -1,11 +1,12 @@
 """Native CLI execution. History remains owned by the installed provider CLI."""
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import json
 import os
 from pathlib import Path
 import re
-from sys import platform
+import sqlite3
+import time
 from typing import Any, Optional
 import uuid
 
@@ -16,18 +17,49 @@ from .host import CleanupFailed, HostClient, HostDied, SessionBusy
 from .shared_mcp import write_config as write_shared_mcp_config
 from .shared_mcp import read_entries as read_shared_mcp_entries
 from .shared_mcp import extend_scrubber as scrub_shared_mcp_entries
+from .shared_mcp import codex_launch as codex_mcp_launch
+from .shared_mcp import codex_inherited, codex_selected
 from .native_protocol import NativeProtocol, RunControl, SecretDeliveryRefused
 from .scrub import Scrubber
 from . import extension
 from . import host_os
 from . import opencode_runtime
 from .acp_protocol import AcpProtocol
-from . import muse_accounts, muse_runtime
-from .msp_protocol import MspProtocol
 
 
 ADAPTERS = opencode_runtime.ADAPTERS.copy()
-WORKER_EXIT_GRACE = 5
+antigravity_accounts = extension.optional('antigravity_accounts')
+antigravity_runtime = extension.optional('antigravity_runtime')
+if antigravity_runtime is not None:
+    ADAPTERS['antigravity'] = antigravity_runtime.adapter
+LOCK_RETRY_SECONDS = 30
+
+
+async def retry_locked(function, *args, retry_store=None, **kwargs):
+    deadline = time.monotonic() + LOCK_RETRY_SECONDS
+    waited = False
+    operation = getattr(function, '__name__', type(function).__name__)
+    while True:
+        try:
+            result = function(*args, **kwargs)
+            if waited and retry_store is not None:
+                problems.record(retry_store, 'storage', 'db-locked', 'operation=' + operation, every=60)
+            return result
+        except sqlite3.OperationalError as error:
+            code = getattr(error, 'sqlite_errorcode', None)
+            if code is not None and code & 255 not in (5, 6):
+                raise
+            if 'locked' not in str(error).lower() and 'busy' not in str(error).lower():
+                raise
+            if retry_store is not None:
+                if retry_store.db.in_transaction:
+                    retry_store.db.rollback()
+                problems.lock_wait(retry_store, operation)
+                waited = True
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise
+            await asyncio.sleep(min(1, remaining))
 
 
 def codex_reasoning_effort(effort):
@@ -51,7 +83,6 @@ class RunResult:
     goal_status: Any = None
     managed: bool = False
     spend: Any = None
-    prompt_sent: bool = False
 
 
 def _scrub_result(result, scrub):
@@ -100,8 +131,7 @@ class ProviderRunner:
             directory.chmod(0o700)
 
     async def _external_writer(self, provider, session_id):
-        flags = ('-A', '-o') if host_os.linux() else ('-axo',)
-        process = await asyncio.create_subprocess_exec('ps', *flags, 'pid=,command=', stdout=asyncio.subprocess.PIPE)
+        process = await asyncio.create_subprocess_exec(*host_os.native_session_ps_command(), stdout=asyncio.subprocess.PIPE)
         output, _ = await process.communicate()
         if process.returncode:
             raise RuntimeError('Cannot inspect native session ownership')
@@ -111,7 +141,7 @@ class ProviderRunner:
                 return True
         return False
 
-    def _environment(self, provider, account_alias=None):
+    def _environment(self, provider, account_alias=None, model=None):
         if provider == 'codex':
             if self.codex_broker and account_alias:
                 return self.codex_broker.environment(account_alias)
@@ -119,7 +149,7 @@ class ProviderRunner:
         elif provider == 'claude':
             if not self.account_broker or not account_alias:
                 raise ValueError('Claude launch requires an account broker assignment')
-            return self.extension.environment(self.account_broker.environment(account_alias), account_alias)
+            return self.extension.environment(self.account_broker.environment(account_alias), account_alias, model)
         else:
             raise ValueError('Unknown provider')
 
@@ -176,26 +206,14 @@ class ProviderRunner:
                   control=None, on_session=None, initial_steer=None, host_id=None,
                   attach=False, last_seq=0, on_seq=None, secrets=None, on_host=None, on_problem=None,
                   goal=None, secret_names=(), current_goal=None, worker_id=None, on_cancel=None, stopped=None,
-                  goal_only=False, reload_secrets=None):
+                  goal_only=False, reload_secrets=None,
+                  plugins=None, topic=None):
         cwd = Path(cwd).resolve()
         acp_factory = ADAPTERS.get(provider)
-        if provider not in ('claude', 'codex') and ((acp_factory is None and provider != 'muse') or self.opencode_store is None):
+        if provider not in ('claude', 'codex') and (acp_factory is None or self.opencode_store is None):
             raise ValueError('Unknown provider')
-        if not attach and acp_factory is None and provider != 'muse' and provider not in self.binaries:
+        if not attach and acp_factory is None and provider not in self.binaries:
             raise ValueError('Unknown provider')
-        if provider == 'muse' and attach and host_id:
-            process = HostClient(self.state_dir / 'hosts' / host_id, on_problem=on_problem)
-            try:
-                await process.stop()
-                return RunResult(session_id, pid=process.child_pid,
-                                 log_path=str(process.directory / 'stderr.log'), failure_code='interrupted',
-                                 error='Muse was stopped after restart because fresh workers cannot reattach.')
-            finally:
-                process.detach()
-                if control is not None:
-                    control.close()
-                if on_cancel:
-                    on_cancel(None)
         if provider == 'codex' and model is None and self.codex_model is not None:
             model = self.codex_model()
         if session_id is not None:
@@ -228,10 +246,6 @@ class ProviderRunner:
         tasks = []
         input_task = None
         terminal = False
-        terminal_ready = asyncio.Event()
-        terminal_drained = False
-        job_store = getattr(self.account_broker, 'store', None) or getattr(self.codex_broker, 'store', None)
-        auto_finish = worker_id is not None and job_store is not None and job_store.get('auto_resume', False) is True
         provider_failed = False
         observed_id = None
         claude_prompt = None
@@ -240,8 +254,6 @@ class ProviderRunner:
         protocol = None
         acp_error = {}
         acp_adapter = acp_factory(problem, error=acp_error) if acp_factory is not None else None
-        if provider == 'muse':
-            acp_adapter = muse_runtime.adapter(problem, error=acp_error)
 
         def observe_session(sid):
             nonlocal observed_id
@@ -250,35 +262,31 @@ class ProviderRunner:
             if (session_id and sid != session_id) or (observed_id and sid != observed_id):
                 raise RuntimeError('Provider changed the native session ID; execution stopped')
             if not observed_id:
-                observed_id = sid
                 result.session_id = sid
                 if self.opencode_store is not None and worker_id is not None:
                     from .session_storage import home_for, remember
-                    remember(self.opencode_store, provider, sid, home_for(provider, spec.get('env') or {}),
+                    remember(self.opencode_store, provider, sid, home_for(provider, spec.get('env') or {}, spec.get('session_home')),
                              spec['cwd'], worker=worker_id, host=host_name, created=spec.get('fresh') is True)
                 if on_session:
                     on_session(sid)
+                observed_id = sid
             return sid
         try:
-            if provider == 'muse':
+            if provider == 'antigravity' and not attach:
                 store = self.opencode_store
-                if store.get('muse_enabled', False) is not True:
-                    raise ValueError('Muse workers are off.')
-                if goal is not None or current_goal is not None or goal_only or secrets or secret_names:
-                    raise ValueError('Muse workers do not take goals or secrets.')
-                if not fresh or attach or session_id is not None:
-                    raise ValueError('Muse workers require a fresh session until resume is supported.')
-                if platform != 'darwin':
-                    raise ValueError('Muse requires macOS.')
-                model = muse_runtime.DEFAULT_MODEL if model is None else model
-                if model not in muse_runtime.MODELS:
-                    raise ValueError('Muse model is unavailable.')
-                binary = muse_accounts.binary(store)
-                muse_accounts.check_binary(binary)
-                broker = muse_accounts.MuseBroker(store)
-                account_alias = broker.run_ready(account_alias)
-                muse_home = muse_accounts.account_home(broker.accounts()[account_alias]['config_dir'])
-                self.binaries['muse'] = binary
+                if goal is not None:
+                    raise ValueError('Antigravity workers do not take goals.')
+                account_alias = antigravity_accounts.AntigravityBroker(store).run_ready(account_alias)
+                agy_home = antigravity_accounts.account_home(account_alias)
+                agy_sandbox = antigravity_runtime.sandboxed(store)
+                if agy_sandbox:
+                    antigravity_runtime.check_sandbox()
+                agy_sessions = None if fresh else antigravity_runtime.find_session_folder(account_alias, session_id, agy_sandbox)
+                if not fresh and agy_sessions is None:
+                    result.failure_code = 'session_missing'
+                    result.error = 'Antigravity failed: session_missing: the saved session has no worker folder.'
+                    return result
+                self.binaries['antigravity'] = antigravity_accounts.check_binary(antigravity_accounts.binary(store))
             if provider == 'opencode' and not attach:
                 from . import opencode_accounts
                 store = self.opencode_store
@@ -329,12 +337,12 @@ class ProviderRunner:
             command = [] if attach else [self.binaries[provider]]
             if acp_factory is not None:
                 command = [] if attach else acp_adapter.argv(self.binaries[provider], cwd)
-            elif provider == 'muse':
-                command = [] if attach else muse_runtime.argv(binary)
             elif provider == 'claude':
                 command += ['--print', '--verbose', '--output-format', 'stream-json', '--dangerously-skip-permissions']
-                command += ['--effort', effort, '--settings', json.dumps({'ultracode': False,
-                    'claudeMdExcludes': claude_md_excludes(Path.home())})]
+                settings = {'ultracode': False, 'claudeMdExcludes': claude_md_excludes(Path.home())}
+                if plugins:
+                    settings['enabledPlugins'] = dict(plugins)
+                command += ['--effort', effort, '--settings', json.dumps(settings)]
                 if control is not None:
                     command += ['--input-format', 'stream-json', '--replay-user-messages']
                 command += ['--session-id' if fresh else '--resume', resume_path or session_id]
@@ -348,6 +356,8 @@ class ProviderRunner:
                         command += ['-c', override]
                 if self.codex_broker:
                     command += ['-c', 'skills.include_instructions=false']
+                for name, enabled in (plugins or {}).items():
+                    command += ['-c', 'plugins.%s.enabled=%s' % (name, json.dumps(enabled))]
                 command += ['app-server', '--listen', 'stdio://'] if control is not None else ['exec']
                 if control is None:
                     if not fresh:
@@ -355,7 +365,7 @@ class ProviderRunner:
                     command += ['--json', '--dangerously-bypass-approvals-and-sandbox', '--skip-git-repo-check']
             else:
                 raise ValueError('Unknown provider')
-            if model and acp_factory is None and provider != 'muse' and (provider == 'claude' or control is None):
+            if model and acp_factory is None and (provider == 'claude' or control is None):
                 command += ['--model', model]
             if provider == 'codex' and control is None:
                 if not fresh:
@@ -363,14 +373,18 @@ class ProviderRunner:
                 command += ['-']
             if provider == 'claude' and not attach:
                 shared_mcp_config = write_shared_mcp_config(
-                    self.account_broker.store, scrub)
+                    self.account_broker.store, scrub, topic=topic)
                 if shared_mcp_config is not None:
                     command += ['--mcp-config', str(shared_mcp_config)]
+                else:
+                    command += ['--mcp-config', '{"mcpServers":{}}']
             payload = ((instructions + '\n\n') if instructions else '') + prompt
-            if provider == 'muse':
-                payload = muse_runtime.AGENTS_LINE + '\n\n' + payload
             start_fresh = fresh
             start_model = model
+            if not attach and worker_id is not None and antigravity_runtime is not None and self.opencode_store is not None:
+                worker = self.opencode_store.db.execute('SELECT task FROM workers WHERE id=?', (worker_id,)).fetchone()
+                if worker and worker['task'] is not None:
+                    await antigravity_runtime.recover_job(self.opencode_store, worker['task'], launching=worker_id)
             host_name = host_id or 'worker-' + str(uuid.uuid4())
             version = 1
             while not attach and (self.state_dir / 'hosts' / host_name).exists():
@@ -378,7 +392,7 @@ class ProviderRunner:
                 host_name = host_id + '.' + str(version)
             directory = self.state_dir / 'hosts' / host_name
             if on_host and not attach:
-                on_host(host_name)
+                await retry_locked(on_host, host_name, retry_store=self.opencode_store)
             if attach:
                 spec = json.loads((directory / 'spec.json').read_text())
                 if provider == 'opencode':
@@ -388,7 +402,7 @@ class ProviderRunner:
                         scrub_shared_mcp_entries(restored['mcp'], scrub)
                     except (OSError, UnicodeError, ValueError, KeyError, TypeError, AttributeError):
                         from . import opencode_accounts
-                        entries = read_shared_mcp_entries(self.opencode_store, scrub, reserved_names=('torii',))
+                        entries = read_shared_mcp_entries(self.opencode_store, scrub, topic=topic)
                         restored = opencode_runtime.worker_config(
                             opencode_accounts.accounts(self.opencode_store)[spec['account']],
                             opencode_accounts.account_home(spec['account']) / 'key', Path(spec['cwd']), entries)
@@ -406,6 +420,9 @@ class ProviderRunner:
                         raise SecretDeliveryRefused('Cannot reattach a Codex secret worker without its safe launch controls.')
                 process = HostClient.attach(directory, last_seq=last_seq, on_seq=on_seq, on_problem=problem)
                 await process.connect()
+                if provider == 'antigravity':
+                    acp_servers = antigravity_runtime.saved_mcp_servers(process)
+                    scrub.extend(Scrubber(antigravity_runtime.mcp_secrets(acp_servers)).forms)
                 payload = spec['initial_payload']
                 start_fresh = spec['fresh']
                 start_model = spec['model']
@@ -414,29 +431,74 @@ class ProviderRunner:
                 if provider == 'opencode':
                     root = self.state_dir / 'opencode' / 'workers' / str(worker_id if worker_id is not None else host_name)
                     env = acp_adapter.environment(root, child_environment())
-                    shared_mcp_entries = read_shared_mcp_entries(store, scrub, reserved_names=('torii',))
+                    shared_mcp_entries = read_shared_mcp_entries(store, scrub, topic=topic)
                     opencode_runtime.write_config(Path(env['XDG_CONFIG_HOME']).parent, account,
                         opencode_accounts.account_home(account_alias) / 'key', cwd, shared_mcp_entries)
                 elif provider in ('claude', 'codex'):
-                    env = self._environment(provider, account_alias)
-                elif provider == 'muse':
-                    env = muse_accounts.environment(muse_home)
+                    env = self._environment(provider, account_alias, model)
+                elif provider == 'antigravity':
+                    env = (antigravity_accounts.environment(agy_home) if agy_sandbox
+                           else antigravity_accounts.worker_environment(agy_home, child_environment()))
+                    acp_servers = antigravity_runtime.mcp_servers(read_shared_mcp_entries(store, scrub, topic=topic))
                 else:
                     raise ValueError('Unknown provider')
-                if provider == 'codex' and self.codex_broker:
-                    from .codex_accounts import CODEX_SKILLS_POINTER, codex_skills_pointer
-                    payload = payload.replace(CODEX_SKILLS_POINTER, codex_skills_pointer(env))
+                if provider == 'codex':
+                    from .codex_session import toml
+                    mcp_store = self.opencode_store or getattr(self.account_broker, 'store', None)
+                    entries = read_shared_mcp_entries(mcp_store, scrub, topic=topic) if mcp_store is not None else {}
+                    codex_servers, codex_mcp_private = codex_mcp_launch(entries)
+                private_names = set(secrets or {}) | set(secret_names if provider == 'codex' else ())
+                env = {key: value for key, value in env.items() if key not in private_names}
+                env.pop('TORII_WORKER_ID', None)
+                env.pop('TORII_TASK_ID', None)
+                if provider == 'codex':
+                    if codex_servers:
+                        inherited = await codex_inherited(self.binaries['codex'], env, cwd)
+                        codex_servers = codex_selected(mcp_store, codex_servers, inherited, topic=topic)
+                    if codex_servers:
+                        command[1:1] = ['-c', 'mcp_servers=' + toml(codex_servers)]
                 worker_temp = worker_id is not None and self.opencode_store is not None
                 if worker_temp and provider != 'opencode':
                     from .worker_storage import prepare_temp
                     env['TMPDIR'] = await prepare_temp(self.opencode_store, worker_id)
-                private_names = set(secrets or {}) | set(secret_names if provider == 'codex' else ())
-                env = {key: value for key, value in env.items() if key not in private_names}
-                secrets = {} if provider == 'muse' or acp_factory is not None else await self.launch_secrets(env, secrets)
-                scrub.extend(Scrubber(secrets).forms)
+                if worker_id is not None and provider in ('claude', 'codex'):
+                    from .worker_hooks import install as install_worker_hook
+                    from .accounts import claude_home_for_environment
+                    from .codex_accounts import codex_home_for_environment
+                    home = (claude_home_for_environment(env) if provider == 'claude'
+                            else codex_home_for_environment(env) or str(Path(env['HOME']) / '.codex'))
+                    try:
+                        installed = install_worker_hook(provider, home, self.state_dir, env.get('TMPDIR'))
+                        if provider == 'codex':
+                            from .worker_hooks import codex_trust_override
+                            override = await codex_trust_override(self.binaries['codex'], env, cwd, installed)
+                            command[1:1] = ['-c', override]
+                    except Exception as error:
+                        if self.opencode_store is not None:
+                            problems.record(self.opencode_store, 'worker', 'secret-hook-failed',
+                                            type(error).__name__, every=300)
+                if provider == 'codex' and self.codex_broker:
+                    from .codex_accounts import CODEX_SKILLS_POINTER, PSTACK, codex_skills_pointer
+                    payload = payload.replace(CODEX_SKILLS_POINTER,
+                                              codex_skills_pointer(env, (plugins or {}).get(PSTACK) is not False))
+                if worker_id is not None and self.opencode_store is not None:
+                    worker = self.opencode_store.db.execute('SELECT task FROM workers WHERE id=?', (worker_id,)).fetchone()
+                    if worker and worker['task'] is not None:
+                        env.update(TORII_WORKER_ID=str(worker_id), TORII_TASK_ID=str(worker['task']))
+                if provider == 'antigravity':
+                    secrets = dict(secrets or {})
+                else:
+                    secrets = {} if acp_factory is not None else await self.launch_secrets(env, secrets)
+                if provider == 'codex':
+                    if set(codex_mcp_private) & (set(env) | set(secrets) | private_names):
+                        raise SecretDeliveryRefused('MCP header environment names conflict with worker environment.')
+                    secrets.update(codex_mcp_private)
+                scrub.extend(Scrubber({name: value for name, value in secrets.items() if value}).forms)
                 spec = {'argv': command, 'cwd': str(cwd), 'env': env,
                         'provider': provider, 'locks': [provider + '-' + session_id] if session_id else [],
                         'initial_payload': payload, 'fresh': fresh, 'model': model}
+                if worker_id is not None and provider in ('claude', 'codex'):
+                    spec['report_background_killed'] = True
                 if worker_temp:
                     spec['worker_temp'] = True
                 if provider == 'codex':
@@ -447,21 +509,31 @@ class ProviderRunner:
                         spec['goal_only'] = True
                 if acp_factory is not None:
                     spec['account'] = account_alias
-                if provider == 'opencode' and platform == 'darwin':
-                    spec['ownership'] = 'coalition'
-                elif provider in ('claude', 'codex') and worker_id is not None and platform == 'darwin':
-                    spec['ownership'] = 'coalition'
-                elif provider == 'muse':
+                spec.update(host_os.worker_ownership(
+                    group_owned=provider in ('claude', 'codex', 'opencode', 'antigravity') and worker_id is not None,
+                    allow_coalition_without_group=provider == 'opencode'))
+                if provider == 'antigravity':
                     from .worker_storage import results_directory
-                    worker = store.db.execute('SELECT task FROM workers WHERE id=?', (worker_id,)).fetchone()
+                    worker = (store.db.execute('SELECT id,task FROM workers WHERE id=?', (worker_id,)).fetchone()
+                              if worker_id is not None else None)
                     results = (results_directory(store, worker['task'], create=True) if worker else
                                str(store.directory / 'results' / host_name))
                     Path(results).mkdir(mode=0o700, parents=True, exist_ok=True)
-                    roots = muse_runtime.write_roots(cwd, env, results)
-                    git = await muse_runtime.git_writes(store, worker, cwd, roots)
-                    spec['argv'] = muse_accounts.write_boundary(command, [*roots, *git.roots], files=git.files)
-                    spec.update(account=account_alias, ownership='coalition',
-                                write_boundary={'mode': 'inline', 'profile': spec['argv'][2]})
+                    if not agy_sandbox:
+                        spec.update(results=str(results), session_home=str(
+                            agy_sessions or antigravity_runtime.account_sessions(agy_home)))
+                    else:
+                        agy_sessions = agy_sessions or antigravity_runtime.session_folder(account_alias, host_name)
+                        roots, binds, sync = await antigravity_runtime.write_roots(
+                            store, worker, cwd, env, results, agy_sessions / ('refs-' + host_name))
+                        agy_scratch = antigravity_runtime.scratch_home(host_name)
+                        spec.update(results=str(results), session_home=str(agy_sessions), branch_sync=sync,
+                                    scratch_home=str(agy_scratch))
+                        spec['argv'] = antigravity_runtime.write_boundary(
+                            command, roots, state=store.directory,
+                            binds=antigravity_runtime.session_binds(agy_home, agy_sessions) + binds,
+                            hidden=await antigravity_runtime.secret_places(store), mounts=self.extension.boundary_mounts(),
+                            home=(agy_home, agy_scratch / 'upper', agy_scratch / 'work'))
                 process = await HostClient.launch(directory, spec, on_seq=on_seq,
                                                   private={'env': secrets, 'scrub': scrub.forms}, on_problem=problem,
                                                   record_failure=bool(self.opencode_store))
@@ -476,19 +548,14 @@ class ProviderRunner:
             result.log_path = str(directory / 'stderr.log')
             result.managed = provider == 'claude' and self.extension.state(spec['env']) == 'managed'
             if on_start:
-                on_start(result.pid)
+                await retry_locked(on_start, result.pid, retry_store=self.opencode_store)
 
             if acp_factory is not None:
                 control = control or RunControl()
-                protocol = AcpProtocol(acp_adapter, process, control, session_id, observe_session, reattaching=attach)
-                if on_cancel:
-                    on_cancel(protocol.cancel)
-                if stopped and stopped():
-                    protocol.cancel()
-            elif provider == 'muse':
-                control = control or RunControl()
-                protocol = MspProtocol(process, control, session_id, observe_session,
-                                       account_home=muse_home, problem=problem)
+                if provider == 'antigravity':
+                    acp_adapter = replace(acp_adapter, continue_prompt=antigravity_runtime.subagent_nudge(spec.get('session_home')))
+                protocol = AcpProtocol(acp_adapter, process, control, session_id, observe_session, reattaching=attach,
+                                       mcp_servers=acp_servers if provider == 'antigravity' else ())
                 if on_cancel:
                     on_cancel(protocol.cancel)
                 if stopped and stopped():
@@ -510,7 +577,7 @@ class ProviderRunner:
                     if provider == 'codex':
                         await protocol.start(payload, cwd, start_fresh, start_model,
                                              goal_only=spec.get('goal_only', False))
-                    elif provider == 'muse':
+                    elif provider == 'antigravity':
                         await protocol.start(payload, cwd, start_fresh, start_model, thread_options={'effort': effort})
                     else:
                         await protocol.start(payload, cwd, start_fresh, start_model)
@@ -562,7 +629,7 @@ class ProviderRunner:
                     result.goal_status = event.get('goal')
                 if provider == 'claude' and kind == 'rate_limit_event':
                     info = event.get('rate_limit_info', {})
-                    if isinstance(info, dict):
+                    if isinstance(info, dict) and not str(info.get('rateLimitType', '')).startswith('five_hour'):
                         result.rate_limit_info = {k: info[k] for k in ('status', 'resetsAt', 'rateLimitType', 'utilization') if k in info}
                         result.quota_limited = info.get('status') == 'rejected'
                 if provider == 'claude' and kind == 'result':
@@ -613,14 +680,12 @@ class ProviderRunner:
                         if (event.get('error') or {}).get('codex_error_info') == 'usage_limit_exceeded':
                             result.quota_limited = True
                             result.failure_code = 'quota_limited'
-                if terminal and (protocol is None or protocol.terminal):
-                    terminal_ready.set()
 
             async def read_stream():
                 if attach:
                     past = list(process.history(last_seq))
                     for old in past:
-                        parse_event(old, replay=True)
+                        await retry_locked(parse_event, old, replay=True, retry_store=self.opencode_store)
                     if protocol is not None:
                         for request in self.extension.unanswered(past, process.history_after(last_seq)):
                             protocol.handle(request)
@@ -633,8 +698,8 @@ class ProviderRunner:
                             else:
                                 protocol.disconnect()
                         break
-                    parse_event(raw)
-                    process.ack()
+                    await retry_locked(parse_event, raw, retry_store=self.opencode_store)
+                    await retry_locked(process.ack, retry_store=self.opencode_store)
             reader_task = asyncio.create_task(read_stream())
             tasks = [reader_task]
             input_task = asyncio.create_task(write_input())
@@ -643,28 +708,7 @@ class ProviderRunner:
             if reader_task.done():
                 reader_task.result()
             await asyncio.shield(input_task)
-            if provider == 'muse':
-                terminal_task = asyncio.create_task(protocol.wait_terminal())
-                tasks.append(terminal_task)
-                await asyncio.wait((reader_task, terminal_task), return_when=asyncio.FIRST_COMPLETED)
-                try:
-                    await asyncio.wait_for(asyncio.shield(reader_task), acp_adapter.exit_seconds)
-                except asyncio.TimeoutError:
-                    await process.stop()
-                    await reader_task
-            elif auto_finish and provider in ('claude', 'codex'):
-                terminal_task = asyncio.create_task(terminal_ready.wait())
-                tasks.append(terminal_task)
-                await asyncio.wait((reader_task, terminal_task), return_when=asyncio.FIRST_COMPLETED)
-                if terminal_task.done() and not reader_task.done():
-                    try:
-                        await asyncio.wait_for(asyncio.shield(reader_task), WORKER_EXIT_GRACE)
-                    except asyncio.TimeoutError:
-                        terminal_drained = True
-                        await process.stop()
-                        await reader_task
-            else:
-                await reader_task
+            await reader_task
             await process.wait()
             if provider == 'codex' and protocol is not None:
                 result.goal_status = protocol.goal
@@ -687,13 +731,17 @@ class ProviderRunner:
                                             launch_root=Path(spec['env']['XDG_CONFIG_HOME']).parent,
                                             subscription=opencode_accounts.accounts(self.opencode_store).get(
                                                 spec.get('account'), {}).get('provider') == 'opencode-go')
-                elif provider == 'muse':
-                    acp_error.update(account=account_alias, detail=protocol.detail, resets_at=protocol.resets_at)
-                    muse_runtime.finish(result, acp_error, store)
+                elif provider == 'antigravity':
+                    antigravity_runtime.finish(result, acp_error, self.opencode_store, spec.get('account'))
+                    antigravity_runtime.collect_images(result, spec.get('session_home'), spec.get('results'))
+                    subagents = antigravity_runtime.subagent_usage(spec.get('session_home'), result.session_id)
+                    if subagents:
+                        result.spend = dict(result.spend or {'usd_estimate': None, 'source': antigravity_runtime.SOURCE},
+                                            subagents=subagents)
                 else:
                     raise ValueError('Unknown provider')
             else:
-                result.success = ((process.returncode == 0 or terminal_drained) and (terminal or goal_only and protocol.terminal)
+                result.success = (process.returncode == 0 and (terminal or goal_only and protocol.terminal)
                                   and not provider_failed and bool(observed_id)
                                   and (protocol is None or protocol.terminal))
             if provider == 'codex' and protocol is not None and protocol.goal_restart is not None and result.success:
@@ -711,6 +759,14 @@ class ProviderRunner:
                 result.error = 'The worker exited while its background work was still running.'
             if not result.success and not result.error:
                 result.error = 'Provider exited without a verified successful terminal result (exit %s)' % process.returncode
+            if process.background_killed:
+                if result.failure_code or result.failure_detail:
+                    result.failure_detail = '\n'.join(filter(None, (result.failure_detail,
+                        'background_killed: ' + process.background_killed)))
+                else:
+                    result.failure_detail = process.background_killed
+                if not result.failure_code:
+                    result.failure_code = 'background_killed'
             return result
         except asyncio.CancelledError:
             if process is not None and host_id is None:
@@ -746,13 +802,16 @@ class ProviderRunner:
                     result.failure_detail = str(error)
                 except (OSError, RuntimeError) as error:
                     problem('worker', 'stop-failed', internal_detail(error))
-            if (provider not in ('claude', 'codex', 'opencode') and isinstance(exc, ValueError)
+            if (provider not in ('claude', 'codex', 'opencode', 'antigravity') and isinstance(exc, ValueError)
                     and str(exc) == 'Unknown provider'):
                 raise
             return result
         finally:
+            if provider == 'antigravity' and process is not None and process.returncode is not None:
+                await asyncio.to_thread(antigravity_runtime.sync_branch, spec.get('branch_sync'))
+                await asyncio.to_thread(antigravity_runtime.remove_scratch_home, spec.get('scratch_home'))
             _scrub_result(result, scrub)
-            if (acp_factory is not None or provider == 'muse') and on_cancel:
+            if acp_factory is not None and on_cancel:
                 on_cancel(None)
             if protocol is not None:
                 if provider == 'codex':
@@ -769,7 +828,5 @@ class ProviderRunner:
                     task.cancel()
             if tasks:
                 await asyncio.gather(*tasks, return_exceptions=True)
-            if acp_factory is not None and protocol is not None:
-                result.prompt_sent = protocol.prompt_sent
             if process is not None:
                 process.detach()

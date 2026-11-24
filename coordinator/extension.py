@@ -6,6 +6,7 @@ import importlib.util
 
 
 LOCAL = __package__ + '.extension_local'
+LOCAL_OPS = __package__ + '.ops_local'
 _active = None
 
 
@@ -22,8 +23,6 @@ def optional(name):
 class Native:
     """Default launch behavior for native profiles."""
 
-    worker_policy = ''
-
     def prepare(self, store):
         return None
 
@@ -36,7 +35,7 @@ class Native:
     async def close(self):
         return None
 
-    def environment(self, env, alias):
+    def environment(self, env, alias, model=None):
         return env
 
     async def private(self, env):
@@ -68,6 +67,32 @@ class Native:
 
     def health(self, store):
         return None
+
+    def extra_reference_roots(self, directory):
+        return ()
+
+    def extra_donor_roots(self):
+        return ()
+
+    def background_infrastructure(self, name, command):
+        return False
+
+    def boundary_mounts(self):
+        return []
+
+    def telegram_server(self, store):
+        return None
+
+
+def local_ops():
+    """Control operations of the private tree, or none."""
+    try:
+        module = importlib.import_module(LOCAL_OPS)
+    except ModuleNotFoundError as error:
+        if error.name != LOCAL_OPS:
+            raise
+        return ()
+    return module.OPS
 
 
 def load():

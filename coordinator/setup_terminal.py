@@ -16,6 +16,10 @@ import termios
 import time
 
 
+from . import host_os
+from .host_os import interactive_mac, open_mac_url as open_url
+
+
 HELPERS = Path(__file__).resolve().parent / 'helpers'
 BOTFATHER = 'https://t.me/BotFather?startapp'
 PASTE = 'Copy the token, come back here, press Command-V, then Return.'
@@ -29,21 +33,8 @@ WATCH_FOR = 300
 _pending_terminal = None
 
 
-def interactive_mac():
-    return (sys.platform == 'darwin' and sys.stdin.isatty() and sys.stdout.isatty()
-            and not any(os.environ.get(key) for key in ('SSH_CONNECTION', 'SSH_CLIENT', 'SSH_TTY')))
-
-
-def open_url(url):
-    try:
-        subprocess.run(['/usr/bin/open', url], stdout=subprocess.DEVNULL,
-                       stderr=subprocess.DEVNULL, timeout=10, check=False)
-    except (OSError, subprocess.SubprocessError):
-        pass
-
-
 def qr_matrix(url):
-    result = subprocess.run(['/usr/bin/osascript', '-l', 'JavaScript', str(HELPERS / 'setup-qr.js')],
+    result = subprocess.run(host_os.javascript_helper(HELPERS / 'setup-qr.js'),
                             input=url.encode('utf-8'), capture_output=True, timeout=10, check=True)
     if len(result.stdout) > 200000:
         raise ValueError('QR output too large')
@@ -245,7 +236,7 @@ def obtain_candidate(show_screen=True):
                 opened = True
 
             try:
-                process = subprocess.Popen(['/usr/bin/osascript', '-l', 'JavaScript', str(HELPERS / 'setup-clipboard.js')],
+                process = subprocess.Popen(host_os.javascript_helper(HELPERS / 'setup-clipboard.js'),
                                            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
                 os.set_blocking(process.stdout.fileno(), False)
                 selector.register(process.stdout, selectors.EVENT_READ, 'helper')

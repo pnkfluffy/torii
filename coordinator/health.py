@@ -1,22 +1,12 @@
 """Read-only owner health summary from saved workers and bounded host probes."""
 
 import math
-import os
 import re
-import subprocess
 import time
 
 from . import host_os
-from .accounts import listed_accounts
-from .controls import _mapping, _timestamp, _until, _window_left, blocked, resets
+from .controls import _mapping, _timestamp, _until, _window_left
 from . import extension
-
-
-def _command(*args):
-    try:
-        return subprocess.run(args, capture_output=True, text=True, timeout=1, check=True).stdout
-    except (OSError, subprocess.SubprocessError, UnicodeError):
-        return ''
 
 
 def _size(value):
@@ -28,7 +18,7 @@ def _plain(value):
 
 
 def _disk(path):
-    lines = _command('df', '-kP', str(path)).splitlines()
+    lines = host_os.disk_usage_output(path).splitlines()
     if len(lines) < 2:
         return None
     fields = lines[-1].split()
@@ -39,69 +29,15 @@ def _disk(path):
     return f'{_size(free)} free / {_size(total)}'
 
 
-def _number(value, convert=float):
-    try:
-        result = convert(value)
-        return result if result >= 0 and math.isfinite(result) else None
-    except (TypeError, ValueError, OverflowError):
-        return None
-
-
-def read_pressure():
-    """Numeric host values. Unavailable readings stay None, independently of other probes."""
-    result = dict.fromkeys(('load1', 'cores', 'memory_used', 'memory_total', 'swap_used', 'pressure'))
-    try:
-        result['load1'] = _number(os.getloadavg()[0])
-    except OSError:
-        pass
-    if host_os.linux():
-        cores = _number(os.cpu_count(), int)
-        memory = {key: _number(value, int) for key, value in re.findall(
-            r'^(MemTotal|MemAvailable|SwapTotal|SwapFree):\s*(\d+) kB$', host_os.proc_text('meminfo'), re.M)}
-        total = memory.get('MemTotal')
-        result['memory_total'] = total * 1024 if total else None
-        if total and memory.get('MemAvailable') is not None:
-            result['memory_used'] = max(0, total - memory['MemAvailable']) * 1024
-        if memory.get('SwapTotal') is not None and memory.get('SwapFree') is not None:
-            result['swap_used'] = max(0, memory['SwapTotal'] - memory['SwapFree']) * 1024
-        pressure = re.search(r'^some avg10=(\d+(?:\.\d+)?)(?:\s|$)',
-                             host_os.proc_text('pressure/memory'), re.M)
-    else:
-        cores = _number(_command('sysctl', '-n', 'hw.ncpu').strip(), int)
-        total = _number(_command('sysctl', '-n', 'hw.memsize').strip(), int)
-        result['memory_total'] = total if total else None
-        stats = _command('vm_stat')
-        page = re.search(r'page size of (\d+) bytes', stats)
-        page_size = _number(page.group(1), int) if page else None
-        pages = {key: _number(value.rstrip('.'), int) for key, value in
-                 re.findall(r'^Pages (free|inactive|speculative):\s+(\d+\.?)[\s]*$', stats, re.M)}
-        if total and page_size and pages.get('free') is not None:
-            available = sum(pages.get(key) or 0 for key in ('free', 'inactive', 'speculative')) * page_size
-            result['memory_used'] = max(0, total - available)
-        pressure = re.search(r'System-wide memory free percentage:\s*(\d+)%', _command('memory_pressure', '-Q'))
-        swapped = re.search(r'used\s*=\s*(\d+(?:\.\d+)?)([KMG])(?:\s|$)',
-                            _command('sysctl', '-n', 'vm.swapusage'))
-        if swapped:
-            amount = _number(swapped.group(1))
-            if amount is not None:
-                result['swap_used'] = _number(amount * 1024 ** ('KMG'.index(swapped.group(2)) + 1), int)
-    result['cores'] = cores if cores else None
-    if pressure:
-        value = _number(pressure.group(1))
-        result['pressure'] = value if value is not None and value <= 100 else None
-    return result
-
-
 def system_pressure(state_dir):
-    values = read_pressure()
+    values = host_os.read_pressure()
     lines = []
     if values['load1'] is not None and values['cores'] is not None:
         lines.append(f'CPU: {values["load1"]:.1f} load / {values["cores"]} cores')
     if values['memory_used'] is not None and values['memory_total'] is not None:
         detail = f'RAM: {_size(values["memory_used"])} used / {_size(values["memory_total"])}'
         if values['pressure'] is not None:
-            detail += (f', {values["pressure"]:.2f}% pressure stall' if host_os.linux() else
-                       f', {values["pressure"]:g}% pressure free')
+            detail += host_os.pressure_detail(values["pressure"])
         if values['swap_used'] is not None:
             detail += ', swap ' + _size(values['swap_used'])
         lines.append(detail)
@@ -112,74 +48,145 @@ def system_pressure(state_dir):
     return lines
 
 
+def _account_order(mark, alias, usable, reset):
+    if mark in ('🟢', '🟡'):
+        return (0, usable.get(alias, math.inf))
+    return (1, reset if reset is not None else math.inf) if mark == '🔴' else (2, math.inf)
+
+
+def account_mark(authenticated, enabled, state):
+    """The mark and state words of one account, shared by /health and /accounts."""
+    if not authenticated:
+        return '⚪', 'signed out'
+    if not enabled:
+        return '⚫', 'off'
+    if state['state'] == 'limited':
+        return '🔴', _back(state.get('until'))
+    if state['state'] == 'stale':
+        return '🟡', 'stale since ' + _timestamp(state.get('since'))
+    return '🟢', ''
+
+
+def _back(until):
+    return 'back in ' + _until(until) if type(until) in (int, float) and until > time.time() else 'back later'
+
+
+def _future(value):
+    return type(value) in (int, float) and value > time.time()
+
+
+def _banked(snapshot):
+    banked = snapshot.get('resets_available')
+    if type(banked) is not int or banked <= 0:
+        return ''
+    expires = snapshot.get('reset_expires')
+    return (' · %d reset%s banked' % (banked, '' if banked == 1 else 's')
+            + (', first expires in ' + _until(expires).replace('d 0h', 'd') if _future(expires) else ''))
+
+
+def claude_line(store, router, alias):
+    """One Claude account line for /health and /accounts: (mark, reset used for ordering, text)."""
+    from .accounts import account_label, authenticated
+    profile = _mapping(_mapping(store.get('accounts', {})).get(alias))
+    label = _plain(account_label(store, alias))
+    state = router.account_state(alias, 'opus')
+    mark, words = account_mark(authenticated(store, alias, profile), profile.get('enabled') is True, state)
+    if mark in ('⚪', '⚫'):
+        return mark, None, f'{mark} {label}: ' + words
+    usage = _mapping(_mapping(_mapping(store.get('account_status', {})).get(alias)).get('usage'))
+    windows = []
+    for key in ('seven_day', 'seven_day_fable'):
+        remaining, _ = _window_left(_mapping(usage.get(key)))
+        windows.append(f'{remaining:g}%' if remaining is not None else '?')
+    parts = [words]
+    shown = state.get('until') if mark == '🔴' and _future(state.get('until')) else None
+    if mark != '🔴':
+        weekly = _mapping(usage.get('seven_day')).get('resets_at')
+        if _future(weekly):
+            shown = weekly
+            parts.append('week resets in ' + _until(weekly))
+        fable = router.account_state(alias, 'fable')
+        if fable['state'] == 'limited':
+            parts.append('Fable paused, ' + _back(fable.get('until')))
+    state_text = ', '.join(filter(None, parts))
+    return mark, shown, f'{mark} {label}: ' + ' · '.join(windows) + (', ' + state_text if state_text else '')
+
+
+def codex_line(broker, alias, active, count):
+    """One ChatGPT account line for /health and /accounts: (mark, reset used for ordering, text)."""
+    from .codex_accounts import credit_line
+    label = _plain(broker.label(alias))
+    state = broker.account_state(alias)
+    mark, words = account_mark(broker.authenticated(alias), broker.signed_in(alias), state)
+    if mark in ('⚪', '⚫'):
+        return mark, None, f'{mark} {label}: ' + words
+    snapshot = broker.snapshot(alias)
+    week = _mapping(_mapping(snapshot.get('usage')).get('seven_day'))
+    remaining, _ = _window_left(week)
+    parts = [words]
+    shown = state.get('until') if mark == '🔴' and _future(state.get('until')) else None
+    if mark != '🔴' and _future(week.get('resets_at')):
+        shown = week['resets_at']
+        parts.append('week resets in ' + _until(week['resets_at']))
+    state_text = ', '.join(filter(None, parts))
+    return mark, shown, (f'{mark} {label}: ' + (f'{remaining:g}%' if remaining is not None else '?')
+                         + (', ' + state_text if state_text else '')
+                         + (' · active' if alias == active and count > 1 else '')
+                         + _banked(snapshot) + ' · ' + credit_line(snapshot))
+
+
 def _subscription(store):
-    from .accounts import AccountBroker, account_label, authenticated
-    aliases = listed_accounts(store)[0]
-    snapshots = _mapping(store.get('account_status', {}))
+    from .accounts import AccountBroker, account_label
+    router = AccountBroker(store)
+    usable = {alias: index for index, alias in enumerate(router.selection_order(model='opus'))}
+    aliases = sorted((alias for alias, profile in _mapping(store.get('accounts', {})).items()
+                      if alias and isinstance(profile, dict)),
+                     key=lambda alias: (account_label(store, alias).casefold(), alias))
     entries = []
     for alias in aliases:
-        if not alias:
-            continue
-        usage = _mapping(_mapping(snapshots.get(alias)).get('usage'))
-        account_block = blocked(store, alias)
-        windows = []
-        for key in ('five_hour', 'seven_day', 'seven_day_fable'):
-            window = _mapping(usage.get(key))
-            remaining, _ = _window_left(window, account_block)
-            windows.append(f'{remaining:g}%' if remaining is not None else '?')
-        state = AccountBroker(store).account_state(alias)
-        profile = (store.get('accounts', {}) or {}).get(alias)
-        mark, state_text = (('⚪', 'not signed in') if not authenticated(store, alias, profile) else
-                            ('⚫', 'disabled') if not profile.get('enabled') else
-                            ('🔴', resets(state.get('until'))) if state['state'] == 'limited' else
-                            ('🟡', 'stale since ' + _timestamp(state.get('since')))
-                            if state['state'] == 'stale' else ('🟢', ''))
-        weekly_reset = _mapping(usage.get('seven_day')).get('resets_at')
-        if mark in ('🟢', '🟡') and type(weekly_reset) in (int, float) and weekly_reset > time.time():
-            state_text += ', week resets in ' + _until(weekly_reset)
-        entries.append(f'{mark} {_plain(account_label(store, alias))}: ' + ' · '.join(windows)
-                       + (', ' + state_text if state_text else ''))
-    return '\n'.join(['**Subscriptions left** (5h · week · Fable)'] + (entries or ['No accounts']))
+        mark, shown, line = claude_line(store, router, alias)
+        entries.append((_account_order(mark, alias, usable, shown), line))
+    entries = [line for _, line in sorted(entries, key=lambda entry: entry[0])]
+    return '\n'.join(['**Subscriptions left** (week · Fable)'] + (entries or ['No accounts']))
 
 
 def _codex(store):
     from .codex_accounts import CodexBroker
     broker = CodexBroker(store)
     listed, active = broker.listed()
+    order = broker.selection_order()
+    if active in order:
+        order.remove(active)
+        order.insert(0, active)
+    usable = {alias: index for index, alias in enumerate(order)}
     aliases = listed + sorted((alias for alias in broker.accounts() if alias not in listed),
                               key=lambda alias: (broker.label(alias).casefold(), alias))
     entries = []
     for alias in aliases:
-        snapshot = broker.snapshot(alias)
-        remaining, _ = _window_left(_mapping(_mapping(snapshot.get('usage')).get('seven_day')))
-        state = broker.account_state(alias)
-        mark, state_text = (('⚪', 'not signed in') if not broker.authenticated(alias) else
-                            ('⚫', 'disabled') if not broker.signed_in(alias) else
-                            ('🔴', resets(state.get('until'))) if state['state'] == 'limited' else
-                            ('🟡', 'stale since ' + _timestamp(state.get('since')))
-                            if state['state'] == 'stale' else ('🟢', ''))
-        weekly_reset = _mapping(_mapping(snapshot.get('usage')).get('seven_day')).get('resets_at')
-        if mark in ('🟢', '🟡') and type(weekly_reset) in (int, float) and weekly_reset > time.time():
-            state_text += (', ' if state_text else '') + 'week resets in ' + _until(weekly_reset)
-        banked = snapshot.get('resets_available')
-        entries.append(f'{mark} {_plain(broker.label(alias))}: '
-                       + (f'{remaining:g}%' if remaining is not None else '?')
-                       + (', ' + state_text if state_text else '') + (' · active' if alias == active else '')
-                       + (' · %d reset%s banked' % (banked, '' if banked == 1 else 's')
-                          if type(banked) is int and banked > 0 else ''))
+        mark, shown, line = codex_line(broker, alias, active, len(aliases))
+        entries.append((_account_order(mark, alias, usable, shown), line))
+    entries = [line for _, line in sorted(entries, key=lambda entry: entry[0])]
     return '\n'.join(['**ChatGPT left** (week)'] + entries) if entries else None
 
 
-def format_health(topics, workers, pressure, subscription, parents=None, extension_line=None, codex=None):
+def format_health(topics, workers, pressure, subscription, parents=None, extension_line=None, codex=None, activity=None,
+                  antigravity=None, opencode=None):
     groups = {}
     for worker in workers:
         if worker['status'] == 'running':
             groups.setdefault(worker['topic'], []).append(worker)
     parents = parents or {}
+    activity = activity or {}
     running = (sum(worker['status'] == 'running' for members in groups.values() for worker in members)
                + sum(parents.get(topic['id'], '').startswith('live') for topic in topics))
     lines = [f'**Agents running: {running}**']
-    for topic in topics:
+    def sort_key(topic):
+        parent = parents.get(topic['id'], '')
+        count = len(groups.get(topic['id'], [])) + parent.startswith('live')
+        latest = activity.get(topic['id'])
+        return (-count, latest is None, -latest if latest is not None else 0, topic['name'])
+
+    for topic in sorted(topics, key=sort_key):
         members = groups.pop(topic['id'], [])
         parent = parents.get(topic['id'])
         count = len(members) + bool(parent and parent.startswith('live'))
@@ -194,18 +201,26 @@ def format_health(topics, workers, pressure, subscription, parents=None, extensi
     lines.extend(['', subscription])
     if extension_line:
         lines.append(extension_line)
-    if codex:
-        lines.extend(['', codex])
+    for section in (codex, antigravity, opencode):
+        if section:
+            lines.extend(['', section])
     return '\n'.join(lines)
 
 
 def op_health_show(store, ctx):
     from .host import host_state
+    from . import opencode_subscription
 
     workers = [dict(row) for row in store.db.execute(
         """SELECT w.topic,w.status,t.number,t.title FROM workers w
         LEFT JOIN tasks t ON t.id=w.task WHERE w.status='running' ORDER BY w.id""")]
     topics = store.topics()
+    activity = {row['topic']: row['latest'] for row in store.db.execute(
+        '''SELECT topic, MAX(when_at) AS latest FROM (
+            SELECT topic, MAX(updated) AS when_at FROM workers GROUP BY topic
+            UNION ALL
+            SELECT topic, MAX(created) AS when_at FROM messages GROUP BY topic
+        ) GROUP BY topic''')}
     home = store.get('coordinator_session_topic') or store.get('coordinator_home_topic')
     if home is None:
         home = next((topic['id'] for topic in topics if topic['enabled'] and store.get('coordinator_session')), None)
@@ -220,11 +235,15 @@ def op_health_show(store, ctx):
                 parents[topic['id']] = 'live (ChatGPT %s)' % _plain(label or 'unknown')
             elif host.get('provider') == 'opencode':
                 parents[topic['id']] = 'live (OpenCode %s)' % _plain(host.get('account') or 'unknown')
+            elif host.get('provider') == 'antigravity':
+                parents[topic['id']] = 'live (Antigravity %s)' % _plain(host.get('account') or 'unknown')
             else:
                 parents[topic['id']] = 'live (Claude)'
         elif store.get('coordinator_account_retry_at'):
             parents[topic['id']] = 'paused until ' + _timestamp(store.get('coordinator_account_retry_at'))
         else:
             parents[topic['id']] = 'wound down'
+    antigravity = extension.optional('antigravity_accounts')
     return format_health(topics, workers, system_pressure(store.directory), _subscription(store), parents,
-                         extension.active().health(store), _codex(store))
+                         extension.active().health(store), _codex(store), activity,
+                         antigravity.health(store) if antigravity else None, opencode_subscription.card(store))

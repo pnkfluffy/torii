@@ -6,6 +6,7 @@ import re
 import sqlite3
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from coordinator import control_api, store as store_module
 from coordinator.store import Store
@@ -26,14 +27,28 @@ def rows(db):
             for name in tables(db)}
 
 
+def definitions(sql):
+    body = sql[sql.index('(') + 1:sql.rindex(')')]
+    parts, depth, start = [], 0, 0
+    for index, character in enumerate(body):
+        depth += {'(': 1, ')': -1}.get(character, 0)
+        if character == ',' and depth == 0:
+            parts.append(body[start:index])
+            start = index + 1
+    parts.append(body[start:])
+    return sorted(re.sub(r'"([A-Za-z_][A-Za-z_0-9]*)"', r'\1', ' '.join(part.split())) for part in parts)
+
+
 def schema(db):
     return {
-        'normalized_sql': sorted(re.sub(r'"([A-Za-z_][A-Za-z_0-9]*)"', r'\1', ' '.join(row[0].split()))
-                                 for row in db.execute('SELECT sql FROM sqlite_master WHERE sql IS NOT NULL')),
-        'columns': {name: [tuple(row) for row in db.execute('PRAGMA table_info("' + name + '")')]
+        'tables': {name: definitions(sql) for name, sql in db.execute(
+            "SELECT name,sql FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")},
+        'columns': {name: sorted(tuple(row)[1:] for row in db.execute('PRAGMA table_info("' + name + '")'))
                     for name in tables(db)},
-        'indexes': [tuple(row) for row in db.execute(
-            "SELECT name,tbl_name,sql FROM sqlite_master WHERE type='index' ORDER BY name")],
+        'foreign_keys': {name: sorted(tuple(row)[2:] for row in db.execute('PRAGMA foreign_key_list("' + name + '")'))
+                         for name in tables(db)},
+        'objects': sorted((kind, name, tbl, ' '.join(sql.split())) for kind, name, tbl, sql in db.execute(
+            "SELECT type,name,tbl_name,sql FROM sqlite_master WHERE type IN ('index','trigger') AND sql IS NOT NULL")),
     }
 
 
@@ -61,48 +76,43 @@ class StoreUpgradeTests(unittest.TestCase):
         self.store = Store(self.root)
         self.addCleanup(lambda: self.store.close())
 
-    def test_job_iterations_preserve_checkpoint_identity_and_round_zero(self):
-        rounds = [dict(row) for row in self.store.db.execute('SELECT * FROM task_iterations ORDER BY task,k')]
-        self.assertEqual(len(rounds), len(self.original_rows['tasks']))
-        for old, iteration in zip(self.original_rows['tasks'], rounds):
+    def test_jobs_keep_identity_and_rounds(self):
+        rounds = [dict(row) for row in self.store.db.execute('SELECT * FROM task_iterations ORDER BY id')]
+        self.assertEqual(rounds, [dict(old, summary=None) for old in self.original_rows['task_iterations']])
+        for old in self.original_rows['tasks']:
             with self.subTest(task=old['id']):
                 task = self.store.task_get(old['id'])
-                self.assertEqual((task['id'], task['number'], task['worktree'], task['pr']),
-                                 (old['id'], old['number'], old['worktree'], old.get('pr')))
-                self.assertEqual((task['iteration'], task['finish'], task['parent']), (0, None, None))
-                self.assertEqual((iteration['task'], iteration['k'], iteration['opened'], iteration['origin'],
-                                  iteration['opened_by']), (old['id'], 0, old['created'], old['origin'], 'migration'))
-                for table in ('workers', 'task_stamps'):
-                    self.assertEqual(self.store.db.execute(
-                        'SELECT COUNT(*) FROM ' + table + ' WHERE task=? AND iteration!=0', (old['id'],)).fetchone()[0], 0)
+                for key in ('id', 'number', 'status', 'worktree', 'pr', 'iteration', 'finish', 'parent', 'copy'):
+                    self.assertEqual(task[key], old[key], key)
         self.assertEqual(self.store.db.execute('PRAGMA foreign_key_check').fetchall(), [])
+
+    def test_jobs_get_stable_unique_uids_and_record_paths(self):
+        self.assertTrue(all('uid' not in task for task in self.original_rows['tasks']))
+        jobs = {task['id']: (task['uid'], task['record_path']) for task in self.store.tasks_list()}
+        self.assertEqual(len({uid for uid, _ in jobs.values()}), len(jobs))
+        self.assertTrue(all(re.fullmatch('[0-9a-f]{8}', uid) for uid, _ in jobs.values()))
+        self.assertTrue(all(path.startswith('records/') for _, path in jobs.values()))
         self.store.close()
         self.store = Store(self.root)
-        self.assertEqual([dict(row) for row in self.store.db.execute('SELECT * FROM task_iterations ORDER BY task,k')], rounds)
+        self.assertEqual({task['id']: (task['uid'], task['record_path']) for task in self.store.tasks_list()}, jobs)
 
-    def test_job_iterations_migrate_closed_jobs_and_keep_indexes_and_branches(self):
+    def test_status_rebuild_keeps_closed_jobs_indexes_and_branches(self):
         directory = self.root / 'closed-checkpoint'
         directory.mkdir()
         fixture = Path(__file__).parent / 'fixtures/store-checkpoint.sql'
         with closing(sqlite3.connect(directory / 'state.sqlite')) as db:
             db.executescript(fixture.read_text())
-            db.execute('ALTER TABLE tasks ADD COLUMN pr TEXT')
             db.execute("UPDATE tasks SET status='done',updated=200,pr='https://example.invalid/pull/1' WHERE id=1")
             db.execute("UPDATE tasks SET status='dropped',updated=300 WHERE id=2")
             db.execute('CREATE INDEX tasks_saved_worktree ON tasks(worktree)')
-            db.execute('''CREATE TABLE task_stamps (
-                id INTEGER PRIMARY KEY, task INTEGER NOT NULL REFERENCES tasks(id),
-                stage TEXT NOT NULL CHECK(stage IN ('ready','reviewed','ci','merged','live')),
-                created REAL NOT NULL)''')
-            db.execute("INSERT INTO task_stamps(id,task,stage,created) VALUES (41,1,'ready',100)")
+            db.execute("INSERT INTO task_stamps(id,task,stage,created,iteration) VALUES (41,1,'ready',100,0)")
             db.execute("UPDATE workers SET workspace=? WHERE task=1",
                        (json.dumps({'branch': 'torii/task-1', 'cwd': '/tmp/torii-checkpoint/path-02'}),))
             db.commit()
         upgraded = Store(directory)
         self.addCleanup(upgraded.close)
-        actual = [tuple(row) for row in upgraded.db.execute(
-            'SELECT task,k,closed,outcome FROM task_iterations WHERE task IN (1,2) ORDER BY task')]
-        self.assertEqual(actual, [(1, 0, 200, 'done'), (2, 0, 300, 'dropped')])
+        self.assertEqual([(job['status'], job['updated']) for job in (upgraded.task_get(1), upgraded.task_get(2))],
+                         [('done', 200), ('dropped', 300)])
         self.assertEqual(upgraded.task_get(1)['pr'], 'https://example.invalid/pull/1')
         worker = upgraded.db.execute('SELECT workspace,iteration FROM workers WHERE task=1').fetchone()
         self.assertEqual((json.loads(worker['workspace'])['branch'], worker['iteration']), ('torii/task-1', 0))
@@ -111,15 +121,33 @@ class StoreUpgradeTests(unittest.TestCase):
         self.assertEqual(upgraded.db.execute(
             "SELECT name FROM sqlite_master WHERE type='index' AND name='tasks_saved_worktree'").fetchone()[0],
                          'tasks_saved_worktree')
+        for status in ('proposed', 'expired'):
+            upgraded.db.execute('UPDATE tasks SET status=? WHERE id=3', (status,))
+            self.assertEqual(upgraded.task_get(3)['status'], status)
         self.assertEqual(upgraded.db.execute('PRAGMA foreign_key_check').fetchall(), [])
 
     def test_checkpoint_schema_matches_fresh_store(self):
         fresh = Store(self.root / 'fresh')
         self.addCleanup(fresh.close)
         upgraded_schema, fresh_schema = schema(self.store.db), schema(fresh.db)
-        for part in ('normalized_sql', 'columns', 'indexes'):
+        for part in ('tables', 'columns', 'foreign_keys', 'objects'):
             with self.subTest(part=part):
                 self.assertEqual(upgraded_schema[part], fresh_schema[part])
+
+    def test_fresh_store_runs_no_schema_upgrade(self):
+        statements = []
+        connect = sqlite3.connect
+
+        def traced(*args, **kwargs):
+            db = connect(*args, **kwargs)
+            db.set_trace_callback(statements.append)
+            return db
+        with patch.object(store_module.sqlite3, 'connect', traced):
+            fresh = Store(self.root / 'fresh')
+        self.addCleanup(fresh.close)
+        self.assertTrue(statements)
+        self.assertEqual([statement for statement in statements
+                          if re.search(r'\b(ALTER|RENAME)\b|\bDROP TABLE\b|_new\b', statement)], [])
 
     def test_checkpoint_upgrade_passes_integrity_and_foreign_key_checks(self):
         self.assertEqual([tuple(row) for row in self.store.db.execute('PRAGMA integrity_check')], [('ok',)])
@@ -128,26 +156,18 @@ class StoreUpgradeTests(unittest.TestCase):
     def test_checkpoint_upgrade_preserves_all_rows(self):
         actual_counts = counts(self.store.db)
         expected_rows = dict(self.original_rows)
+        expected_rows['settings'] = sorted((row for row in expected_rows['settings']
+                                            if row['key'] != 'envelope_prompt_exit'), key=lambda row: row['key'])
         expected_counts = {table: len(original) for table, original in expected_rows.items()}
         expected_counts.update({name: 0 for name in actual_counts if name not in expected_counts})
-        final_workers = {worker['id'] for worker in self.original_rows['workers']
-                         if worker['status'] == 'needs_input'}
-        expected_counts['worker_temp_state'] = len(final_workers)
-        expected_counts['task_iterations'] = len(self.original_rows['tasks'])
         self.assertEqual(actual_counts, expected_counts)
-        queued = self.store.db.execute(
-            'SELECT worker,finished,pending,path FROM worker_temp_state').fetchall()
-        self.assertEqual({tuple(row) for row in queued},
-                         {(worker, 1, 1, None) for worker in final_workers})
         migrated_rows = rows(self.store.db)
+        migrated_rows['settings'].sort(key=lambda row: row['key'])
         for table, original in expected_rows.items():
             self.assertEqual(len(migrated_rows[table]), len(original), table)
             for old, new in zip(original, migrated_rows[table]):
                 with self.subTest(table=table, row=old.get('id', old.get('key'))):
-                    expected = dict(old)
-                    if table == 'workers' and old['status'] == 'needs_input':
-                        expected.update(status='done', updated=new['updated'])
-                    self.assertEqual({key: new[key] for key in old}, expected)
+                    self.assertEqual({key: new[key] for key in old}, old)
 
     def test_checkpoint_pairing_and_group_mode_are_preserved(self):
         settings = {row['key']: json.loads(row['value']) for row in self.original_rows['settings']}

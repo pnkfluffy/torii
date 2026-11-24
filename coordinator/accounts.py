@@ -14,7 +14,7 @@ from .failures import TaskFailure
 DEFAULT_ACCOUNTS = {}
 LIMIT_CONTINUATION = ('The prior turn stopped at a provider usage limit. Continue the same saved job. '
                       'Inspect prior progress before repeating any action with external effects.\n\n')
-CLAUDE_SWITCH_THRESHOLD = 0.98
+CLAUDE_SWITCH_THRESHOLD = 0.99
 LOCAL_OVERRIDES_PATH = Path(__file__).resolve().parent.parent / 'local-overrides.json'
 _local_override_errors = set()
 PROFILE = re.compile(r'[A-Za-z0-9][A-Za-z0-9_-]{0,63}\Z')
@@ -43,15 +43,9 @@ def discover_accounts(store, root=None):
     default_identity = _dict(_dict(_dict(store.get('account_status', {})).get('default')).get('identity'))
     if default_identity.get('logged_in') is not True or not identity_email(default_identity):
         accounts.pop('default', None)
-    for alias in list(accounts):
-        if alias.startswith('home-login-needs-name'):
-            accounts.pop(alias, None)
     status = _dict(store.get('account_status', {}))
     if default_identity.get('logged_in') is not True or not identity_email(default_identity):
         status.pop('default', None)
-    for alias in list(status):
-        if alias.startswith('home-login-needs-name'):
-            status.pop(alias, None)
     store.put('account_status', status)
     for alias, profile in accounts.items():
         if profile.get('enabled') and not authenticated(store, alias, profile):
@@ -106,7 +100,7 @@ def _number(value):
 
 
 def temporary_local_switch_thresholds():
-    """TEMPORARY local override hook. Remove account_switch_thresholds to remove reserves; preserve shared_mcp_servers."""
+    """TEMPORARY local override hook. Remove account_switch_thresholds to remove reserves."""
     try:
         data = json.loads(LOCAL_OVERRIDES_PATH.read_text())
         if not isinstance(data, dict):
@@ -127,25 +121,67 @@ def temporary_local_switch_thresholds():
         return {}
 
 
-def switch_threshold(store, alias=None):
-    return temporary_local_switch_thresholds().get(alias, CLAUDE_SWITCH_THRESHOLD) if alias else CLAUDE_SWITCH_THRESHOLD
+def is_fable(model):
+    return isinstance(model, str) and (model.lower() == 'fable' or model.lower().startswith('claude-fable-'))
 
 
-def listed_accounts(store):
+def every_meter(model):
+    """Fable work, or work whose model is unknown ('native-default'), counts every meter."""
+    return model == 'native-default' or is_fable(model)
+
+
+PICK_GROUPS = ('fable', 'other')
+
+
+def pick_group(model):
+    return 'fable' if is_fable(model) else 'other'
+
+
+def account_picks(store):
+    """The owner Claude picks per model group. An old single alias applies to both groups."""
+    value = store.get('claude_account_pick')
+    if isinstance(value, dict):
+        return {group: value.get(group) if isinstance(value.get(group), str) and value.get(group) else None
+                for group in PICK_GROUPS}
+    return {group: value if isinstance(value, str) and value else None for group in PICK_GROUPS}
+
+
+def account_pick(store, model):
+    return account_picks(store)[pick_group(model)]
+
+
+def picks_value(picks):
+    return dict(picks) if any(picks.values()) else None
+
+
+def switch_threshold(store, alias=None, window=None):
+    if not alias or window == 'seven_day_fable':
+        return CLAUDE_SWITCH_THRESHOLD
+    return temporary_local_switch_thresholds().get(alias, CLAUDE_SWITCH_THRESHOLD)
+
+
+def limit_window(limit_type):
+    """The meter a Claude limit type names. Claude Code reports the Fable weekly limit as
+    seven_day_overage_included, in stream events and in the representative claim header."""
+    return ('seven_day_fable' if limit_type == 'seven_day_overage_included' or 'fable' in limit_type.lower() else
+            'seven_day' if limit_type in ('', 'seven_day') else None)
+
+
+def listed_accounts(store, model):
     """Return display-sorted signed-in accounts and the broker's next choice."""
     registered = _dict(store.get('accounts', {}))
     accounts = {alias: profile for alias, profile in registered.items() if isinstance(profile, dict)}
     aliases = [alias for alias in sorted(accounts) if authenticated(store, alias, accounts[alias])]
     aliases.sort(key=lambda alias: (account_label(store, alias).casefold(), alias))
     router = AccountBroker(store)
-    active = router.select(accounts)
+    active = router.select(accounts, model=model)
     if active not in aliases:
         return aliases, None
     return [active] + [alias for alias in aliases if alias != active], active
 
 
-def account_block(store, alias):
-    state = AccountBroker(store).account_state(alias)
+def account_block(store, alias, model):
+    state = AccountBroker(store).account_state(alias, model)
     return ({'reason': 'quota', 'until': state.get('until')}
             if state.get('state') == 'limited' else None)
 
@@ -215,6 +251,7 @@ class AccountBroker:
                 if account.get('config_dir'):
                     homes.append(account['config_dir'])
                 homes.extend(account.get('previous_config_dirs', []))
+        homes.extend(self.store.get('account_dirs_removed', []) or [])
         return list(dict.fromkeys(homes))
 
     def alias_for_environment(self, env):
@@ -242,13 +279,13 @@ class AccountBroker:
             destination.symlink_to(source)
         return str(destination)
 
-    def account_state(self, alias):
+    def account_state(self, alias, model):
         snapshot = _dict(_dict(self.store.get('account_status', {})).get(alias))
         block = self.blocks().get(alias)
-        if block:
+        if block and (every_meter(model) or block.get('window') != 'seven_day_fable'):
             return {'state': 'limited', 'until': block.get('until')}
-        if self._usage_full(alias, snapshot):
-            return {'state': 'limited', 'until': self._usage_reset(alias, snapshot)}
+        if self._usage_full(alias, snapshot, model):
+            return {'state': 'limited', 'until': self._usage_reset(alias, snapshot, model)}
         observed = snapshot.get('observed_at')
         if not _number(observed) or snapshot.get('error') or time.time() - observed > self.FRESH_SECONDS:
             return {'state': 'stale', 'since': observed}
@@ -256,14 +293,14 @@ class AccountBroker:
 
     def full_windows(self, alias, snapshot=None):
         snapshot = snapshot if snapshot is not None else _dict(_dict(self.store.get('account_status', {})).get(alias))
-        threshold = switch_threshold(self.store, alias) * 100
-        return {key: window for key in ('five_hour', 'seven_day', 'seven_day_fable')
+        return {key: window for key in ('seven_day', 'seven_day_fable')
                 for window in [_dict(_dict(snapshot.get('usage')).get(key))]
                 if not (_number(window.get('resets_at')) and window['resets_at'] <= time.time())
-                and _number(window.get('utilization')) and window['utilization'] >= threshold}
+                and _number(window.get('utilization')) and window['utilization'] >= switch_threshold(self.store, alias, key) * 100}
 
-    def _usage_full(self, alias, snapshot=None):
-        return bool(self.full_windows(alias, snapshot))
+    def _usage_full(self, alias, snapshot, model):
+        windows = self.full_windows(alias, snapshot)
+        return bool(windows if every_meter(model) else windows.get('seven_day'))
 
     def log_crossings(self, alias, previous, snapshot):
         before = self.full_windows(alias, previous)
@@ -272,36 +309,47 @@ class AccountBroker:
                 logging.getLogger(__name__).info(
                     'account switch point crossed account=%s meter=%s used_pct=%s switch_point_pct=%s reset=%s',
                     account_label(self.store, alias), meter, window['utilization'],
-                    switch_threshold(self.store, alias) * 100, window.get('resets_at'))
+                    switch_threshold(self.store, alias, meter) * 100, window.get('resets_at'))
 
-    def pick_feedback(self, topic):
+    def pick_feedback(self, request):
         from .controls import _until
-        alias = self.store.get('claude_account_pick')
+        alias = request.get('alias')
+        groups = [group for group in request.get('models') or PICK_GROUPS if group in PICK_GROUPS]
+        topic = request.get('topic')
         channel = self.store.topic(topic) if topic else None
         topic = topic if channel and channel['enabled'] else self.store.get('coordinator_home_topic')
         channel = self.store.topic(topic) if topic else None
-        if not alias or not channel or not channel['enabled']:
+        picks = account_picks(self.store)
+        if not alias or not groups or any(picks[group] != alias for group in groups) or not channel or not channel['enabled']:
             return
         label = account_label(self.store, alias)
         accounts = self.store.get('accounts', {})
-        if self.available(accounts, alias):
-            text = (f'{label} has room: Claude work now uses {label}; '
-                    'running Claude chats move after their current turn.')
+        model = 'fable' if groups == ['fable'] else 'opus'
+        work, chats = {('fable',): ('Fable work', 'Fable chats'),
+                       ('other',): ('Claude work other than Fable', 'Claude chats')}.get(
+                           tuple(groups), ('Claude work', 'Claude chats'))
+        if self.available(accounts, alias, model=model):
+            text = (f'{label} has room: {work} now uses {label}; '
+                    f'running {chats} move after their current turn.')
+            if 'fable' in groups and model != 'fable' and self.is_full(alias, 'fable'):
+                text += ' Fable work uses another account until its limit resets.'
         else:
             windows = self.full_windows(alias)
-            meter, window = next(((key, windows[key]) for key in ('seven_day', 'seven_day_fable', 'five_hour')
+            if model != 'fable':
+                windows.pop('seven_day_fable', None)
+            meter, window = next(((key, windows[key]) for key in ('seven_day', 'seven_day_fable')
                                   if key in windows), ('', {}))
-            names = {'five_hour': '5-hour', 'seven_day': 'all-model weekly', 'seven_day_fable': 'Fable weekly'}
-            state = self.account_state(alias)
-            fallback = self.select()
+            names = {'seven_day': 'all-model weekly', 'seven_day_fable': 'Fable weekly'}
+            state = self.account_state(alias, model)
+            fallback = self.select(model=model)
             detail = (f"at {window['utilization']:g}% of its {names[meter]} limit" if meter else 'held')
             back = _until(state['until']) if state.get('until') is not None else 'an unknown time'
             text = (f'{label} is still {detail} after a fresh check, back in {back}; '
-                    + (f'Claude work stays on {account_label(self.store, fallback)} until then' if fallback else
-                       'Claude work waits until then') + f' and moves to {label} after.')
+                    + (f'{work} stays on {account_label(self.store, fallback)} until then' if fallback else
+                       f'{work} waits until then') + f' and moves to {label} after.')
         self.store.enqueue_report(topic, text)
 
-    def selection_reason(self, accounts, current, attempted=()):
+    def selection_reason(self, accounts, current, attempted=(), *, model):
         if not current:
             return 'reason=account_available'
         if current in attempted:
@@ -311,31 +359,36 @@ class AccountBroker:
         if not signed_in(self.store, current, accounts.get(current)):
             return 'reason=signed_out'
         block = self.blocks().get(current)
+        if block and not every_meter(model) and block.get('window') == 'seven_day_fable':
+            block = None
         if block and block.get('reason') != 'threshold':
             return 'reason=hold hold_reason=%s until=%s' % (block.get('reason'), block.get('until'))
         windows = self.full_windows(current)
+        if not every_meter(model):
+            windows.pop('seven_day_fable', None)
         if windows:
             meter, window = next(iter(windows.items()))
             return 'reason=%s used_pct=%s switch_point_pct=%s reset=%s' % (
-                meter, window['utilization'], switch_threshold(self.store, current) * 100, window.get('resets_at'))
+                meter, window['utilization'], switch_threshold(self.store, current, meter) * 100, window.get('resets_at'))
         if block:
             return 'reason=hold hold_reason=%s until=%s' % (block.get('reason'), block.get('until'))
-        pick = self.store.get('claude_account_pick')
-        if pick and pick != current and self.available(accounts, pick, attempted):
+        pick = account_pick(self.store, model)
+        if pick and pick != current and self.available(accounts, pick, attempted, model=model):
             return 'reason=owner_pick'
         return 'reason=sooner_reset'
 
-    def _usage_reset(self, alias, snapshot):
+    def _usage_reset(self, alias, snapshot, model):
         usage = _dict(snapshot.get('usage'))
         resets = [_dict(usage.get(key)).get('resets_at') for key in
-                  ('five_hour', 'seven_day', 'seven_day_fable')
-                  if _number(_dict(usage.get(key)).get('utilization')) and
-                  _dict(usage.get(key)).get('utilization') >= switch_threshold(self.store, alias) * 100]
+                  ('seven_day', 'seven_day_fable')
+                  if (every_meter(model) or key != 'seven_day_fable') and
+                  _number(_dict(usage.get(key)).get('utilization')) and
+                  _dict(usage.get(key)).get('utilization') >= switch_threshold(self.store, alias, key) * 100]
         values = [value for value in resets if _number(value) and value > time.time()]
         return max(values) if values else None
 
-    def is_full(self, alias):
-        return self.account_state(alias)['state'] == 'limited'
+    def is_full(self, alias, model):
+        return self.account_state(alias, model)['state'] == 'limited'
 
     def transcript(self, session):
         if not session:
@@ -358,17 +411,19 @@ class AccountBroker:
         now = time.time()
         saved = self.store.get('account_blocks', {})
         kept = {alias: block for alias, block in saved.items()
-                if isinstance(block, dict) and (block.get('until') is None or block['until'] > now)}
+                if isinstance(block, dict) and block.get('window') != 'five_hour'
+                and (block.get('until') is None or block['until'] > now)}
         for alias, block in saved.items():
             snapshot = _dict(_dict(self.store.get('account_status', {})).get(alias))
             if (isinstance(block, dict) and block.get('reason') == 'threshold'
-                    and not self._usage_full(alias, snapshot)):
+                    and not (self.full_windows(alias, snapshot).get(block.get('window'))
+                             if block.get('window') else self.full_windows(alias, snapshot))):
                 kept.pop(alias, None)
             elif (isinstance(block, dict) and not block.get('retry_usage') and block.get('until') is None and
                   _number(snapshot.get('observed_at')) and
                   snapshot['observed_at'] > (block.get('observed_at') or 0) and
                   not snapshot.get('error') and
-                  not self._usage_full(alias, snapshot)):
+                  not self.full_windows(alias, snapshot)):
                 kept.pop(alias, None)
         if kept != saved:
             outer = self.store.db.in_transaction
@@ -377,29 +432,43 @@ class AccountBroker:
                 self.store.db.commit()
         return {alias: block for alias, block in kept.items() if not block.get('released')}
 
-    def available(self, accounts, alias, attempted=()):
+    def available(self, accounts, alias, attempted=(), *, model):
         return (alias not in attempted and signed_in(self.store, alias, accounts.get(alias))
-                and not self.is_full(alias))
+                and not self.is_full(alias, model))
 
-    def select(self, accounts=None, attempted=()):
+    def selection_order(self, accounts=None, attempted=(), *, model):
+        """Usable accounts in routing order, with an available owner pick first."""
         accounts = accounts or self.store.get('accounts', DEFAULT_ACCOUNTS)
-        pick = self.store.get('claude_account_pick')
-        if pick and self.available(accounts, pick, attempted):
-            return pick
-        eligible = [alias for alias in accounts if self.available(accounts, alias, attempted)]
+        pick = account_pick(self.store, model)
+        eligible = [alias for alias in accounts if self.available(accounts, alias, attempted, model=model)]
         snapshots = self.store.get('account_status', {})
         def weekly_reset(alias):
             usage = _dict(_dict(snapshots.get(alias)).get('usage'))
             reset = _dict(usage.get('seven_day')).get('resets_at')
             return reset if _number(reset) and reset > time.time() else math.inf
-        return min(eligible, key=lambda alias: (weekly_reset(alias), alias)) if eligible else None
+        return sorted(eligible, key=lambda alias: (alias != pick, weekly_reset(alias), alias))
 
-    def activate(self, accounts=None, attempted=()):
+    def select(self, accounts=None, attempted=(), *, model):
+        return next(iter(self.selection_order(accounts, attempted, model=model)), None)
+
+    def default_model(self):
+        return self.store.get('worker_model', 'opus')
+
+    def capacity(self, model):
+        return self.select(model=model) is not None
+
+    async def ready(self, worker):
+        return self.capacity(worker['model'] or self.default_model())
+
+    def reset(self, worker):
+        return self.earliest_reset(model=worker['model'] or self.default_model())
+
+    def activate(self, accounts=None, attempted=(), *, model):
         accounts = accounts or self.store.get('accounts', DEFAULT_ACCOUNTS)
         current = self.store.get('active_account')
-        alias = self.select(accounts, attempted)
+        alias = self.select(accounts, attempted, model=model)
         if alias != current:
-            reason = self.selection_reason(accounts, current, attempted)
+            reason = self.selection_reason(accounts, current, attempted, model=model)
             if alias is None:
                 logging.getLogger(__name__).info('no eligible account from=%s %s',
                                                  account_label(self.store, current), reason)
@@ -412,7 +481,7 @@ class AccountBroker:
                 self.store.db.commit()
         return alias
 
-    def earliest_reset(self, accounts=None):
+    def earliest_reset(self, accounts=None, *, model):
         accounts = accounts or self.store.get('accounts', DEFAULT_ACCOUNTS)
         resets = []
         for alias in accounts:
@@ -420,13 +489,16 @@ class AccountBroker:
                 continue
             block = self.blocks().get(alias)
             account_resets = []
-            if block and _number(block.get('until')) and block['until'] > time.time():
+            if (block and (every_meter(model) or block.get('window') != 'seven_day_fable')
+                    and _number(block.get('until')) and block['until'] > time.time()):
                 account_resets.append(block['until'])
             snapshot = _dict(_dict(self.store.get('account_status', {})).get(alias))
             usage = _dict(snapshot.get('usage'))
-            for name in ('five_hour', 'seven_day', 'seven_day_fable'):
+            for name in ('seven_day', 'seven_day_fable'):
+                if name == 'seven_day_fable' and not every_meter(model):
+                    continue
                 window = _dict(usage.get(name))
-                if (_number(window.get('utilization')) and window['utilization'] >= switch_threshold(self.store, alias) * 100
+                if (_number(window.get('utilization')) and window['utilization'] >= switch_threshold(self.store, alias, name) * 100
                         and _number(window.get('resets_at')) and window['resets_at'] > time.time()):
                     account_resets.append(window['resets_at'])
             if account_resets:
@@ -436,9 +508,9 @@ class AccountBroker:
     def record_rate_limit(self, alias, info, rejected=False):
         previous_snapshot = _dict(_dict(self.store.get('account_status', {})).get(alias))
         limit_type = str((info or {}).get('rateLimitType', ''))
-        window_name = ('five_hour' if limit_type.startswith('five_hour') else
-                       'seven_day_fable' if limit_type == 'seven_day_overage_included' or 'fable' in limit_type.lower() else
-                       'seven_day' if limit_type in ('', 'seven_day') else None)
+        if limit_type.startswith('five_hour'):
+            return
+        window_name = limit_window(limit_type)
         if info and window_name:
             snapshot = self.store.get('account_status', {})
             account = dict(snapshot.get(alias) or {})
@@ -462,16 +534,19 @@ class AccountBroker:
         utilization = (info or {}).get('utilization')
         if type(utilization) in (int, float) and utilization <= 1:
             utilization *= 100
-        full = bool(window_name) and type(utilization) in (int, float) and utilization >= switch_threshold(self.store, alias) * 100
+        full = bool(window_name) and type(utilization) in (int, float) and utilization >= switch_threshold(self.store, alias, window_name) * 100
         if rejected or full:
             until = self.future_reset(info or {}) or (time.time() + self.REJECTION_HOLD_SECONDS if rejected else None)
             self.hold(alias, until, 'quota' if rejected else 'threshold',
-                      window_name if rejected and limit_type else None)
+                      window_name if limit_type else None)
 
     def hold(self, alias, until, reason, window=None):
         self.blocks()
         blocks = dict(self.store.get('account_blocks', {}))
         previous = blocks.get(alias) or {}
+        if (window == 'seven_day_fable' and previous and not previous.get('released')
+                and previous.get('window') != 'seven_day_fable' and previous.get('reason') != 'threshold'):
+            return
         if (not previous.get('released') and previous.get('until') == until and previous.get('reason') == reason
                 and previous.get('window') == window):
             return
@@ -485,8 +560,10 @@ class AccountBroker:
         logging.getLogger(__name__).info('account limited account=%s reason=%s until=%s',
                                          account_label(self.store, alias), reason, until)
 
-    def record_usage(self, alias, windows, rejected=False, reset=None):
-        """Usage read outside Claude stream events. It is written only when it changes."""
+    def record_usage(self, alias, windows, rejected=None, reset=None):
+        """Usage read outside Claude stream events. It is written only when it changes. `rejected` is
+        the refused limit's claim, so a Fable refusal holds only Fable work."""
+        windows = {name: window for name, window in windows.items() if name in ('seven_day', 'seven_day_fable')}
         snapshot = _dict(self.store.get('account_status', {}))
         account = dict(_dict(snapshot.get(alias)))
         usage = _dict(account.get('usage'))
@@ -494,23 +571,23 @@ class AccountBroker:
         if merged != usage:
             merged = {name: dict(window, recorded_at=time.time()) if name in windows else window
                       for name, window in merged.items()}
-        full = self._usage_full(alias, account)
+        full = bool(self.full_windows(alias, account))
         previous = dict(account)
         if merged != usage:
             account['usage'] = merged
             snapshot[alias] = account
             self.store.put('account_status', snapshot)
         self.log_crossings(alias, previous, account)
-        if rejected and alias not in self.blocks():
+        window = 'seven_day_fable' if rejected and limit_window(rejected) == 'seven_day_fable' else None
+        held = self.blocks().get(alias)
+        if rejected and (not held or held.get('window') == 'seven_day_fable' and not window):
             self.hold(alias, self.future_reset({'resetsAt': reset}) or time.time() + self.REJECTION_HOLD_SECONDS,
-                      'quota')
-        elif not full and self._usage_full(alias, account):
+                      'quota', window)
+        elif not full and self.full_windows(alias, account):
             self.store.put('account_status_refresh_requested', time.time())
 
     async def run(self, run, provider, prompt, cwd, session_id, notice_topic=None, stopped=None, **options):
         on_account = options.pop('on_account', None)
-        if provider != 'claude':
-            return await run(provider, prompt, cwd, session_id, **options)
         attempted = set()
         launched_pid = None
         previous = None
@@ -519,7 +596,7 @@ class AccountBroker:
         last = RunResult(session_id, error='No enabled Claude account is available.', failure_code='accounts_unavailable')
         while True:
             accounts = self.store.get('accounts', DEFAULT_ACCOUNTS)
-            alias = self.activate(accounts, attempted)
+            alias = self.activate(accounts, attempted, model=model)
             if alias is None:
                 return last
             config_dir = accounts[alias].get('config_dir')
@@ -547,10 +624,11 @@ class AccountBroker:
                 if not last.managed:
                     self.record_rate_limit(alias, last.rate_limit_info,
                                            last.quota_limited and not last.success)
-            if last.success or not last.quota_limited or (stopped and stopped()):
+            if (last.success or not last.quota_limited or (stopped and stopped())
+                    or str((last.rate_limit_info or {}).get('rateLimitType', '')).startswith('five_hour')):
                 return last
             previous = alias
-            if not self.select(self.store.get('accounts', DEFAULT_ACCOUNTS), attempted):
+            if not self.select(self.store.get('accounts', DEFAULT_ACCOUNTS), attempted, model=model):
                 return last
             resume_path = resume_path or self.transcript(last.session_id)
             if not resume_path:

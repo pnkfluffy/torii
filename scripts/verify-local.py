@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """Run Torii's offline checks and preserve an isolated CLI proof."""
 
+import argparse
+import importlib.util
 import json
 import os
-import re
 from pathlib import Path
-import sqlite3
+import signal
 import subprocess
 import sys
 import tempfile
@@ -13,6 +14,71 @@ from datetime import datetime, timezone
 
 
 SERVICE_PYTHON = '/usr/bin/python3'
+
+
+def stop_detached_children(pid):
+    output = subprocess.check_output(['ps', '-axo', 'pid=,ppid=,pgid='], text=True)
+    processes = [tuple(map(int, line.split())) for line in output.splitlines()]
+    descendants = {pid}
+    while True:
+        found = {child for child, parent, _ in processes if parent in descendants}
+        if found.issubset(descendants):
+            break
+        descendants.update(found)
+    groups = {group for child, _, group in processes if child in descendants and child == group and child != pid}
+    denied = None
+    for group in groups:
+        try:
+            os.killpg(group, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        except PermissionError as error:
+            denied = error
+    if denied is not None:
+        raise denied
+
+
+def run_process(args, root, env, timeout=1800, grace=20):
+    process = subprocess.Popen(args, cwd=root, env=env, text=True,
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                               start_new_session=True)
+    try:
+        stdout, stderr = process.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        stop_error = None
+        try:
+            os.killpg(process.pid, signal.SIGSTOP)
+            try:
+                stop_detached_children(process.pid)
+            except (OSError, ValueError, subprocess.SubprocessError) as error:
+                stop_error = error
+            os.killpg(process.pid, signal.SIGINT)
+        except ProcessLookupError:
+            pass
+        finally:
+            try:
+                os.killpg(process.pid, signal.SIGCONT)
+            except ProcessLookupError:
+                pass
+        try:
+            process.communicate(timeout=grace)
+        except subprocess.TimeoutExpired:
+            pass
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        try:
+            process.communicate(timeout=grace)
+        except subprocess.TimeoutExpired as error:
+            for stream in (process.stdout, process.stderr):
+                if stream is not None:
+                    stream.close()
+            raise RuntimeError('Timed out collecting test process output after termination') from error
+        if stop_error is not None:
+            raise RuntimeError('Could not stop detached test processes') from stop_error
+        raise
+    return process.returncode, stdout, stderr
 
 
 def interpreter():
@@ -34,7 +100,17 @@ def interpreter():
         'Python 3.9+ interpreter and run this again.')
 
 
-def main():
+def load_ci_tests():
+    spec = importlib.util.spec_from_file_location('ci_tests', Path(__file__).with_name('ci-tests.py'))
+    tool = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(tool)
+    return tool
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--shard', type=load_ci_tests().parse_shard)
+    args = parser.parse_args(argv or [])
     os.umask(0o077)
     root = Path(__file__).resolve().parents[1]
     proof_root = Path(os.environ['TORII_VERIFY_PROOF_ROOT']) if os.environ.get('TORII_VERIFY_PROOF_ROOT') else Path.home() / '.local/state/agent-workflow/proofs/torii'
@@ -42,7 +118,10 @@ def main():
     stamp = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ-')
     proof = Path(tempfile.mkdtemp(prefix=stamp, dir=proof_root))
     actions = []
-    result = {'mode': 'offline', 'passed': False, 'no_comments': False, 'scratch_removed': False}
+    result = {'mode': 'offline', 'passed': False, 'scratch_removed': False}
+    first = not args.shard or args.shard[0] == 1
+    if first:
+        result['no_comments'] = False
 
     def save(name, value):
         (proof / name).write_text(json.dumps(value, indent=2) + '\n')
@@ -50,62 +129,50 @@ def main():
     try:
         python = interpreter()
         result['python_executable'] = python
-        with tempfile.TemporaryDirectory(prefix='torii-verify-') as temporary:
+        with tempfile.TemporaryDirectory(prefix='v') as temporary:
             scratch = Path(temporary)
             env = dict(os.environ, PYTHONPYCACHEPREFIX=str(scratch / 'bytecode'), TMPDIR=str(scratch))
 
             def run(name, args):
-                completed = subprocess.run(args, cwd=root, env=env, text=True,
-                                           capture_output=True, timeout=1800)
-                (proof / (name + '.stdout.txt')).write_text(completed.stdout)
-                (proof / (name + '.stderr.txt')).write_text(completed.stderr)
-                actions.append({'name': name, 'argv': args, 'exit_code': completed.returncode})
+                code, stdout, stderr = run_process(args, root, env)
+                (proof / (name + '.stdout.txt')).write_text(stdout)
+                (proof / (name + '.stderr.txt')).write_text(stderr)
+                actions.append({'name': name, 'argv': args, 'exit_code': code})
                 save('actions.json', actions)
-                if completed.returncode:
+                if code:
                     raise RuntimeError(name + ' failed; inspect its proof output')
-                return completed.stdout
+                return stdout
 
-            result['revision'] = run('revision', ['git', 'rev-parse', 'HEAD']).strip()
-            result['python'] = run('python', [python, '--version']).strip()
-            run('worktree-status', ['git', 'status', '--short'])
-            cli = [python, '-m', 'coordinator', '--state-dir', str(scratch / 'state'),
-                   '--token-file', str(scratch / 'no-token')]
-            help_text = run('cli-help', cli + ['--help'])
-            if '--state-dir' not in help_text or 'status' not in help_text:
-                raise RuntimeError('CLI help does not expose expected commands')
-            expected = {'owner': None, 'group': None, 'topics': [], 'tasks': [], 'workers': []}
-            for name in ('cli-status', 'cli-status-repeat'):
-                if json.loads(run(name, cli + ['status'])) != expected:
-                    raise RuntimeError('Unexpected fresh CLI state')
-            operations = json.loads(run('cli-ctl-list', cli + ['ctl', 'list']))
-            ids = {op['id'] for op in operations}
-            if not {'settings.show', 'service.restart', 'tasks.create', 'workers.goal'}.issubset(ids):
-                raise RuntimeError('The control manifest is missing expected operations')
-            if any(op['kind'] not in ('read', 'write') for op in operations):
-                raise RuntimeError('The control manifest is missing expected operations')
-            database = scratch / 'state' / 'state.sqlite'
-            with sqlite3.connect(database.as_uri() + '?mode=ro&immutable=1', uri=True) as db:
-                counts = {table: db.execute('SELECT count(*) FROM ' + table).fetchone()[0]
-                          for table in ('settings', 'topics', 'updates', 'outbox', 'attachments',
-                                        'tasks', 'messages', 'workers', 'service_requests',
-                                        'envelopes', 'envelope_events', 'envelope_effects')}
-            save('state-observation.json', {'database_created': database.exists(), 'rows': counts})
-            expected_counts = dict.fromkeys(counts, 0)
-            if counts != expected_counts:
-                raise RuntimeError('Fresh status command created unexpected data')
-            run('no-comments', [python, 'scripts/check-no-comments.py'])
-            result['no_comments'] = True
+            if first:
+                result['revision'] = run('revision', ['git', 'rev-parse', 'HEAD']).strip()
+                result['python'] = run('python', [python, '--version']).strip()
+                run('worktree-status', ['git', 'status', '--short'])
+                run('cli-smoke', [python, str(Path(__file__).with_name('ci-smoke.py')),
+                                  '--temp', str(scratch), '--out', str(proof)])
+                run('no-comments', [python, 'scripts/check-no-comments.py'])
+                run('error-problems', [python, 'scripts/check-error-problems.py'])
+                result['no_comments'] = True
+            command = [python, str(Path(__file__).with_name('ci-tests.py')), '--out', str(proof / 'suite')]
+            if args.shard:
+                command += ['--shard', '%d/%d' % args.shard]
             try:
-                run('unittest', [python, '-m', 'unittest', 'discover', '-v'])
+                try:
+                    run('unittest', command)
+                finally:
+                    suite = proof / 'suite' / 'result.json'
+                    record = json.loads(suite.read_text()) if suite.is_file() else {}
+                    keys = ('discovered_modules', 'discovered_tests', 'shard', 'modules') if args.shard else ()
+                    result.update({key: record[key] for key in keys + ('test_count',) if key in record})
             finally:
-                run('test-hosts', [python, 'scripts/check-test-hosts.py', '--root', str(scratch)])
-            test_output = (proof / 'unittest.stderr.txt').read_text()
-            match = re.search(r'Ran (\d+) tests?', test_output)
-            if not match:
-                raise RuntimeError('The unittest output did not report a test count')
-            result['test_count'] = int(match.group(1))
-            run('compile', [python, '-m', 'compileall', '-q', 'coordinator', 'scripts', 'tests'])
-            run('diff-check', ['git', 'diff', '--check'])
+                if first:
+                    run('test-hosts', [python, 'scripts/check-test-hosts.py', '--root', str(scratch)])
+            if args.shard and not result.get('modules'):
+                raise ValueError('shard has no test modules')
+            if 'test_count' not in result:
+                raise RuntimeError('The test runner did not report a test count')
+            if first:
+                run('compile', [python, '-m', 'compileall', '-q', 'coordinator', 'scripts', 'tests'])
+                run('diff-check', ['git', 'diff', '--check'])
             result['passed'] = True
     except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
         result['error'] = str(error)
@@ -118,4 +185,4 @@ def main():
 
 
 if __name__ == '__main__':
-    sys.exit(main())
+    sys.exit(main(sys.argv[1:]))

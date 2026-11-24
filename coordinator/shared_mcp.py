@@ -1,6 +1,7 @@
 """Copy explicitly shared Torii-home MCP entries into private launch configs."""
 
 import fcntl
+import asyncio
 import hashlib
 import json
 import os
@@ -21,17 +22,63 @@ def extend_scrubber(entries, scrub):
     scrub.extend(Scrubber(values).forms)
 
 
-def read_entries(store, scrub=None, *, reserved_names=()):
-    from .accounts import LOCAL_OVERRIDES_PATH
+def codex_launch(entries):
+    private = {}
+    configs = {}
+    for name, entry in entries.items():
+        headers = {}
+        for header, value in entry['headers'].items():
+            key = 'TORII_MCP_HEADER_' + hashlib.sha256((name + '\x00' + header).encode()).hexdigest().upper()
+            headers[header] = key
+            private[key] = value
+        configs[name] = {'url': entry['url'], 'env_http_headers': headers,
+                         'default_tools_approval_mode': 'approve'}
+    return configs, private
 
+
+async def codex_inherited(binary, env, cwd, *, coordinator=False):
+    """The names of the MCP servers that Codex loads from its own configuration. They stay on."""
+    process = await asyncio.create_subprocess_exec(binary, 'mcp', 'list', '--json', cwd=str(cwd), env=env,
+        stdin=asyncio.subprocess.DEVNULL, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
     try:
-        overrides = json.loads(LOCAL_OVERRIDES_PATH.read_text())
-        names = overrides.get('shared_mcp_servers', [])
-        if not isinstance(names, list) or any(not isinstance(name, str) or not name for name in names):
-            raise ValueError('invalid server names')
-    except FileNotFoundError:
-        return {}
-    except (OSError, UnicodeError, ValueError, AttributeError):
+        stdout, _ = await asyncio.wait_for(process.communicate(), 20)
+    except asyncio.TimeoutError:
+        process.kill()
+        await process.wait()
+        raise RuntimeError('Could not inspect Codex MCP configuration.') from None
+    except asyncio.CancelledError:
+        process.kill()
+        await process.wait()
+        raise
+    try:
+        rows = json.loads(stdout)
+        if process.returncode or not isinstance(rows, list) or any(
+                not isinstance(row, dict) or not isinstance(row.get('name'), str) or not row['name'] for row in rows):
+            raise ValueError()
+        names = {row['name'] for row in rows}
+    except (ValueError, UnicodeError):
+        raise RuntimeError('Could not inspect Codex MCP configuration.') from None
+    if coordinator and 'torii' in names:
+        raise RuntimeError('Remove the torii MCP server from the shared Codex configuration before launch.')
+    return names
+
+
+def codex_selected(store, selected, inherited, topic=None):
+    """The chat's servers that Codex can add to its own.
+
+    A Codex override merges into a server of the same name and cannot replace it, so that server
+    keeps its own configuration and Torii records a problem.
+    """
+    taken = sorted(set(selected) & set(inherited))
+    if taken:
+        problems.record(store, 'shared-mcp', 'codex-name-taken', 'entries=' + ','.join(taken), topic=topic)
+    return {name: entry for name, entry in selected.items() if name not in taken}
+
+
+def read_entries(store, scrub=None, *, topic=None, reserved_names=('torii',)):
+    from .chat_mcp import selection
+    names = selection(store, topic)
+    if names is None:
         problems.record(store, 'shared-mcp', 'selection-invalid')
         return {}
     if not names:
@@ -57,12 +104,12 @@ def read_entries(store, scrub=None, *, reserved_names=()):
                 problems.record(store, 'shared-mcp', 'entry-missing', 'entry=' + name)
             elif (not isinstance(entry, dict) or entry.get('type') != 'http' or
                   not isinstance(entry.get('url'), str) or not entry['url'] or
-                  not isinstance(entry.get('headers'), dict) or
+                  not isinstance(entry.get('headers', {}), dict) or
                   not all(isinstance(key, str) and isinstance(value, str)
-                          for key, value in entry['headers'].items())):
+                          for key, value in entry.get('headers', {}).items())):
                 problems.record(store, 'shared-mcp', 'entry-invalid', 'entry=' + name)
             else:
-                entries[name] = entry
+                entries[name] = dict(entry, headers=entry.get('headers', {}))
     if not entries:
         return {}
     if scrub is not None:
@@ -70,8 +117,8 @@ def read_entries(store, scrub=None, *, reserved_names=()):
     return entries
 
 
-def write_config(store, scrub=None):
-    entries = read_entries(store, scrub)
+def write_config(store, scrub=None, *, topic=None):
+    entries = read_entries(store, scrub, topic=topic)
     if not entries:
         return None
     content = json.dumps({'mcpServers': entries}, sort_keys=True, separators=(',', ':'))

@@ -1,356 +1,487 @@
-<h1 align="center">
-  <img src="docs/brand/torii-mark.png" alt="Torii mark: a gate inside a speech bubble" width="120">
-  <br>
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="docs/brand/torii-wordmark-dark.png">
-    <img src="docs/brand/torii-wordmark-light.png" alt="torii: your agents, one gate away" width="440">
-  </picture>
-</h1>
+# Torii
 
-<p align="center">
-  <b>Run your Claude Code and Codex agents from one Telegram chat.</b><br>
-  Run agents on your own machine with the subscriptions you already pay for.
-</p>
+Torii runs local agents for one Telegram owner. Each project topic has a
+persistent coordinator and its own work. The coordinator can answer, start
+workers, check their results, and report back in that topic.
 
-<p align="center">
-  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-green" alt="License: MIT"></a>
-  <img src="https://img.shields.io/badge/python-3.9%2B-blue" alt="Python 3.9+">
-  <img src="https://img.shields.io/badge/Telegram-bot-26A5E4?logo=telegram&logoColor=white" alt="Telegram">
-</p>
+Torii is independent of Anthropic, OpenAI, and Telegram. The core service uses
+Python's standard library. The source is shared as-is; outside pull requests are
+not accepted. Send feedback through issues. Report vulnerabilities through
+GitHub private vulnerability reporting, without credentials or transcripts.
 
-<!-- DEMO VIDEO: drag a 20-40s mp4 into the GitHub README editor and paste the resulting
-https://github.com/user-attachments/assets/... URL on its own line here. -->
+## Install Torii
 
-## Install
+You need macOS 13 or newer, or Linux with a systemd user session, Git, Python
+3.9 or newer, and a supported provider CLI. Install
+[Claude Code](https://code.claude.com/docs/en/setup) or the
+[Codex CLI](https://developers.openai.com/codex/cli), and use an account with
+access to the selected model. The machine must stay awake and online. Voice
+transcription is optional, macOS-only, and requires macOS 14 or newer on Apple
+silicon. It downloads a separate environment and model on first use.
 
-You need Git, Python 3.9+, and the `claude` or `codex` CLI installed and signed in.
-Replace `example/torii` in the examples with the repository you use. Then run:
+Create a dedicated bot with `/newbot` in [BotFather](https://t.me/BotFather).
+Use the repository URL supplied for your installation:
 
 ```sh
-git clone https://github.com/example/torii.git ~/torii && cd ~/torii && python3 scripts/setup.py
+git clone https://github.com/example/torii.git ~/torii
+cd ~/torii
+python3 scripts/setup.py
 ```
 
-Or ask your agent: *"Set up Torii by following docs/agent-setup.md in this repository. Never ask me for my Telegram bot token."*
+Run setup in your own terminal. Enter the bot token only at its hidden prompt.
+Never put the token in a command, agent chat, or issue. If it appears in a chat,
+revoke it in BotFather and use the replacement at the terminal prompt. The
+installer saves the path of the Python interpreter that runs it. Keep that
+interpreter installed. Use its absolute path instead of `python3` if needed.
 
-Setup walks you through BotFather, keeps your bot token out of chats and command lines, installs the
-background service, and gives you a link to add the bot to a Telegram group you own.
-See [Install and first run](#install-and-first-run) for the full steps.
+In Telegram, select a group you own and add the bot as an administrator. Keep
+**Manage topics**, **Delete messages**, and **Pin messages** enabled. Turn on
+**Topics** if asked, then tap **Check again**. In the **Torii** topic, select
+**Connect Claude** or **Add ChatGPT** and follow the sign-in card. Send the
+first request and choose its project name. Torii holds work until a provider is
+connected. Use **New project** in `/projects` for another project.
 
-Torii is a small service that runs on your own Mac or Linux machine. It connects
-you, as the one paired Telegram owner, to the Claude and Codex command-line agents
-installed on that computer. Each Telegram project topic gets its own long-running Claude or ChatGPT
-coordinator. You send a task in plain words; the coordinator plans it, hands
-parts to workers, checks their results, and answers in the same topic.
+### Agent-assisted setup
 
-Torii is an independent project. It is not affiliated with Anthropic, OpenAI, or Telegram.
+Follow this section only when the owner asks you to install Torii. Never ask
+for, read, print, or store the bot token, account credential files, or sign-in
+codes. Do not sign in for the owner or run nested agents. Preserve native
+account homes and history. Check Git, Python, and the selected provider CLI
+with their `--version` commands. A version check does not prove sign-in or
+native protocol support.
 
-## Why Torii
+Use the repository URL the owner supplied. Use `~/torii` unless the owner names
+another folder. If the destination is an existing Torii checkout, use
+`git pull --ff-only`. If it contains something else, choose a separate folder.
+Do not replace it. Guide the owner through BotFather without receiving the
+resulting token.
 
-| | Torii | Hosted agent apps |
-| --- | --- | --- |
-| Models | Claude Code and Codex; coordinators continue on ChatGPT when every Claude account is out of usage | The vendor's own models |
-| Where it runs | Your own machine, your repos and files | The vendor's servers |
-| Cost | The Claude and ChatGPT subscriptions you already have | A separate plan |
-| Interface | Telegram: one topic per project, voice notes, images, and files | The vendor's app |
-| Work tracking | One Git branch and worktree per task; state survives restarts | Varies |
-| Source | MIT, single owner, self-hosted | Closed |
+On a Mac with a GUI session, open the setup launcher in the owner's Terminal:
 
-Coding agents are good at long jobs, but they live in a terminal. Torii puts
-them in the chat app you already carry:
+```sh
+open -a Terminal ~/torii/scripts/setup.command
+```
 
-- **Away from the desk.** Start, steer, and review work from your phone.
-- **One conversation per project.** Each topic has a separate coordinator
-  conversation and job list. `/projects` → **New project** creates its topic
-  and a Git folder on your computer.
-- **Keeps talking while work runs.** Workers run in the background. You can
-  add instructions mid-task and they arrive in order.
-- **Survives restarts.** Messages, replies, and job state survive restarts,
-  provider switches, and usage-limit rejections. Torii asks the coordinator
-  to check interrupted work before continuing.
+Use the actual clone path. Do not attach to or inspect that Terminal window.
+On Linux, over SSH, or if opening Terminal fails, give the owner the setup
+command above to run in their own terminal. Do not run `scripts/setup.py`
+through an agent terminal or pseudo-terminal. After the owner says setup is
+complete, run `python3 scripts/setup.py --status` with the selected interpreter.
+Report its output and leave further interaction to the owner.
 
-## Requirements
+### Linux
 
-- macOS 13 or newer, or Linux with a systemd user session, plus Git. On macOS,
-  install Git with Apple's
-  [Command Line Tools](https://developer.apple.com/documentation/xcode/installing-the-command-line-tools)
-  by running `xcode-select --install` in Terminal. On Linux, use your
-  distribution's `git` package.
-- [Python 3.9 or newer](https://www.python.org/downloads/). Torii's core
-  has no third-party Python dependencies. Check `python3 --version` before setup.
-- [Claude Code](https://code.claude.com/docs/en/setup), the `claude` command,
-  or the [Codex CLI](https://developers.openai.com/codex/cli), the `codex` command.
-  Use an account with access to the selected provider and model. Connect Claude
-  or ChatGPT in Accounts.
-  Either provider can run the main chat.
-  Saved secrets and worker goals work with Claude and ChatGPT workers.
-- A new Telegram bot made with `/newbot` in @BotFather just for Torii. Using a
-  bot that another program polls interrupts that program.
-- A computer that stays awake and online. A sleeping computer does not answer.
-
-Voice notes are optional. Local voice transcription is macOS-only and requires macOS 14 or newer
-on Apple silicon and installs a separate environment and model on first use.
-See [voice setup](docs/setup.md#messages-and-reports) and
-[native CLI capability checks](docs/operations.md#native-cli-contract).
-Setup checks CLI availability, not a minimum CLI version.
-
-## Install and first run
-
-1. Ask your local agent to set up Torii, using this prompt:
-
-   ```text
-   Set up Torii on this computer. Follow the instructions at
-   docs/agent-setup.md in the Torii repository I provide.
-   Never ask me for my Telegram bot token.
-   ```
-
-   It clones Torii, checks this computer, guides you through BotFather, and opens
-   the setup window in Terminal. If it cannot open Terminal, it gives you one
-   command to run there. It never asks for your bot token.
-
-2. Or install by hand:
-
-   Install the Command Line Tools, Python, and at least one provider CLI from the
-   official links in [Requirements](#requirements). Open a new Terminal window
-   after installation. Check `git --version`, `python3 --version`, and
-   `claude --version` or `codex --version` before cloning.
-
-   ```sh
-   git clone https://github.com/example/torii.git ~/torii
-   cd ~/torii
-   python3 scripts/setup.py
-   ```
-
-   The token prompt is hidden. Do not put the token in an agent chat or a command.
-   The installer saves the absolute path of the Python interpreter that runs
-   setup in the LaunchAgent. To select another Python 3.9+ interpreter, replace
-   `python3` with its absolute path. Keep that interpreter installed.
-   `TORII_PYTHON` overrides the offline verifier's interpreter, not the installer.
-   Set it to the saved path when verifying a custom-Python installation.
-
-3. In Telegram, pick a group you own and tap **Add as admin**. If Telegram did
-   not open, use the printed link. No group yet? Create one before opening it.
-   Keep **Manage topics**, **Delete messages**, and **Pin messages** enabled.
-
-4. If asked, turn on **Topics** under the group name → **Edit**, then tap
-   **Check again**. Continue in the **Torii** topic and tap **Add ChatGPT** or **Connect Claude**.
-   Follow the sign-in card in your browser; paste a code in that topic if Claude asks.
-   Send your first request in **Torii**, then choose its project name.
-
-Each project starts under `~/Projects/torii` and gets its own group topic.
-Torii holds work until Claude or ChatGPT is connected. Either can run the main chat.
-Existing group installs keep working. The bot DM is only for secrets and sign-in
-codes. [Setup reference](docs/setup.md) covers setup and terminal alternatives.
+Run setup as a normal user with Linux-native provider sign-ins. Do not copy
+credentials, service state, or native history from another machine. The
+installer uses a systemd user unit. `scripts/install-service.py --write-only`
+writes the unit without changing systemd or linger. A manual install can use
+`python3 scripts/install-service.py`; it enables the user unit and linger.
+If local authorization blocks linger, an administrator must enable it for the
+user. Setup uses `xdg-open` only when a display is present.
 
 ## Daily use
 
-| Action | How |
+| Action | Control |
 | --- | --- |
 | Give or steer work | Send a message in an enabled project topic. |
 | Answer a question | Reply to the coordinator's message. |
-| Set a long verification goal | `/goal CONDITION` |
-| List or create projects | `/projects`, then **New project**, **Projects folder**, or **This topic ›** |
-| Add or inspect accounts | `/accounts`, then **Add Claude** or **Add ChatGPT** |
-| Set models and delegation | `/accounts`, then **Models & Codex ›** |
-| Catch up on this topic | `/tldr` |
-| See running agents and system load | `/health` |
-| Manage stored credentials | `/secrets`, then a name and **Rotate**, **Revoke**, or **Ask again** |
+| Set a long goal | `/goal CONDITION` |
+| Create or manage projects | `/projects` |
+| Add or remove accounts, set models | `/accounts` |
+| Manage saved credentials | `/secrets` |
+| See system load and agents | `/health` |
+| Catch up on a topic | `/tldr` |
 | Check the connection | `/ping` |
-| See the command list | `/help` |
-| Inspect tasks and workers on the computer | `python3 -m coordinator status` |
-| List local control operations | `python3 -m coordinator ctl list` |
+| List commands | `/help` |
 
-The command menu has seven commands, all without arguments. `/help` is a plain
-list with no buttons. `/setup` and `/start` still handle pairing and project
-linking, but stay out of the menu. The full command list is in
-[Telegram controls](docs/operations.md#telegram-controls).
-See [Update Torii](docs/operations.md#update-torii) and
-[Uninstall Torii](docs/operations.md#uninstall-torii) for service maintenance.
+Images and files can carry instructions in a caption. Telegram limits each
+bot download to 20 MB. The bot's private chat handles credentials and sign-in
+codes, not work requests. Owner settings and usage policy determine provider,
+model, effort, delegation, review, and shipping choices.
 
-### Faster replies and lighter models
-
-New installs use the Claude `sonnet` alias and `medium` parent thinking for
-Claude and ChatGPT. Workers also default to `medium`; your usage policy can
-choose another effort for each task. Existing installs keep their saved settings
-and their previous implicit model and parent effort through a one-time migration.
-Choose models, effort, and task routing for your own accounts and workload.
-The [example usage policy](docs/usage-policy.example.md) is a starting point.
-
-Lower thinking can speed up replies, but gives the parent less room to check
-assumptions and plan complex work. From the Torii folder, run:
+On the machine, list and inspect controls with:
 
 ```sh
-python3 -m coordinator ctl call effort.parent provider=claude effort=high
-python3 -m coordinator ctl call effort.parent provider=codex effort=low
+python3 -m coordinator --help
+python3 -m coordinator ctl list
+python3 -m coordinator ctl describe tasks.create
+python3 -m coordinator ctl call tasks.list
 ```
 
-Both providers accept `low`, `medium`, `high`, and `max`. Codex maps `max` to
-`xhigh`; use `max` in the control operation. These settings apply at the next
-parent launch. A changed launch fingerprint relaunches the parent after active
-work settles and resumes the same native session. If native resume fails, the
-existing recovery path can start a fresh session.
+`ctl call` accepts `key=value` arguments. Use `--topic` with a topic ID or a
+unique project name when needed. The CLI returns JSON. Exit codes 0, 1, 2,
+and 3 mean done or queued, handler failure, usage error, and refusal.
+`pending.signal` is local CLI only, refused over MCP and from worker sources.
+Telegram sources are also refused. Any process with local CLI access can call
+it.
 
-For fast, short replies with very little usage, try `gpt-6-luna` with low thinking.
-Claude `sonnet` or `haiku` are lighter alternatives:
+The loadout supplies model and effort defaults for coordinators and workers.
+`loadout.show` shows the effective defaults. Coordinators can use
+`loadout.swap` and `loadout.unswap` for owner-requested temporary changes.
+Swap creation requires the owner message ID and an end time within 30 days.
+Coordinators can create, end or show swaps only for their own chat. Only the
+home chat can create or end all-chat swaps by omitting `topic` on creation.
+`loadout.show` without `topic` uses the calling chat. Values have no control
+characters and appear quoted in prompts. Reasons appear only in
+`loadout.show`. Set worker effort with the local CLI `effort.worker` control.
+Codex service tier stays in the shared Codex configuration.
+
+Idle job trimming is off by default. To enable it after 24 hours, run
+`python3 -m coordinator ctl call cleanup.idle_trim enabled=true`. Add
+`hours=N` to choose another interval. Set `enabled=false` to turn it off.
+Jobs with armed waits are not trimmed.
+
+The sweep removes dependency and cache folders in job scratch, and ignored
+dependency, build and cache folders in work copies. Other scratch files, the
+job branch and results stay. A later worker receives a
+reminder to reinstall dependencies before tests or builds.
+
+Finished agent session cleanup is off by default. Use
+`python3 -m coordinator ctl call cleanup.sessions enabled=true` to move
+eligible native transcripts older than 14 days to the Trash once a day. Set
+`enabled=false` to stop the sweep. Open jobs, sessions referenced by their
+handoffs, and each chat's two most recent native sessions stay. OpenCode stores
+sessions together in a database. Its database moves only when all sessions in
+it belong to the finished work and the database can move as one file.
+OpenCode worker home cleanup runs independently. After its three-day grace
+period, it saves usage and moves eligible homes from cleared jobs to the Trash.
+
+When close-save is on, an open job with no queued, running or waiting worker
+for 48 hours is parked like a waiting job: Torii saves its work and proofs,
+then clears its worktree and scratch. Before the scratch clear, each Git tree in
+scratch gets a bundle of the commits and stashes no surviving ref holds and a patch of its
+changes and untracked files in `rounds/K/scratch-git/`, and the job notes name
+the folder. Commits that only a reflog holds are pinned under
+`refs/torii/scratch-reflog/` first. A `.git` file counts as a Git tree only when it points at a Git directory.
+If one tree cannot be saved, the whole scratch stays, the partial save is removed and the park is held
+with a cleanup problem that names the tree. A later save links the bundle of an earlier save of the same commits. A save that no
+round records moves to a `torii-trim-task-*` folder in the Trash only when each of its files is also in a save
+that stays: the same bytes, or a bundle of the same heads, left-out commits and object count. The job stays open, and the next worker
+rebuilds the worktree. A park whose save fails is retried after 1, 2, 4 hours
+and so on, at most a day apart; the hourly park check never parks a job again in the same round,
+whatever its copy state, and a paused rebuild keeps its hold. When a saved `branch.bundle` is
+gone, Torii rebuilds it from the commits the repository still holds or can
+fetch from its remotes and the project's other clone. A saved ref that moved
+stops the rebuild. If every source answers that the commits are gone, Torii
+records one `saved-work-lost` problem and stops retrying; if a source gives no
+answer, it records `saved-work-unverified` and keeps retrying. Copies of git-ignored files in `rounds/` are deleted 7
+days after a done or dropped job closes. A `rebuildable` close rule
+(`cleanup.close_rules rebuildable='[{"project": ..., "paths": [...],
+"manifest": ..., "prefix": ..., "ref": ..., "command": ...}]'`) skips
+ignored files whose sha256 matches the published manifest at `ref`, because
+`command` fetches them again. Files that differ are saved as usual.
+
+For an open job without a queued, running or waiting worker, the hourly sweep
+moves scratch entries untouched for 48 hours to a `torii-trim-task-*` folder
+in the Trash. It also trims scratch over 10 GiB and results over 2 GiB oldest
+first, starting with entries at least 12 hours old. Records, reports,
+`HANDOFF.md`, KEEP, `rounds/`, Git bundles, Git trees, referenced paths and files
+that a process has open stay. A note, a prompt, a script or a `.md` file in the
+job's results that names the job folder keeps every entry in it. The caps count
+only entries that the sweep can move. While a job has such a worker, Torii
+removes from its scratch only clean, merged Git worktrees. A path that the
+reference scan may not read is skipped and recorded as a
+`reference-scan-unreadable` cleanup problem.
+When free space on the state volume is below 10 percent, idle jobs park after
+2 hours and Torii records a `low-disk` cleanup problem. Torii deletes its
+`torii-trim-task-*` and `torii-orphan-*` Trash entries after one day in the Trash.
+
+When a worker of a job ends, Torii removes extra Git worktrees in that
+job's scratch only if each is clean, has no unknown ignored files, no lock, no
+live process, no KEEP link or proof, and its HEAD is on the remote main branch.
+While another worker of the job is unfinished, only a worktree that nothing
+wrote to for 48 hours goes.
+Ignored dependency, build and cache folders go with it. The branch stays. The
+managed job worktree is never removed this way.
+
+Channel continuity includes UTC dates for recent messages and reply status
+for owner messages. A reply not linked status does not prove that a message was unanswered.
+
+To message another Torii chat or agent, follow "Messaging another chat or
+agent" in [AGENTS.md](AGENTS.md). The recipient treats the event as a note, not
+an owner instruction.
+
+## How Torii works
+
+The service accepts work only from the paired numeric Telegram owner in the
+paired group. Names and usernames are display text. Other users, bots, edited
+messages, and anonymous administrators cannot submit work. Forwarded messages
+from others are content, not owner instructions. New topics need a project
+binding before they accept work.
+
+The service saves an incoming update and its cursor before acknowledging it.
+It feeds saved messages to the topic coordinator in order, including during an
+active turn. A message does not itself create a task. The coordinator creates a
+task for committed work, delegates, and verifies results. Tasks use worktrees.
+The service persists worker results and an outbox for replies. Retrying a
+Telegram delivery never repeats agent execution.
+
+A new job worktree without a `base` starts from the remote's current default
+branch. Torii reads it with `git ls-remote --symref` and keeps the answer for
+five minutes. Set `git config torii.defaultBase <branch>` in the project clone
+to choose another branch. When the remote cannot be read, Torii uses the
+upstream of the clone's checked-out branch, then its `HEAD`.
+
+Claude and Codex research workers without a worktree start in job scratch and
+receive the project path for reading. Dev and OpenCode workers create a
+worktree when needed. The operating system does not enforce read-only access
+to the project for research workers.
+
+Provider hosts are detached from the service and hold native session locks.
+On restart Torii reattaches to live hosts or resumes the saved native session.
+It does not blindly replay uncertain work. Inspect actual effects before
+continuing an interrupted task. A provider receipt proves delivery to a session,
+not that the agent applied the instruction. A process exit does not prove a
+deployment worked; verify the target.
+
+Torii reports Claude and Codex worker processes that survive the provider and
+are reaped at turn end. The worker result retains its success and text and
+reports process details. Existing failures are preserved.
+
+Each worker receives the job's `results/task-<id>/HANDOFF.md` as it existed
+when queued. Before it ends, it should update the file in at most 60 lines with
+its goal, current state, completed work and proof paths, work in flight, next
+step, work not to repeat, and open questions. `workers.get` and `tasks.get` show
+`no_handoff` when the file was missing or older than the worker start. Older
+workers without a recorded start have an unknown value. To measure the share of
+recorded worker ends with fresh handoffs, run:
 
 ```sh
-python3 -m coordinator ctl call model.parent provider=codex model=gpt-6-luna
-python3 -m coordinator ctl call model.parent provider=claude model=sonnet
+python3 scripts/handoff-share.py /path/to/state.sqlite
 ```
 
-These are alternative parent selections; the last selection wins. Lighter models
-can miss details on large tasks, even at higher effort. Keep stronger models for
-complex coding and reviews. `model.coordinator model=sonnet` changes the Claude
-model used by automatic parent selection. `model.codex model=gpt-6-luna` and
-`model.worker model=haiku` change future worker models without selecting a parent.
-Workers take an `effort` on each `workers.spawn`; parent thinking settings do not
-change worker effort. Your usage policy controls worker choices.
+`coordinator/policy.py` is the source of coordinator instructions.
+`coordinator/control_api.py` defines operations and their access rules.
+`coordinator/store.py` owns durable state, and `coordinator/mcp.py` exposes
+coordinator tools. Discover current arguments with `ctl describe` or MCP tool
+schemas rather than relying on a copied operation list.
 
-To restore default parent thinking and automatic model selection, omit the values:
+## Accounts and credentials
+
+Claude profiles retain their native sign-ins. Torii does not read or pass
+Claude sign-in tokens. The owner can pick an eligible Claude account; otherwise
+Torii selects an eligible account by weekly reset time and alias. Claude
+accounts switch at 99% usage or at a configured reserve. A running parent waits
+for active work to settle, then resumes its native conversation under the next
+account. Workers can switch when Claude rejects them for usage. When no Claude
+account is available, new parents can use the active ChatGPT account.
+When ChatGPT auto-switch is on, a parent paused for usage continues when any
+ChatGPT account becomes available. Any connected agent can run any chat,
+including the home chat, and `model.parent` without topic can make any of them
+the default. When the agent of a chat or a worker is out of usage, Torii moves
+the work to the next agent that has capacity: the other of Claude and ChatGPT
+at the same tier. A chat moves when it next starts, and it returns after its
+current work settles once its own agent can run again. A worker that has not
+started moves at launch. A running worker that hits its limit continues on the
+new agent from a handoff: its brief and the `HANDOFF.md` of its job. Each move
+sends one short note. When no agent has capacity, the work waits for the first
+reset. A picked agent that does not start counts as out for 15 minutes when
+another agent takes the chat; the wait doubles with each failure in a row, up
+to a day, and a new pick clears it. OpenCode work moves out the same way.
+No work moves to OpenCode. A short OpenCode rate limit is not an outage.
+A ChatGPT worker moves only while Codex account switching is on.
+Codex account switching is off unless
+the owner enables it. With it on, workers and ChatGPT chat agents use accounts
+with included allowance first, in weekly reset order. Both move at 99% usage.
+They then use prepaid credits, largest balance first, down to zero. With
+auto-switch off, workers and parents stay on the active account and can use its
+credits after its included allowance runs out. An ordinary-meter usage-limit
+rejection blocks a funded account until a fresh status shows usable included
+allowance or permits credits with a positive balance. A separate model-meter
+rejection holds the account until that meter resets.
+Torii sends one home notice when work starts using credits during an outage.
+`/health` shows each ChatGPT account's credit balance. Account enablement, selection,
+models, and delegation are owner controls.
+
+Use `/secrets` to request or manage credentials. The owner fills a private card
+in the bot DM. Declared secrets reach authorized workers through their process
+environment; the coordinator receives names and metadata. Output scrubbing
+has limits. Native transcripts, files, encoded values, and provider requests can
+retain secrets. Telegram also retains its own records. If Telegram message
+deletion fails, delete the message and rotate the credential.
+
+The bot token, state, vault, and logs are private local data. A worker running
+as the same operating-system user can still access files available to that user.
+Do not upload logs or transcripts to public issues. Never read or copy account
+credential files or provider history during setup or maintenance.
+
+## Operate and recover
+
+Run exactly one service poller for a bot. The installer configures a macOS
+LaunchAgent or Linux systemd user unit. `scripts/run-service.sh` runs the
+service in the foreground. `--pair-only` still contacts Telegram but does not
+run agents. Pairing uses a single-use code and checks the group creator. Never
+share that code. Re-pairing disables old topics and retires undelivered reports;
+project folders and native sessions remain local.
+
+Use `/accounts` to see usage, add or remove accounts and set models. Ask the
+coordinator in text for an account pick or a banked reset. ChatGPT auto-switch
+(`accounts.codex_auto`) and Codex on or off (`delegation.codex`) are local
+controls. Use `ctl list` and `ctl describe` for local controls. The owner's rules live in rule files; see
+Rule files below.
+
+## Job record recovery
+
+Torii keeps job records and journals in the state directory's `records/` folder.
+The ledger also holds an allowlist of durable, non-secret settings, including chat tags, and plain copies
+of the personal, tag and chat rule files. It does not back up the vault, account credentials,
+worker sessions, or chat memory. A setting with a secret-shaped value is omitted.
+A rule file with a secret-shaped value blocks the configuration snapshot until the
+value is removed. Check the records problems before relying on the backup.
+
+To restore records and the saved configuration into a fresh state directory, run:
 
 ```sh
-python3 -m coordinator ctl call effort.parent provider=claude
-python3 -m coordinator ctl call effort.parent provider=codex
-python3 -m coordinator ctl call model.parent
+python3 -m coordinator --state-dir /path/to/new-state records restore --source /path/to/records
 ```
 
-If you changed worker models or the coordinator model, omit `model` from the
-corresponding `model.codex`, `model.worker`, or `model.coordinator` operation to
-restore its default.
+A closed job's journal leaves the folder once it is committed; the record's `log:` names the commit that holds it,
+and `tasks.get` prints the `git show` command.
 
-## Features
+The source can be a records folder or a clone. Restore brings back the saved
+`records.sync` choice and remote. When the service starts, an enabled sync can
+push later commits to that remote. Pair the bot and reconnect accounts separately;
+the vault has no backup in the ledger.
 
-- **A coordinator per topic.** Each project topic has its own persistent
-  Claude or ChatGPT coordinator session. Your first request starts it. You can
-  [choose the provider and model for all coordinators](docs/control-api.md#setup-and-settings-operations)
-  with local controls.
-  Changes wait for active work to settle. Provider switches post a notice in
-  that topic. Sessions resume after a relaunch.
-- **Claude and Codex workers.** The coordinator delegates to native Claude
-  subagents, Codex, or background service workers, and checks what they claim.
-  The coordinator and workers follow your project's `AGENTS.md` and run the
-  project's own checks.
-- **Optional OpenCode agents.** Enable OpenCode to run workers and linked chat
-  agents outside the home topic. They use the selected account's model, have no
-  goals or saved secrets, and report estimated API spend. See
-  [OpenCode chat agents](docs/operations.md#opencode-chat-agents).
-- **One worktree per task.** Each committed task gets its own Git branch
-  (`torii/task-<id>`) and worktree. Your usage policy and repository rules
-  determine how changes are reviewed and shipped.
-- **Attachments and voice.** Send images, files of any type, and voice notes.
-  Voice notes are transcribed locally on the Mac (macOS only).
-- **Several accounts.** Use your own Claude and ChatGPT subscriptions. Each
-  Claude agent uses one of your Claude Code sign-ins and that account's
-  `CLAUDE_CONFIG_DIR` folder. Claude rotation is automatic at 98% used by
-  default, or at a local per-account reserve. Torii waits for current work to
-  settle, then restarts the coordinator under the next eligible account and
-  resumes the same conversation. When every Claude account is out of usage,
-  coordinators continue on your ChatGPT account and return to Claude after it
-  recovers. Torii reads usage through Claude Code, which
-  talks directly to Anthropic. Torii never reads, copies, or forwards sign-in
-  tokens. Codex worker account switching stays off until you turn it on.
-  ChatGPT coordinator accounts never switch automatically.
-- **Private credentials.** Send a credential through a secure card. Torii
-  stores accepted values in an encrypted local vault and keeps them out of
-  its work-message records and prompts. Tap **Fill privately** to use the bot DM.
-  Waiting cards carry a start link. Armed cards open the private chat directly.
-  An expired card offers **Ask again** to post a fresh request.
-  See [credential transport and deletion](docs/setup.md#setup).
-- **Settings in Telegram.** `/accounts` shows usage, sign-ins, and resets.
-  Its **Models & Codex ›** button opens model and delegation settings.
-  `/projects` manages projects. `/health` shows running agents and system load.
-- **Status at a glance.** Torii reacts to your message: 👀 when the coordinator
-  takes it on, 👨‍💻 or 🤔 when a worker starts coding or researching, and 👌 when
-  the job is done.
+## Rule files
 
-## How it works
+Torii loads `coordinator/defaults/Torii.md`, then `<state>/personal.md`, then
+`<state>/tags/<tag>.md` for each of the chat's tags in order, then `<state>/chats/<topic>/chat.md`.
+Missing tag files are skipped. The chat agent and its workers see the chat's MCP
+server names in their fixed rules. Coordinators load updated rules with the next message.
+New workers receive the rules without coordinator-only sections.
 
-```mermaid
-flowchart LR
-    T[Telegram project topics] --> M[Saved messages]
-    M --> C[Claude or ChatGPT coordinator per topic]
-    C --> W[Native subagents, Codex, or service workers]
-    W --> C
-    C --> O[Telegram outbox]
-    O --> T
+New chats start with no tags.
+
+Use `chat.tags topic=<topic>` to show the tags. Set them in order with
+`chat.tags topic=<topic> tags=dev_agent,project_torii`, or clear them with `chat.tags topic=<topic> tags=`.
+Project tags include `project_torii`, `project_notes`, and `project_webapp`. Tag names start with
+a lowercase letter or digit and can contain up to 64 lowercase letters, digits, underscores or hyphens.
+`policy.show topic=<topic>` shows each file and its byte count. `policy.set text=...` replaces
+`personal.md`. `policy.chat topic=<topic> message=<owner-message-id> append=...` adds a rule to
+`chat.md`.
+
+## Chat MCP servers
+
+Each chat can select HTTP MCP server names from the Torii home's
+`~/.claude.json`. Torii passes valid HTTP entries and records a problem for
+unsupported or invalid entries. For example, run:
+
+```sh
+python3 -m coordinator ctl call chat.mcp topic=TOPIC 'names=["example-mcp"]'
 ```
 
-1. The service polls Telegram, accepts only the paired owner, and saves each
-   message in SQLite before anything acts on it.
-2. It hands each saved message, in order, to that topic's coordinator. Messages
-   sent while a turn runs are delivered too.
-3. The coordinator answers directly, or commits to a task and delegates it.
-   Worker results come back to the coordinator as messages.
-4. Replies go through a saved outbox. A delivery retry never reruns an agent.
+A tag can name default servers for its chats:
 
-Every coordinator and worker runs under its own detached host, so restarting
-the service interrupts no agent. On relaunch Torii reattaches to live hosts or
-resumes each topic's exact native session. It does not blindly rerun work that
-may have partly happened. See [Architecture](docs/architecture.md) and
-[Coordinator and delegation](docs/orchestration.md).
+```sh
+python3 -m coordinator ctl call tag.mcp tag=TAG 'names=["example-mcp"]'
+```
 
-## Safety model
+A chat without its own selection uses the union of its tags' defaults, in tag
+order. A chat's own selection overrides them; `names=[]` selects no servers and
+`names=null` returns the chat to its tag defaults. New chats use their tag defaults.
+Claude, OpenCode, and Codex coordinators and workers use their chat's selection
+on new launches. The server entries and headers stay in `~/.claude.json`.
+The selection applies at the next coordinator or worker launch.
+A failed connection leaves that server's tools unavailable.
 
-Torii is a trusted, single-owner tool. Read the [access model](SECURITY.md)
-before you enable agents.
+The chat's selection only adds servers. Claude and Codex still load the MCP
+servers from their own configuration: Claude's user, local and project servers
+(including `.mcp.json`) and Codex's `config.toml` servers, stdio servers
+included. For Claude, a selected server replaces a native server of the same
+name. Codex cannot replace a server it already has, so its own server keeps the
+name and Torii records a `codex-name-taken` problem.
 
-- **Agents have your permissions.** Claude workers run with
-  `--dangerously-skip-permissions`. Codex app-server threads use
-  `approvalPolicy="never"` and `sandbox="danger-full-access"`; the separate
-  exec path uses `--dangerously-bypass-approvals-and-sandbox`. They can read and change
-  anything your user account can. A Git worktree is not a sandbox.
-- **Only you can give work.** An expiring, one-use pairing code binds your
-  numeric Telegram ID and the group you own. Other users, bots, edited messages, and
-  anonymous admins cannot submit work. New topics stay disabled until bound to a project.
-- **Credential handling.** Claude profiles keep their own sign-in. Torii never
-  reads or passes Claude sign-in tokens. The bot token, state, and logs live outside the
-  repository with private permissions. Credentials go through the private chat
-  into an encrypted vault. Claude and ChatGPT job workers receive only the
-  secrets their task declares, through their own process environment. The
-  coordinator receives names and metadata only. Codex secret workers require
-  a private app-server and checked launch controls that disable shell snapshots,
-  memory generation, native subagents, and tool-output telemetry. Captured-output
-  scrubbing has limits, and native history can retain values a tool prints.
-  See [Credentials](docs/operations.md#credentials).
-- **No silent reruns.** After a restart, Torii reports uncertain work to the
-  coordinator instead of repeating it.
+Torii 2.0 shared the `shared_mcp_servers` names in `local-overrides.json` with
+every chat. The first start after an upgrade gives each existing chat that
+selection once. Chats created later start with their tag defaults.
 
-## Docs
+Telegram updates are off by default. Ask the coordinator to turn them on
+(`service.updates enabled=true`) if wanted. `/update` shows a card before applying the displayed versions. The
+updater refuses tracked changes and non-fast-forward checkouts. It runs no tests.
+A successful first Telegram poll at the intended commit is its health signal;
+failed updates can roll back. Do not infer live success from a process exit.
+When `origin/main` moves before the tap, Torii still updates to the commit shown
+on the card if `origin/main` contains it.
 
-- [Setup reference](docs/setup.md): models, effort, usage policy, worktrees
-- [Operations](docs/operations.md): controls, accounts, credentials, logs, troubleshooting
-- [Architecture](docs/architecture.md): request flow, recovery, stored state
-- [Coordinator and delegation](docs/orchestration.md)
-- [Control API](docs/control-api.md)
-- [Pinned release](docs/release.md)
-- [Verification](docs/verification.md): the offline test baseline
-- [Access model](SECURITY.md) and [Contributing](CONTRIBUTING.md)
+Before a manual update or uninstall, stop new work and let active turns,
+background tasks, and workers settle. Inspect the installed checkout and service
+configuration. Stopping the poller alone does not stop detached hosts. Preserve
+state, the vault and its key, projects, worktrees, and native history. To
+uninstall, unload the service and move only inspected, owner-selected files to
+Trash. Verify that the service is absent before moving its checkout.
 
-To run the offline checks from this checkout:
+For a pinned macOS release, `scripts/pin-release.py COMMIT` creates or reuses a
+detached release worktree and prints the values and commands to apply. It does
+not change or restart the service. Only the owner applies the release. After
+activation, check the service start log for the intended commit, release path,
+and home path. Preserve the previous release while its hosts still run.
+
+To transfer a native session, inspect its live state first. Wait for active work
+and bridge checks to settle. Transfer ownership rather than forking, preserving
+the working directory and native session ID. Never run two writers against one
+native session. Do not restart the old writer while the service owns it.
+Never delete, move, copy, or truncate native account history or authentication.
+
+## Change and verify Torii
+
+Each Claude coordinator chat has its own memory folder at
+`<state>/chats/<chat>/memory`. Torii warns when a chat index exceeds 40 lines and asks the
+coordinator to trim it. Claude's own 200-line or 25 KB load limit still applies.
+Nightly maintenance removes dead file links from chat indexes when their
+coordinators are idle. It does not remove memory notes.
+
+Use Python 3.9-compatible standard-library code. Persist each request before
+acknowledging it. Never rerun agent execution because delivery failed. Code has
+no comments; docstrings and a first-line shebang are allowed. Preserve the
+owner, routing, recovery, and one-writer boundaries when changing behavior.
+Add meaningful regression coverage for changed behavior.
+
+Run the offline baseline with the service interpreter:
 
 ```sh
 /usr/bin/python3 ./scripts/verify-local.py
 ```
 
-The verifier defaults to `/usr/bin/python3`. For an installation using another
-interpreter, run `TORII_PYTHON=/absolute/path/to/python3 ./scripts/verify-local.py`.
-Use the interpreter registered with your LaunchAgent on macOS or systemd user
-unit on Linux.
-The checks use fake Telegram and provider processes in scratch state and do not touch
-a running service.
+Set `TORII_PYTHON` to the service interpreter if it differs. The verifier uses
+fresh scratch state, fake Telegram transport, and fake providers. It runs the
+unittest suite, compilation, comment check, CLI checks, and `git diff --check`.
+Read its `result.json`; a proof directory alone is not a pass. Offline checks do
+not verify live Telegram, provider sign-in, or deployment.
 
-## Shared MCP servers
+Live Telegram checks need task-specific authorization and an isolated bot,
+topic, state directory, and native session. Confirm one poller owns the test
+bot. Check the group picker, administrator rights, topic migration, sign-in,
+and message delivery on the selected test client. Do not restart the running
+service, change accounts, or send test messages without authorization.
 
-Claude coordinators and workers can share MCP servers from your
-`~/.claude.json`. The list is opt-in and empty by default; add server names to
-the checkout's gitignored `local-overrides.json`:
+The public snapshot builder `scripts/public_snapshot.py` exports files from a
+committed revision using `scripts/public_snapshot_files.json`. It requires a
+private denylist and successful secret scanners, and does not push. Review the
+output and its report before any separately authorized publication. Update the
+manifest when tracked files change. Public files must not contain private names,
+credentials, or private operational details.
 
-```json
-{"shared_mcp_servers": ["example-mcp"]}
+For a local export, install Git, gitleaks, and trufflehog. Use a new output
+folder and a private, nonempty denylist outside the repository:
+
+```sh
+/usr/bin/python3 scripts/public_snapshot.py --commit HEAD \
+  --output /absolute/new-snapshot-folder \
+  --denylist /absolute/private-identifiers.txt \
+  --author-name 'Public Author' --author-email 'public@example.invalid'
 ```
 
-See [Setup reference](docs/setup.md#shared-mcp-servers) for the rules.
+The builder scans before it initializes the output repository. If a scan fails,
+inspect and move the partial output to Trash. Use a fresh output path for a
+retry. Publication is a separate owner action. Never force-push a snapshot.
+
+## Security
+
+Agents run with the local user's permissions and can read or change accessible
+files and accounts. A Git worktree is not a sandbox. Trust the machine, its
+users, and the selected agent configurations.
 
 ## License
 
-MIT. See [LICENSE](LICENSE). The Claude and Codex CLIs and services have their
-own terms.
+MIT. See [LICENSE](LICENSE).

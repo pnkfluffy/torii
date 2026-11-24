@@ -1,7 +1,7 @@
 """One OpenCode subscription, its usage windows and bounded quota holds."""
 
 import asyncio
-from datetime import datetime, timezone
+from datetime import datetime
 from email.utils import parsedate_to_datetime
 from http.client import HTTPException
 import json
@@ -16,7 +16,7 @@ from .control_api import Refused
 
 
 USAGE_URL = 'https://opencode.ai/zen/go/v1/usage'
-WINDOWS = {'rolling': '5-hour', 'weekly': 'weekly', 'monthly': 'monthly'}
+WINDOWS = {'rolling': '5-hour', 'weekly': 'week', 'monthly': 'month'}
 RECHECK_SECONDS = 300
 HTTP_TIMEOUT = 15
 MAX_RESET_SECONDS = 32 * 86400
@@ -294,21 +294,40 @@ def limit_info(data, message=''):
     return {'retry_at': retry_at(data)} if data.get('statusCode') == 429 or quota else None
 
 
-def card(store, alias):
+def _account_line(store, alias):
+    from .controls import _window_left, resets
+    from .health import _future, _plain, account_mark
+
     snapshot = (store.get('opencode_account_status', {}) or {}).get(alias, {})
-    lines = ['OpenCode subscription']
-    if snapshot.get('error'):
-        lines.append(ERRORS.get(snapshot['error'], ERRORS['usage_unavailable']))
-    elif snapshot.get('usage'):
-        for name, label in WINDOWS.items():
-            window = snapshot['usage'][name]
-            reset = window['resets_at']
-            when = datetime.fromtimestamp(reset, timezone.utc).strftime('%Y-%m-%d %H:%M UTC') if reset else 'unknown'
-            lines.append('%s: %g%% left; resets %s' % (label, max(0, 100 - window['utilization']), when))
-    else:
-        lines.append('Usage has not been checked yet.')
-    block = account_block(store, alias)
-    if block:
-        until = datetime.fromtimestamp(block['until'], timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
-        lines.append('Paused until ' + until + ('; usage will be rechecked.' if not block['reset_known'] else '.'))
-    return '\n'.join(lines)
+    usage = snapshot.get('usage', {})
+    error = snapshot.get('error')
+    state = launch_state(store, alias)
+    signed_out = error in (*AUTH_ERRORS, 'key_file')
+    authenticated = not signed_out and state != 'usage_unavailable'
+    until = account_block(store, alias).get('until')
+    if authenticated and state != 'ready' and until is None:
+        until = max((window['resets_at'] for window in limited_windows(snapshot)
+                     if _future(window.get('resets_at'))), default=None)
+    mark, words = account_mark(authenticated, True, {'state': 'ready' if state == 'ready' else 'limited', 'until': until})
+    prefix = f'{mark} {_plain(alias)}: '
+    detail = ERRORS.get(error, ERRORS['usage_unavailable']) if error else ''
+    if mark == '⚪':
+        if not snapshot:
+            detail = 'Usage has not been checked yet.'
+        return prefix + (words if signed_out else 'usage unavailable') + ('\n' + detail if detail else '')
+    if mark == '🟢':
+        times = [(label, usage.get(name, {}).get('resets_at')) for name, label in WINDOWS.items()]
+        soonest = min(((label, reset) for label, reset in times if _future(reset)),
+                      key=lambda window: window[1], default=None)
+        if soonest:
+            label, reset = soonest
+            words = f'{label} {resets(reset)}'
+    remaining = [_window_left(usage.get(name, {}))[0] for name in WINDOWS]
+    line = prefix + ' · '.join(f'{left:g}%' if left is not None else '?' for left in remaining)
+    return line + (', ' + words if words else '') + ('\n' + detail if detail else '')
+
+
+def card(store, alias=None):
+    aliases = accounts(store) if alias is None else (alias,)
+    heading = '**OpenCode** (left: ' + ' · '.join(WINDOWS.values()) + ')'
+    return '\n'.join([heading] + [_account_line(store, name) for name in aliases]) if aliases else None

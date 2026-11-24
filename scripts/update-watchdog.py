@@ -2,7 +2,6 @@
 """Copied before mutation so rollback survives a broken checkout or service."""
 
 import argparse
-import ctypes
 import importlib.util
 import json
 import os
@@ -232,21 +231,7 @@ def file_identity(path):
 
 
 def exchange(left, right):
-    library = ctypes.CDLL(None, use_errno=True)
-    if sys.platform == 'darwin':
-        rename = library.renamex_np
-        rename.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint]
-        args = (os.fsencode(left), os.fsencode(right), 2)
-    elif sys.platform.startswith('linux') and hasattr(library, 'renameat2'):
-        rename = library.renameat2
-        rename.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
-        args = (-100, os.fsencode(left), -100, os.fsencode(right), 2)
-    else:
-        raise RuntimeError('Atomic tool installation is not supported on this host')
-    rename.restype = ctypes.c_int
-    if rename(*args):
-        error = ctypes.get_errno()
-        raise OSError(error, os.strerror(error))
+    return host_os.exchange_paths(left, right)
 
 
 def restore_runtime(runtime, database):
@@ -384,12 +369,6 @@ def stop_old(record):
     return False
 
 
-def service_command():
-    if host_os.linux():
-        return ['systemctl', '--user', 'restart', 'local.telegram-agent-coordinator.service']
-    return ['launchctl', 'kickstart', '-k', 'gui/%d/local.telegram-agent-coordinator' % os.getuid()]
-
-
 def new_health(record, commit):
     health = record.get('health') or {}
     before = record.get('restart_from') or {}
@@ -504,7 +483,7 @@ def watchdog(db, update_id, service_control=None, restart_timeout=240):
             return
         if superseded(db, read(db)):
             return
-        command(service_control if service_control is not None else service_command())
+        command(service_control if service_control is not None else host_os.service_restart_command())
     except RuntimeError as error:
         write(db, update_id, phase='recovering', interrupted_phase='rollback_restart', result=str(error), restored=results)
         return

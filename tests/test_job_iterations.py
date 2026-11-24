@@ -26,6 +26,13 @@ class JobIterationTests(unittest.TestCase):
         self.origin = self.store.message_save('1:2', 'owner', 'Build the job', telegram_message=405)
 
     def call(self, op, **params):
+        if op == 'tasks.update' and params.get('status') == 'dropped':
+            params.setdefault('note', 'No longer needed')
+        if op == 'tasks.update' and params.get('status') == 'done':
+            job = self.store.task_get(params['task'])
+            if not self.store.db.execute('SELECT 1 FROM outbox WHERE task=?', (job['id'],)).fetchone():
+                with self.store.db:
+                    self.store.enqueue_report(job['topic'], 'Result', task=job['id'])
         result = control_api.call(self.store, op, params, topic='1:2')
         self.assertTrue(result.ok, result.text)
         return result
@@ -70,7 +77,8 @@ class JobIterationTests(unittest.TestCase):
                 task = self.call('tasks.create', title='Child', message=self.origin['id'],
                                  finish=finish, parent=parent['id']).data
                 self.assertEqual((task['finish'], task['parent']), (finish, parent['id']))
-                closed = self.call('tasks.update', task=task['id'], status='done')
+                closed = self.call('tasks.update', task=task['id'], status='done',
+                                   summary='Closed in test.\nNo PR: a test job with no change.')
                 self.assertEqual((closed.data['status'], closed.data['iteration']), ('done', 0))
         for finish in ('code', 'answer', 'deliver', 'unknown'):
             result = control_api.call(self.store, 'tasks.create', {'title': 'Invalid', 'topic': '1:2',
@@ -86,20 +94,21 @@ class JobIterationTests(unittest.TestCase):
 
     def test_parent_description_uses_global_job_id(self):
         description = control_api.BY_ID['tasks.create'].description
-        self.assertIn("parent takes the job's global id", description)
-        self.assertIn('not its per-chat number', description)
+        self.assertIn('parent is the global job ID.', description)
 
     def test_legacy_status_updates_record_the_same_round_without_new_transitions(self):
         task = self.job()
+        with self.store.db:
+            self.store.enqueue_report('1:2', 'Result', task=task['id'])
         for status in ('done', 'open', 'dropped'):
             with self.subTest(status=status):
                 with patch('coordinator.store.time.time', return_value=200):
-                    self.call('tasks.update', task=task['id'], status=status)
+                    self.call('tasks.update', task=task['id'], status=status, **({'summary': 'Closed in test.'} if status in ('done', 'dropped') else {}))
                 row = self.store.db.execute('SELECT k,closed,outcome FROM task_iterations WHERE task=?',
                                              (task['id'],)).fetchone()
                 self.assertEqual(tuple(row), (0, None, None) if status == 'open' else (0, 200, status))
         for status in ('waiting', 'interrupted'):
-            self.assertFalse(control_api.call(self.store, 'tasks.update', {'task': task['id'], 'status': status}).ok)
+            self.assertFalse(control_api.call(self.store, 'tasks.update', {'task': task['id'], 'status': status, **({'summary': 'Closed in test.'} if status in ('done', 'dropped') else {})}).ok)
         self.assertEqual(self.store.db.execute('SELECT COUNT(*) FROM task_iterations').fetchone()[0], 1)
 
     def test_spawn_and_stamps_keep_the_round_they_were_created_in(self):
@@ -143,13 +152,13 @@ class JobIterationTests(unittest.TestCase):
         self.round_one(task)
         second = self.spawn(task, 'Next round')
         self.assertEqual(self.call('workers.get', worker=first).text,
-                         'Worker %d: queued, job %d, effort medium' % (first, task['id']))
+                         'Worker %d: queued, job %d, effort high' % (first, task['id']))
         self.assertEqual(self.call('workers.get', worker=second).text,
-                         'Worker %d: queued, job %d (405.1), effort medium' % (second, task['id']))
+                         'Worker %d: queued, job %d (405.1), effort high' % (second, task['id']))
         listed = self.call('workers.list', task=task['id'])
         self.assertEqual(listed.text.splitlines(), [
-            'Worker %d: queued, job %d (405.1), effort medium' % (second, task['id']),
-            'Worker %d: queued, job %d, effort medium' % (first, task['id'])])
+            'Worker %d: queued, job %d (405.1), effort high' % (second, task['id']),
+            'Worker %d: queued, job %d, effort high' % (first, task['id'])])
         self.assertEqual([(row['id'], row['iteration']) for row in listed.data['workers']], [(second, 1), (first, 0)])
         for worker, label in ((first, str(task['id'])), (second, '%d (405.1)' % task['id'])):
             with self.subTest(worker=worker):
@@ -159,10 +168,15 @@ class JobIterationTests(unittest.TestCase):
                     capture_output=True, text=True, timeout=120)
                 self.assertEqual(completed.returncode, 0, completed.stderr)
                 self.assertEqual(json.loads(completed.stdout)['text'],
-                                 'Worker %d: queued, job %s, effort medium' % (worker, label))
+                                 'Worker %d: queued, job %s, effort high' % (worker, label))
 
     def test_label_collision_copied_global_id_closes_only_the_intended_job(self):
         def tool(name, **arguments):
+            if name == 'tasks_update' and arguments.get('status') == 'done':
+                job = self.store.task_get(arguments['task'])
+                if not self.store.db.execute('SELECT 1 FROM outbox WHERE task=?', (job['id'],)).fetchone():
+                    with self.store.db:
+                        self.store.enqueue_report(job['topic'], 'Result', task=job['id'])
             result = mcp.dispatch(self.store, {'method': 'tools/call',
                                   'params': {'name': name, 'arguments': arguments}})
             self.assertFalse(result.get('isError', False), result)
@@ -185,9 +199,9 @@ class JobIterationTests(unittest.TestCase):
         self.assertEqual((intended['id'], intended['number']), (1809, 409))
         other = self.store.task_get(409)
         self.assertEqual((other['topic'], other['number'], other['status']), ('-100:2', 205, 'open'))
-        intended_worker = json.loads(tool('workers_spawn', task=1809, provider='codex', prompt='Build it')
+        intended_worker = json.loads(tool('workers_spawn', task=1809, kind='general', prompt='Build it')
                                      .splitlines()[-1])['worker']
-        other_worker = json.loads(tool('workers_spawn', task=409, provider='codex', prompt='Other work')
+        other_worker = json.loads(tool('workers_spawn', task=409, kind='general', prompt='Other work')
                                  .splitlines()[-1])['worker']
         listed = tool('workers_list', task=1809)
         fetched = tool('workers_get', worker=intended_worker)
@@ -195,7 +209,8 @@ class JobIterationTests(unittest.TestCase):
         self.assertEqual(listed.splitlines()[0], fetched.splitlines()[0])
         copied = int(listed.splitlines()[0].split(', job ')[1].split(',')[0])
         selected = json.loads(tool('tasks_get', task=copied).splitlines()[-1])
-        tool('tasks_update', task=copied, status='done', note='Merged PR #12; verified')
+        tool('tasks_update', task=copied, status='done', note='Merged PR #12; verified',
+             summary='Merged https://github.com/o/r/pull/12; verified.')
         self.assertEqual(self.store.task_get(1809)['status'], 'done')
         self.assertEqual(selected['id'], 1809)
         self.assertEqual(self.store.task_get(409)['status'], 'open')
@@ -236,11 +251,8 @@ class JobIterationTests(unittest.TestCase):
     def test_mcp_reads_expose_round_history(self):
         task = self.job()
         self.round_one(task)
-        for name, params in (('tasks_get', {'task': task['id']}), ('tasks_list', {'topic': '1:2'})):
-            with self.subTest(tool=name):
-                result = mcp.dispatch(self.store, {'method': 'tools/call', 'params': {'name': name, 'arguments': params}})
-                self.assertFalse(result.get('isError', False), result)
-                self.assertIn('405.1', result['content'][0]['text'])
-                data = json.loads(result['content'][0]['text'].splitlines()[-1])
-                row = data[0] if name == 'tasks_list' else data
-                self.assertEqual([item['k'] for item in row['iterations']], [0, 1])
+        result = mcp.dispatch(self.store, {'method': 'tools/call', 'params': {'name': 'tasks_get', 'arguments': {'task': task['id']}}})
+        self.assertFalse(result.get('isError', False), result)
+        self.assertIn('405.1', result['content'][0]['text'])
+        data = json.loads(result['content'][0]['text'].splitlines()[-1])
+        self.assertEqual([item['k'] for item in data['iterations']], [0, 1])

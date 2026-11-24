@@ -3,9 +3,9 @@
 from datetime import datetime, timezone
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
+import json
 import math
 import os
-import tempfile
 import logging
 import re
 import shutil
@@ -14,10 +14,10 @@ import time
 from pathlib import Path
 
 from .control_api import Refused, Result
-from .policy import CHAT_POLICY_LIMIT, PARENT_EFFORT, chat_policy, usage_policy
+from .policy import PARENT_EFFORT
 from .account_status import identity_label
-from .accounts import (AccountBroker, account_block, account_label, authenticated, listed_accounts, signed_in,
-                       switch_threshold)
+from .accounts import (PICK_GROUPS, AccountBroker, account_block, account_label, account_picks, authenticated,
+                       listed_accounts, picks_value, signed_in, switch_threshold)
 from .parent import session_key
 from .parent_state import effective_agent, opencode_pick_problem
 from .providers import codex_reasoning_effort
@@ -29,17 +29,21 @@ _OPENCODE_MODEL_DISPLAY = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.:/-]{0,199}\Z')
 _USAGE = {
     '/help': '/help', '/setup': '/setup [new NAME|use PROJECT_OR_PATH|cancel] (link this channel to a project)',
     '/start': '/start', '/accounts': '/accounts', '/projects': '/projects', '/health': '/health',
+    '/login': '/login PROVIDER EMAIL (sign a listed account in again)',
     '/tldr': '/tldr (summarize messages since your last message in this topic)',
     '/project': '/project new NAME, or /project folder /absolute/path',
     '/service': '/service restart REASON',
     '/update': '/update',
     '/secrets': '/secrets',
     '/waiting': '/waiting',
+    '/keep': '/keep [to dir:/absolute/path]',
+    '/status': '/status',
 }
 _HELP = '''Torii runs Claude and ChatGPT agents on your projects. Send a normal message in a project's topic to give it work. Send another to continue.
 
 **Accounts**
 /accounts - usage, sign-ins, resets, models
+/login PROVIDER EMAIL - sign a listed account in again
 
 **Projects**
 /projects - your projects, new projects, this topic's folder
@@ -48,12 +52,22 @@ _HELP = '''Torii runs Claude and ChatGPT agents on your projects. Send a normal 
 /tldr - catch up on this topic since your last message
 /waiting - what is waiting on you
 /goal CONDITION - keep the agent working until CONDITION holds
+/keep - show or set this chat's keep destination
 
 **Service**
 /health - running agents and system load
 /secrets - stored keys: rotate, revoke, ask again
 /ping - check that Torii is listening
 /help - this list'''
+
+
+def _help(store):
+    from .health import _codex, _subscription
+    from .extension import optional
+    antigravity = optional('antigravity_accounts')
+    sections = [_HELP, _subscription(store), _codex(store) or '**ChatGPT left** (week)\nNo accounts',
+                antigravity.health(store) if antigravity else None]
+    return '\n\n'.join(filter(None, sections))
 
 
 def _number(value):
@@ -74,7 +88,7 @@ def _remaining(used):
     return max(0, min(100, 100 - used))
 
 
-def _window_left(window, block=None):
+def _window_left(window):
     value = window.get('utilization')
     reset = window.get('resets_at')
     held = window.get('blocked') is True and not (_number(reset) and reset <= time.time())
@@ -116,7 +130,7 @@ def _mapping(value):
 
 
 def blocked(store, alias):
-    return account_block(store, alias)
+    return account_block(store, alias, 'opus')
 
 
 def resets(until):
@@ -143,7 +157,7 @@ def _account_card(store, alias, active=False):
     if state.startswith('not signed in'):
         lines.append('Sign in from /accounts.')
     usage = _mapping(snapshot.get('usage'))
-    for key, title in (('five_hour', '5-hour'), ('seven_day_fable', 'Fable weekly'), ('seven_day', 'Weekly (all models)')):
+    for key, title in (('seven_day_fable', 'Fable weekly'), ('seven_day', 'Weekly (all models)')):
         window = _mapping(usage.get(key))
         value = window.get('utilization')
         reset = window.get('resets_at')
@@ -155,7 +169,7 @@ def _account_card(store, alias, active=False):
             lines.append(f'{title}: {_meter(value)} · {resets(reset)}')
         else:
             lines.append(f'{title}: no data')
-    state = AccountBroker(store).account_state(alias)
+    state = AccountBroker(store).account_state(alias, 'opus')
     if state['state'] == 'stale':
         lines.append('Account state: stale since ' + _timestamp(state.get('since')) + '.')
     elif state['state'] == 'limited':
@@ -166,8 +180,8 @@ def _account_card(store, alias, active=False):
             cause = 'Claude refused requests' if hold.get('reason') == 'quota' else 'account hold'
         elif windows:
             meter = max(windows, key=lambda key: windows[key]['resets_at'] if _number(windows[key].get('resets_at')) else 0)
-            title = {'five_hour': '5-hour', 'seven_day': 'weekly', 'seven_day_fable': 'Fable weekly'}[meter]
-            point = f'{round(threshold * 100)}%' if threshold == switch_threshold(store) else f'its {round((1 - threshold) * 100)}% reserve'
+            title = {'seven_day': 'weekly', 'seven_day_fable': 'Fable weekly'}[meter]
+            point = f'{round(switch_threshold(store, alias, meter) * 100)}%' if meter == 'seven_day_fable' or threshold == switch_threshold(store) else f'its {round((1 - threshold) * 100)}% reserve'
             cause = f'{title} reached {point}'
         else:
             cause = 'account hold'
@@ -308,22 +322,23 @@ def _change_folder(store, topic_id, raw):
 
 def _status_card(store, topic_id):
     """The facts the owner asks for most. Everything else is one tap down."""
+    from .policy import chat_tags
     topic = store.topic(topic_id) or {}
-    listed, account_alias = listed_accounts(store)
-    alias = account_label(store, account_alias) if account_alias else 'none available'
     worker = store.get('worker_model', 'opus')
-    five = _mapping(_mapping(_mapping(_mapping(store.get('account_status', {})).get(account_alias)).get('usage')).get('five_hour'))
-    percent = five.get('utilization')
+    listed, account_alias = listed_accounts(store, worker)
+    alias = account_label(store, account_alias) if account_alias else 'none available'
+    weekly = _mapping(_mapping(_mapping(_mapping(store.get('account_status', {})).get(account_alias)).get('usage')).get('seven_day'))
+    percent = weekly.get('utilization')
     accounts = _mapping(store.get('accounts', {}))
     if not account_alias and any(signed_in(store, name, accounts.get(name)) for name in listed):
-        account = 'all accounts limited · ' + resets(AccountBroker(store).earliest_reset())
+        account = 'all accounts limited · ' + resets(AccountBroker(store).earliest_reset(model=worker))
     elif not account_alias:
         account = 'none available'
     elif _number(percent):
-        account = f'{alias} · {_meter(percent)} · resets in {_until(five.get("resets_at"))}'
+        account = f'{alias} · {_meter(percent)} · resets in {_until(weekly.get("resets_at"))}'
     else:
         account = alias + ' · usage not checked yet'
-    state = AccountBroker(store).account_state(account_alias) if account_alias else {}
+    state = AccountBroker(store).account_state(account_alias, worker) if account_alias else {}
     if state.get('state') == 'stale' and _number(state.get('since')):
         account += ' · stale since ' + _timestamp(state['since'])
     main = store.get('coordinator_session_topic') or store.get('coordinator_home_topic')
@@ -359,7 +374,8 @@ def _status_card(store, topic_id):
             return line + ' · picked for this chat'
         effort = codex_reasoning_effort(value['effort']) if value['provider'] == 'codex' else value['effort']
         return '%s %s · %s thinking · %s' % (
-            'ChatGPT' if value['provider'] == 'codex' else 'Claude', _safe(value['model'], _MODEL), effort,
+            {'codex': 'ChatGPT', 'antigravity': 'Antigravity'}.get(value['provider'], 'Claude'),
+            _safe(value['model'], _MODEL), effort,
             'picked for this chat' if value['picked'] else 'default')
 
     chat_agent = agent_line(agent)
@@ -382,14 +398,28 @@ def _status_card(store, topic_id):
          ((' · workers ' + ', '.join('%d %s' % (row['id'], row['effort']) for row in active)) if active else ''))
         if task else 'No open job in this channel.',
     ]
-    own = store.get(key + '_delegation')
-    if own:
-        text = ' '.join(own['text'].split())
-        lines.insert(3, 'Delegation: own instructions · ' + text[:60] + ('…' if len(text) > 60 else ''))
+    tags = chat_tags(store, topic_id)
+    if tags:
+        lines.insert(3, 'Tags: ' + ', '.join(tags))
+    proposed = store.db.execute("SELECT COUNT(*) FROM tasks WHERE topic=? AND status='proposed'", (topic_id,)).fetchone()[0]
+    lines.insert(-1, 'Proposed follow-ups: %d' % proposed)
+    queued = store.db.execute('SELECT COUNT(*) FROM keep_queue q JOIN tasks t ON t.id=q.task WHERE t.topic=?', (topic_id,)).fetchone()[0]
+    lines.insert(-1, 'Keep queue: %d' % queued)
+    idle_hours = store.get('idle_trim', 0)
+    lines.insert(-1, 'Idle trim: ' + ('off' if not idle_hours else 'after %s hours' % idle_hours))
     if store.get('setup_problem'):
         lines.append('Setup problem: ' + store.get('setup_problem'))
     if store.get('group_owner_changed'):
         lines.append(store.get('group_owner_changed'))
+    sync = store.get('records_sync_status', {})
+    if sync:
+        lines.append('Records git: commit %s · last %s%s%s%s' % (
+            (sync.get('sha') or 'none')[:12], sync.get('last_commit') or 'never',
+            ' · push to %s install/%s, ahead %s' % (_records_provider(store.get('records_sync_remote')),
+                                                   store.get('records_sync_install'), sync.get('ahead', '?'))
+            if store.get('records_sync', False) is True else '',
+            ' · blocked %d' % len(sync['blocked']) if sync.get('blocked') else '',
+            ' · ' + sync['error'] if sync.get('error') else ''))
     selection = store.get('parent_selection')
     if selection and not store.get(key + '_selection'):
         lines.append('Parent selection: %s %s after active work settles.' %
@@ -400,18 +430,21 @@ def _status_card(store, topic_id):
 def _accounts(store):
     from .codex_accounts import CodexBroker
     from . import opencode_subscription
-    ordered, active = listed_accounts(store)
+    ordered, active = listed_accounts(store, 'opus')
     aliases = [alias for alias in ordered if _safe(alias, _ALIAS, '')]
     codex, codex_active = CodexBroker(store).listed()
     codex = [alias for alias in codex if _safe(alias, _ALIAS, '')]
-    subscription_cards = [opencode_subscription.card(store, alias) for alias in opencode_subscription.accounts(store)]
-    if not aliases and not codex and not subscription_cards:
-        return 'No accounts are registered. Open /accounts to add one.'
+    from .extension import optional
+    antigravity = optional('antigravity_accounts')
     sections = [codex_heading(store) + '\n\n' + '\n\n'.join(_codex_card(store, alias, alias == codex_active)
                                                    for alias in codex)] if codex else []
-    sections.extend(subscription_cards)
+    if antigravity:
+        sections.extend(antigravity.cards(store))
+    opencode = opencode_subscription.card(store)
+    if opencode:
+        sections.append(opencode)
     if not aliases:
-        return '\n\n'.join(sections)
+        return '\n\n'.join(sections) if sections else 'No accounts are registered. Open /accounts to add one.'
     cards = []
     identities = {}
     snapshots = _mapping(store.get('account_status', {}))
@@ -442,7 +475,7 @@ def _current_account(store):
 def _current_claude(store, accounts):
     if not accounts:
         return _accounts(store)
-    active = listed_accounts(store)[1]
+    active = listed_accounts(store, 'opus')[1]
     heading = 'Next account: ' + (account_label(store, active) if active else 'none available')
     if not active:
         return heading + '\n\n' + _accounts(store)
@@ -457,12 +490,7 @@ def op_cleanup_sessions(store, ctx, enabled):
     _change(store, 'session_delete', enabled)
     from .session_storage import request
     request(store)
-    return 'Owned native session deletion is ' + ('on.' if enabled else 'off.')
-
-
-def op_service_intake_batching(store, ctx, enabled):
-    _change(store, 'coordinator_intake_batching', enabled)
-    return Result(True, 'Coordinator intake batching is ' + ('on.' if enabled else 'off.'), {'enabled': enabled})
+    return 'Cleanup of finished native sessions older than 14 days is ' + ('on.' if enabled else 'off.')
 
 
 def op_service_updates(store, ctx, enabled):
@@ -480,23 +508,74 @@ def op_service_updates(store, ctx, enabled):
     return 'Updates from Telegram are ' + ('on. Use /update.' if enabled else 'off.')
 
 
-def op_cleanup_close_space(store, ctx, enabled):
-    if ctx.source != 'cli':
-        raise Refused('Close clears space is a local CLI setting.')
-    _change(store, 'close_clears_space', enabled)
+def op_cleanup_cow_worktrees(store, ctx, enabled):
+    _change(store, 'cow_worktrees', enabled)
+    from .workspaces import volume_mounted
+    mounted = '' if volume_mounted(store.directory) else ' The volume is not mounted now, so new trees use git worktree add.'
+    return 'Copy-on-write worktrees are ' + ('on.' if enabled else 'off.') + (mounted if enabled else '')
+
+
+def op_cleanup_idle_trim(store, ctx, enabled, hours=None):
+    if hours is not None and hours < 1:
+        raise Refused('Hours must be one or more.')
+    value = (hours or 24) if enabled else 0
+    _change(store, 'idle_trim', value)
+    return 'Idle trimming is ' + ('off.' if not value else 'on after %d hours.' % value)
+
+
+def _records_provider(remote):
+    from .records import provider
+    try:
+        return provider(remote or '').name
+    except ValueError:
+        return 'no provider'
+
+
+def op_records_sync(store, ctx, enabled, remote=None, install=None):
+    from .records import INSTALL, PROVIDERS, provider
+    named = store.get('records_sync_install')
+    if install and named and install != named and store.get('records_sync_status', {}).get('last_push'):
+        raise Refused('The install name is fixed after the first push. It stays %s.' % named)
+    remote = remote or store.get('records_sync_remote')
+    install = install or named
     if enabled:
-        with store.db:
-            store.db.execute("UPDATE tasks SET copy='saving',copy_reason=NULL WHERE status IN ('done','dropped','waiting','interrupted') AND copy!='cleared'")
-    return 'Closing jobs saves work and clears space is ' + ('on.' if enabled else 'off.')
+        if (not remote or remote.startswith('-') or any(c.isspace() for c in remote)
+                or '?' in remote or '#' in remote or re.search(r'://[^/]*@', remote)):
+            raise Refused('Set a remote without credentials, whitespace, query or fragment.')
+        try:
+            provider(remote)
+        except ValueError:
+            raise Refused('The records remote needs a provider for its host: %s.' % ', '.join(
+                kind.name for kind in PROVIDERS)) from None
+        if not install or not INSTALL.fullmatch(install):
+            raise Refused('Set install to a name of 2 to 31 lowercase letters, digits or hyphens, starting with a letter.')
+    store.put('records_sync', enabled)
+    if remote:
+        store.put('records_sync_remote', remote)
+    if install:
+        store.put('records_sync_install', install)
+    return 'Records push is ' + ('on to install/%s.' % install if enabled else 'off.')
+
+def rebuild_rules(text):
+    """Parse and check the JSON list for the close_saves_rebuildable setting; empty text clears it."""
+    try:
+        rules = json.loads(text) if text.strip() else []
+    except ValueError:
+        raise Refused('Send rebuildable as a JSON list.') from None
+    keys = {'project', 'paths', 'manifest', 'ref', 'command'}
+    if not isinstance(rules, list) or not all(
+            isinstance(rule, dict) and keys <= set(rule) and set(rule) <= keys | {'prefix'}
+            and Path(str(rule['project'])).is_absolute() and isinstance(rule['paths'], list) and rule['paths']
+            and all(isinstance(value, str) and value for value in [*rule['paths'], rule['manifest'], rule['ref'],
+                                                                    rule['command'], rule.get('prefix', 'x')])
+            for rule in rules):
+        raise Refused('Each rebuildable rule needs project (absolute), paths (list), manifest, ref and command; prefix is optional.')
+    return rules
 
 
-def op_cleanup_close_rules(store, ctx, submodules=None, any_branch=None, prune_held=None,
-                           discard_names=None, keep=None, requeue=None):
-    if ctx.source != 'cli':
-        raise Refused('Close-save rules are local CLI settings.')
+def op_cleanup_close_rules(store, ctx, discard_names=None, keep=None, rebuildable=None, requeue=None):
     from . import close_saves
-    changes = {name: value for name, value in (
-        ('submodules', submodules), ('any_branch', any_branch), ('prune_held', prune_held)) if value is not None}
+    changes = {}
     if discard_names is not None:
         names = list(dict.fromkeys(name.strip() for name in discard_names.split(',') if name.strip()))
         if any(name in ('.', '..') or '/' in name or '\\' in name for name in names):
@@ -510,16 +589,16 @@ def op_cleanup_close_rules(store, ctx, submodules=None, any_branch=None, prune_h
         if any(task_id <= 0 for task_id in ids):
             raise Refused('Send keep as comma-separated positive task IDs.')
         changes['keep'] = ids
+    if rebuildable is not None:
+        changes['rebuildable'] = rebuild_rules(rebuildable)
     prefixes = []
     with store.transaction():
         for name, value in changes.items():
-            key = 'close_saves_' + name
-            previous = store.get(key, [] if name in ('discard_names', 'keep') else False)
-            _change(store, key, value)
-            if value and (name == 'discard_names' or previous is not True or requeue is True):
+            _change(store, 'close_saves_' + name, value)
+            if value:
                 prefixes.extend(close_saves.RULES.get(name, ()))
         requeued = 0
-        if close_saves.enabled(store) and requeue is not False and prefixes:
+        if requeue is not False and prefixes:
             candidates = store.db.execute(f"""SELECT id FROM tasks WHERE copy='held'
                 AND status IN ({','.join('?' for _ in close_saves.CLOSED)}) AND (""" +
                 ' OR '.join('copy_reason LIKE ?' for _ in prefixes) + ')',
@@ -528,24 +607,15 @@ def op_cleanup_close_rules(store, ctx, submodules=None, any_branch=None, prune_h
                 if not close_saves.kept(store, row['id']):
                     store.db.execute("UPDATE tasks SET copy='saving',copy_reason=NULL WHERE id=?", (row['id'],))
                     requeued += 1
-    data = {name: store.get(name, False) is True for name in (
-        'close_saves_submodules', 'close_saves_any_branch', 'close_saves_prune_held')}
-    data.update({name: store.get(name, []) for name in ('close_saves_discard_names', 'close_saves_keep')})
+    data = {name: store.get(name, []) for name in ('close_saves_discard_names', 'close_saves_keep', 'close_saves_rebuildable')}
     data['requeued'] = requeued
-    text = 'Close-save rules updated. Requeued %d held jobs.' % requeued
-    if not close_saves.enabled(store):
-        text += ' cleanup.close_space is disabled. Enable it before requeueing held jobs.'
-    return Result(True, text, data)
+    return Result(True, 'Close-save rules updated. Requeued %d held jobs.' % requeued, data)
 
 
 def op_cleanup_retry(store, ctx, task):
-    if ctx.source != 'cli':
-        raise Refused('Close-save retry is a local CLI operation.')
     from . import close_saves
     if close_saves.kept(store, task):
         raise Refused('Task %d is in close_saves_keep. Remove it from keep before retrying.' % task)
-    if not close_saves.enabled(store):
-        raise Refused('Enable cleanup.close_space before retrying a close save.')
     current = store.task_get(task)
     if not current or current['status'] not in close_saves.CLOSED:
         raise Refused('Choose an existing closed job for cleanup.retry.')
@@ -553,31 +623,17 @@ def op_cleanup_retry(store, ctx, task):
     return 'Close save queued for task %d.' % task
 
 
-def op_waits_set_enabled(store, ctx, enabled):
-    if ctx.source != 'cli':
-        raise Refused('The waits switch is a local CLI setting.')
-    if not enabled and store.get('auto_resume', False) is True:
-        raise Refused('Turn auto-resume off before disabling waits.')
-    _change(store, 'waits_enabled', enabled)
-    if enabled:
-        store.service_request('waits.changed', {})
-    return 'Waits are switched ' + ('on.' if enabled else 'off.')
-
-
-def op_cleanup_delete(store, ctx, enabled):
-    _change(store, 'closed_copy_delete', enabled)
-    return 'Deletion of saved closed job copies is ' + ('on.' if enabled else 'off.')
-
-
 def op_settings_get(store, ctx):
     from .onboarding import configured_root
     from .opencode_accounts import owner_settings
-    from .muse_accounts import owner_settings as muse_settings
+    from .extension import optional
+    antigravity = optional('antigravity_accounts')
     root = configured_root(store)
-    data = dict(close_clears_space=store.get('close_clears_space', False) is True,
-                close_saves_submodules=store.get('close_saves_submodules', False) is True,
-                close_saves_any_branch=store.get('close_saves_any_branch', False) is True,
-                close_saves_prune_held=store.get('close_saves_prune_held', False) is True,
+    data = dict(cow_worktrees=store.get('cow_worktrees', False) is True,
+                records_sync=store.get('records_sync', False) is True,
+                records_sync_remote=store.get('records_sync_remote'),
+                records_sync_install=store.get('records_sync_install'),
+                idle_trim=store.get('idle_trim', 0),
                 close_saves_discard_names=store.get('close_saves_discard_names', []),
                 close_saves_keep=store.get('close_saves_keep', []),
                 session_delete=store.get('session_delete', False) is True,
@@ -586,15 +642,13 @@ def op_settings_get(store, ctx):
                 codex_model=store.get('codex_model'),
                 codex_auto_switch=store.get('codex_auto_switch', False) is True,
                 telegram_updates_enabled=store.get('telegram_updates_enabled', False) is True,
-                coordinator_intake_batching=store.get('coordinator_intake_batching', False) is True,
-                closed_copy_delete=store.get('closed_copy_delete', False) is True,
                 codex_active_account=_codex_active_label(store),
                 coordinator_home_topic=store.get('coordinator_home_topic'),
                 coordinator_model=store.get('coordinator_model'),
                 parent_selection=store.get('parent_selection'),
                 projects_root=str(root) if root else None,
                 account_switch_threshold=switch_threshold(store),
-                **owner_settings(store), **muse_settings(store))
+                **owner_settings(store), **(antigravity.owner_settings(store) if antigravity else {}))
     return Result(True, '\n'.join('%s: %s' % (key, value) for key, value in sorted(data.items())), data)
 
 
@@ -637,7 +691,7 @@ def op_account_show(store, ctx, alias):
     if _codex(store, alias):
         from .codex_accounts import CodexBroker
         return _codex_card(store, alias, alias == CodexBroker(store).current())
-    return _account_card(store, alias, alias == listed_accounts(store)[1])
+    return _account_card(store, alias, alias == listed_accounts(store, 'opus')[1])
 
 
 def op_account_current(store, ctx):
@@ -645,10 +699,13 @@ def op_account_current(store, ctx):
 
 
 def op_policy_show(store, ctx, topic=None):
-    if topic is not None:
-        row = store.topic(topic)
-        return chat_policy(store, session_key(store, row['cwd'], topic))
-    return usage_policy(store.directory)
+    from .policy import join_layers, layers, torii_instructions
+    row = store.topic(topic) if topic else None
+    key = session_key(store, row['cwd'], topic) if row else 'coordinator'
+    fixed = torii_instructions(store, key, 'coordinator', create_scratch=False)
+    rules = layers(store, key, 'coordinator')
+    sizes = '\n'.join('%s: %d bytes' % (name, len(text.encode())) for name, text in [('Torii.md', fixed)] + rules)
+    return sizes + '\n\n' + fixed + '\n\n' + join_layers(rules)
 
 
 def op_topic_bind(store, ctx, topic, cwd, name, provider=None, session=None, enable=None, source_pid=None):
@@ -740,19 +797,6 @@ def op_delegation_opencode(store, ctx, enabled):
     return 'OpenCode delegation is ' + ('on.' if enabled else 'off.')
 
 
-def op_delegation_muse(store, ctx, enabled):
-    from .muse_accounts import binary, check_binary
-    if ctx.source != 'cli':
-        raise Refused('Muse workers are a local CLI setting.')
-    if enabled:
-        if sys.platform != 'darwin':
-            raise Refused('Muse workers require macOS and its sandbox-exec write boundary.')
-        check_binary(binary(store))
-    _change(store, 'muse_enabled', enabled)
-    return ('Muse workers are ' + ('on.' if enabled else 'off.')
-            + ' Off by default. Only the pinned Muse Code 1.4.9-R6297.1 binary runs.')
-
-
 def op_model_worker(store, ctx, model=None):
     _change(store, 'worker_model', model)
     return f"worker model: {model or 'native default'}. This setting applies to future dispatches."
@@ -771,8 +815,14 @@ def op_model_coordinator(store, ctx, model=None):
 
 
 def op_model_parent(store, ctx, provider=None, model=None, topic=None, effort=None, message=None):
-    if provider == 'opencode' and topic is None:
-        raise Refused(opencode_pick_problem(store, None))
+    if provider == 'opencode' and topic is None and opencode_pick_problem(store):
+        raise Refused(opencode_pick_problem(store))
+    if provider == 'antigravity' and topic is None:
+        from .extension import optional
+        problem = optional('antigravity_parent').pick_problem(store)
+        if problem:
+            raise Refused(problem)
+        model = model or optional('antigravity_accounts').DEFAULT_MODEL
     if topic is not None:
         from . import topics
         row = store.topic(topic)
@@ -783,7 +833,7 @@ def op_model_parent(store, ctx, provider=None, model=None, topic=None, effort=No
         key = session_key(store, row['cwd'], topic)
         if provider == 'opencode':
             from . import opencode_accounts, opencode_subscription
-            problem = opencode_pick_problem(store, key)
+            problem = opencode_pick_problem(store)
             if problem:
                 raise Refused(problem)
             alias = opencode_accounts.active(store)
@@ -792,8 +842,17 @@ def op_model_parent(store, ctx, provider=None, model=None, topic=None, effort=No
                      'OpenCode on account %s (%s)' % (alias, account['model']))
             opencode_text = 'Chat %s agent: %s.' % (topic, label)
             model, effort = None, None
+        if provider == 'antigravity':
+            from .extension import optional
+            pick_problem = optional('antigravity_parent').pick_problem
+            problem = pick_problem(store)
+            if problem:
+                raise Refused(problem)
         previous = store.get(key + '_selection') or {}
-        if provider and (provider, model, effort) == tuple(previous.get(field) for field in ('provider', 'model', 'effort')):
+        if provider and (provider, model, effort) == tuple(previous.get(field) for field in (
+                'provider', 'model', 'effort')):
+            if store.get(key + '_start_failed') is not None:
+                store.put(key + '_start_failed', None)
             return Result(True, ('Chat %s agent is already set to %s.' % (topic, label)
                                  if provider == 'opencode' else
                                  'Chat %s agent is already set to this provider, model and thinking.' % topic),
@@ -805,7 +864,7 @@ def op_model_parent(store, ctx, provider=None, model=None, topic=None, effort=No
             store.put(key + '_selection_cleared', True)
         elif selection and store.get(key + '_selection_cleared'):
             store.put(key + '_selection_cleared', None)
-        for suffix in ('_selection_retry_at', '_selection_notice'):
+        for suffix in ('_selection_retry_at', '_selection_notice', '_start_failed'):
             if store.get(key + suffix) is not None:
                 store.put(key + suffix, None)
         return Result(True, (opencode_text if provider == 'opencode' else 'Chat %s agent: %s %s · %s thinking.' % (
@@ -815,13 +874,15 @@ def op_model_parent(store, ctx, provider=None, model=None, topic=None, effort=No
             {'topic': topic, 'selection': selection})
     if effort is not None:
         raise Refused('Supply topic for chat thinking, or use effort.parent for global parent thinking.')
-    if bool(provider) != bool(model):
+    if provider != 'opencode' and bool(provider) != bool(model):
         raise Refused('Supply both provider and model, or omit both for automatic parent selection.')
     selection = {'provider': provider, 'model': model} if provider else None
     if provider != (store.get('parent_selection') or {}).get('provider'):
         store.put('parent_selection_revision', store.get('parent_selection_revision', 0) + 1)
     _change(store, 'parent_selection', selection)
-    return Result(True, ('Parent chats: %s %s.' % (provider, model) if selection else
+    if store.get('coordinator_start_failed') is not None:
+        store.put('coordinator_start_failed', None)
+    return Result(True, ('Parent chats: %s %s.' % (provider, model or 'account model') if selection else
                          'Parent chats: automatic provider and model selection.') +
                   ' Active turns and native background tasks settle before a change. Worker settings stay unchanged.',
                   {'parent_selection': selection})
@@ -834,63 +895,39 @@ def op_effort_parent(store, ctx, provider, effort=None):
             (provider, effort or PARENT_EFFORT))
 
 
-def _chat_policy_text(text):
-    if any('\ud800' <= character <= '\udfff' for character in text):
-        raise Refused('Chat delegation instructions cannot contain surrogate characters.')
-    if any((ord(character) < 32 or 127 <= ord(character) <= 159) and character not in '\n\t'
-           for character in text):
-        raise Refused('Chat delegation instructions cannot contain control characters other than newline and tab.')
-    text = text.strip()
-    if len(text) > CHAT_POLICY_LIMIT:
-        raise Refused('Keep chat delegation instructions to 2000 characters or fewer (this text has %d).' % len(text))
-    return text
-
-
-def op_policy_chat(store, ctx, topic, text=None, message=None):
+def op_policy_chat(store, ctx, topic, message=None, append=None):
     from . import topics
+    from .policy import chat_path, atomic_rule_write, _clean
     row = store.topic(topic)
     if not row or not row['chat'] or not row['cwd']:
         raise Refused('Choose a linked channel first.')
     if topics.lifecycle(store, topic):
         raise Refused('This chat is closing or closed.')
-    key = session_key(store, row['cwd'], topic)
-    text = _chat_policy_text(text) if text is not None else None
-    previous = store.get(key + '_delegation')
-    if text is not None and previous and text == previous['text']:
-        return Result(True, 'Chat %s delegation instructions are already set to this text.' % topic,
-                      {'topic': topic, 'delegation': previous})
-    if text is None and not previous:
-        return Result(True, 'Chat %s has no delegation instructions of its own. It follows the usage policy.' % topic,
-                      {'topic': topic, 'delegation': None})
-    own = {'text': text, 'revision': (previous or {}).get('revision', 0) + 1} if text is not None else None
-    store.put(key + '_delegation', own)
-    note = 'Delegation updated.' if own else 'Delegation cleared.'
-    store.enqueue_report(topic, note)
-    reply = ('Chat %s delegation instructions saved (%d characters). Its agent follows them from its next message. '
-             'Worker settings stay unchanged.' % (topic, len(text)) if own else
-             'Chat %s delegation instructions cleared. Its agent follows the usage policy from its next message.' % topic)
-    return Result(True, reply, {'topic': topic, 'delegation': own})
+    if message is None:
+        raise Refused('Pass message=N for the owner message that asked.')
+    topics._asking(store, ctx, message)
+    if append is None:
+        raise Refused('Supply append to add a chat rule.')
+    append = append.strip()
+    if not append:
+        raise Refused('Supply a chat rule.')
+    path = chat_path(store, topic)
+    current = path.read_text() if path.exists() else ''
+    updated = current.rstrip() + ('\n' if current.strip() else '') + append + '\n'
+    if len(_clean(updated)) > 4000:
+        raise Refused('Keep chat rules to 4000 characters. HTML comments do not count.')
+    atomic_rule_write(path, updated)
+    return 'Chat rules saved. The agent loads them with its next message.'
 
 
 def op_policy_set(store, ctx, text):
-    policy = text.strip()
-    if not policy or len(policy) > 4000:
-        raise Refused('Keep usage policy to 4000 characters or fewer.')
-    path = None
-    try:
-        with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', dir=store.directory,
-                                         prefix='.USAGE-', delete=False) as temporary:
-            path = Path(temporary.name)
-            os.fchmod(temporary.fileno(), 0o600)
-            temporary.write(policy)
-            temporary.flush()
-            os.fsync(temporary.fileno())
-        os.replace(path, store.directory / 'USAGE.md')
-    finally:
-        if path is not None:
-            path.unlink(missing_ok=True)
-    logging.getLogger(__name__).info('setting changed key=USAGE.md length=%s', len(policy))
-    return 'Usage policy saved. Coordinators load it with their next message; new workers at launch.'
+    from .policy import atomic_rule_write, personal_path, rule_lines, _clean
+    updated = text.strip() + '\n'
+    if not rule_lines(updated) or len(_clean(updated)) > 4000:
+        raise Refused('Keep personal rules to 1–4000 characters. HTML comments do not count.')
+    with store.transaction():
+        atomic_rule_write(personal_path(store, create=False), updated)
+    return 'Personal rules saved. Coordinators load them with their next message.'
 
 
 def _registered(store, alias):
@@ -941,9 +978,26 @@ def op_account_disable(store, ctx, alias):
     return _set_enabled(store, alias, False)
 
 
-def op_account_use(store, ctx, alias, topic=None):
+_PICK_SCOPES = {None: 'Claude', 'fable': 'Claude Fable', 'other': 'Claude models other than Fable'}
+
+
+def _owner_asked(store, ctx, message):
+    if ctx is None:
+        return
+    if ctx.source_worker is not None:
+        raise Refused('Workers do not change accounts. Report the need; the coordinator asks the owner.')
+    if ctx.source == 'mcp':
+        from dataclasses import replace
+        from .topics import _asking
+        _asking(store, replace(ctx, topic=ctx.topic or ctx.caller), message)
+
+
+def op_account_use(store, ctx, alias, topic=None, models=None, message=None):
     from .codex_accounts import CodexBroker
+    _owner_asked(store, ctx, message)
     broker = CodexBroker(store)
+    if models and _codex(store, alias):
+        raise Refused('models applies only to Claude accounts.')
     if not _codex(store, alias):
         accounts = _registered(store, alias)
         display = account_label(store, alias)
@@ -952,11 +1006,12 @@ def op_account_use(store, ctx, alias, topic=None):
         if accounts[alias].get('enabled') is not True:
             raise Refused(f'{display} is disabled. Enable it first.')
         request_id = store.get('claude_pick_refresh_id', 0) + 1
-        _change(store, 'claude_account_pick', alias)
+        groups = [models] if models else list(PICK_GROUPS)
+        _change(store, 'claude_account_pick', picks_value({**account_picks(store), **dict.fromkeys(groups, alias)}))
         store.put('claude_pick_refresh_id', request_id)
-        store.put('claude_pick_refresh', {'alias': alias, 'id': request_id, 'topic': ctx.topic})
+        store.put('claude_pick_refresh', {'alias': alias, 'id': request_id, 'topic': ctx.topic, 'models': groups})
         store.put('account_status_refresh_requested', time.time())
-        return f'{display} is picked for Claude; its usage is being checked.'
+        return f'{display} is picked for {_PICK_SCOPES[models]}; its usage is being checked.'
     if not broker.signed_in(alias):
         raise Refused(f'{broker.label(alias)} is not signed in or is disabled. Sign it in or enable it first.')
     _change(store, 'codex_active_account', alias)
@@ -970,11 +1025,13 @@ def op_account_use(store, ctx, alias, topic=None):
     return text
 
 
-def op_accounts_claude_auto(store, ctx):
-    _change(store, 'claude_account_pick', None)
-    store.put('claude_pick_refresh', None)
-    store.put('claude_pick_weekly_notice', None)
-    return ('Claude account choice is automatic. '
+def op_accounts_claude_auto(store, ctx, models=None, message=None):
+    _owner_asked(store, ctx, message)
+    picks = picks_value({**account_picks(store), **dict.fromkeys([models] if models else PICK_GROUPS)})
+    _change(store, 'claude_account_pick', picks)
+    if picks is None:
+        store.put('claude_pick_refresh', None)
+    return (f'{"Claude" if not models else _PICK_SCOPES[models]} account choice is automatic. '
             'Running chats stay on their account while it can take work.')
 
 
@@ -982,8 +1039,9 @@ def op_accounts_codex_auto(store, ctx, enabled):
     from .codex_accounts import CodexBroker
     _change(store, 'codex_auto_switch', enabled is True)
     if enabled is True:
-        return ('Automatic Codex account switching is on. At 95% or a usage-limit rejection, Torii moves Codex work '
-                'to the signed-in account whose weekly limit resets soonest.')
+        return ('Automatic Codex account switching is on. At 99% or a usage-limit rejection, Torii moves Codex work '
+                'to the signed-in account whose weekly limit resets soonest. When included allowance is used, '
+                'Torii uses prepaid credits, largest balance first, down to zero.')
     broker = CodexBroker(store)
     active = broker.active()
     return ('Automatic Codex account switching is off. Codex work stays on the active account %s. '
@@ -1073,25 +1131,34 @@ async def redeem_codex_account(store, topic, alias):
 
 
 def op_account_codex_reset(store, ctx, alias):
+    _owner_asked(store, ctx, None)
     return _redeem_codex_account(store, ctx, alias, True)
 
 
-def op_account_redeem(store, ctx):
+def op_account_redeem(store, ctx, message=None):
     from .codex_accounts import CodexBroker
+    _owner_asked(store, ctx, message)
     alias = CodexBroker(store).active()
     if not alias:
         raise Refused('No active Codex account is registered.')
     return _redeem_codex_account(store, ctx, alias, True)
 
 
-def op_accounts_discover(store, ctx):
-    from .accounts import discover_accounts
-    registered = discover_accounts(store)
-    display = [account_label(store, alias) + (' · not signed in'
-               if not authenticated(store, alias, profile) else '')
-               for alias, profile in sorted(registered.items())]
-    return Result(True, 'Registered account profiles: ' + (', '.join(display) or 'none found') + '.', display)
-
+def op_accounts_codex_auto_redeem(store, ctx, accounts=None):
+    if ctx.source_worker is not None:
+        raise Refused('Codex automatic reset redemption is an owner setting on the local CLI.')
+    if accounts is not None:
+        try:
+            names = json.loads(accounts)
+            if not isinstance(names, list) or any(not isinstance(name, str) or not name.strip() for name in names):
+                raise ValueError()
+        except ValueError:
+            raise Refused('Send a JSON list of Codex account emails or aliases, or [] to turn it off.') from None
+        _change(store, 'codex_auto_redeem', list(dict.fromkeys(name.strip() for name in names)) or None)
+    names = store.get('codex_auto_redeem') or []
+    return Result(True, ('Torii redeems one banked reset when one of these Codex accounts reaches its limit: %s.' %
+                         ', '.join(names)) if names else 'Torii redeems no banked Codex reset on its own.',
+                  {'codex_auto_redeem': names})
 
 
 def _grammar(store, topic_id, command, args, text):
@@ -1101,6 +1168,14 @@ def _grammar(store, topic_id, command, args, text):
     still gets the usage reply, never a refusal from an operation.
     """
     remainder = text.split(maxsplit=1)[1] if args else ''
+    if command == '/status' and not args:
+        return 'settings.show', {}, 'menu'
+    if command == '/keep':
+        if not args:
+            return 'keep.destination', {}, 'menu'
+        if len(args) >= 2 and args[0] == 'to':
+            return 'keep.destination', {'to': text.split(maxsplit=2)[2]}, 'menu'
+        return None
     if command in ('/setup', '/start'):
         parts = remainder.split(maxsplit=1)
         action = parts[0].lower() if parts else ''
@@ -1116,11 +1191,14 @@ def _grammar(store, topic_id, command, args, text):
     if command == '/projects':
         return 'projects.list', {}, 'menu'
     if command == '/help':
-        return _HELP if store.get('waits_enabled', False) is True else _HELP.replace('/waiting - what is waiting on you\n', '')
+        return _help(store)
     if command == '/health':
         return 'health.show', {}, 'menu'
     if command == '/accounts':
         return 'accounts.list', {}, 'menu'
+    if command == '/login':
+        from .signin import login_command
+        return login_command(store, args)
     if command == '/project' and args[:1] == ['new']:
         from .onboarding import _create
         store.put('project_setup:' + topic_id, {'stage': 'project_new'})
@@ -1146,10 +1224,8 @@ def handle_control(store, topic_id: str, message_id: int, text: str, in_place: b
     if command == '/waiting' and not args:
         from .waits import pending_data, pending_text
         scope = None if store.get('coordinator_home_topic') == topic_id else topic_id
-        reply = 'Nothing is waiting on you.'
-        if store.get('waits_enabled', False) is True:
-            reply = store.wait_hook('list-failed', lambda: pending_text(store, pending_data(store, scope, owner=True)))
-            reply = reply or 'The waiting list is unavailable. Try again.'
+        reply = store.wait_hook('list-failed', lambda: pending_text(store, pending_data(store, scope, owner=True)))
+        reply = reply or 'The waiting list is unavailable. Try again.'
         store.enqueue_report(topic_id, reply, reply_to=message_id)
         return True
     if command == '/update' and not args:
